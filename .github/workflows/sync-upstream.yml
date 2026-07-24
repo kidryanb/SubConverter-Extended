@@ -1,0 +1,44 @@
+name: Sync upstream and rebuild image
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 每天 UTC 03:17，即香港时间 11:17
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Sync upstream master
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Aethersailor/SubConverter-Extended.git || true
+          git fetch upstream master
+          before=$(git rev-parse HEAD)
+          git merge --no-edit upstream/master
+          after=$(git rev-parse HEAD)
+
+          if [ "$before" != "$after" ]; then
+            git push origin master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger image build
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build-personal-image.yml --ref master
