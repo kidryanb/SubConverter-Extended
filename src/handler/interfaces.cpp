@@ -2248,7 +2248,7 @@ static std::string subconverter_impl(Request &request, Response &response,
                  LOG_LEVEL_INFO);
         provider.url = item.url_decoded ? item.url
                                         : urlDecode(item.url); // 解码 URL
-        provider.interval = 86400;    // 固定使用 86400 秒（24小时）
+        provider.interval = 0;    // 禁止自动周期更新订阅
         provider.groupId = groupID;
         provider.path = "./providers/" + provider.name + ".yaml";
         provider.user_agent = provider_user_agent;
