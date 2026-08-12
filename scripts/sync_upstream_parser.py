@@ -20,7 +20,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOT_RESOLVED = ROOT.resolve()
-TARGET_BRANCH = "dev"
+TARGET_BRANCH = "master"
 DEFAULT_CURSOR_FILE = ".github/upstream-subconverter.seen"
 MAX_PATCH_CHARS = 50_000
 ALLOWED_REPO_REPORT_PATHS = {
