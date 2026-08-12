@@ -2,7 +2,7 @@ name: Sync upstream and rebuild image
 
 on:
   schedule:
-    - cron: "17 3 * * *" # 每天 UTC 03:17，即香港时间 11:17
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -12,9 +12,10 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: master
           fetch-depth: 0
@@ -22,16 +23,25 @@ jobs:
       - name: Sync upstream master
         id: sync
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/Aethersailor/SubConverter-Extended.git || true
+
+          git remote add upstream https://github.com/Aethersailor/SubConverter-Extended.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/Aethersailor/SubConverter-Extended.git
+
           git fetch upstream master
-          before=$(git rev-parse HEAD)
-          git merge --no-edit upstream/master
-          after=$(git rev-parse HEAD)
+
+          before="$(git rev-parse HEAD)"
+
+          # 冲突时保留 fork 自己的版本，继续合并其余上游更新。
+          git merge --no-edit -X ours upstream/master
+
+          after="$(git rev-parse HEAD)"
 
           if [ "$before" != "$after" ]; then
-            git push origin master
+            git push origin HEAD:master
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
