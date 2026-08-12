@@ -1,3 +1,6 @@
+Ryan，整个替换 `tests/test_sync_upstream_parser.py`：
+
+```python
 from __future__ import annotations
 
 import importlib.util
@@ -26,12 +29,12 @@ class UpstreamParserMonitorSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.planner = load_planner()
 
-    def test_dev_checkout_is_mandatory(self) -> None:
-        with mock.patch.object(self.planner, "git", return_value="dev\n"):
+    def test_master_checkout_is_mandatory(self) -> None:
+        with mock.patch.object(self.planner, "git", return_value="master\n"):
             self.planner.ensure_dev_checkout()
 
-        with mock.patch.object(self.planner, "git", return_value="master\n"):
-            with self.assertRaisesRegex(RuntimeError, "dev-only"):
+        with mock.patch.object(self.planner, "git", return_value="dev\n"):
+            with self.assertRaisesRegex(RuntimeError, "master-only"):
                 self.planner.ensure_dev_checkout()
 
     def test_mixed_commit_review_contains_every_changed_file(self) -> None:
@@ -71,7 +74,7 @@ class UpstreamParserMonitorSafetyTests(unittest.TestCase):
     def test_workflow_cannot_write_repository_content(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("contents: read", text)
-        self.assertIn("TARGET_BRANCH: dev", text)
+        self.assertIn("TARGET_BRANCH: master", text)
         self.assertIn("persist-credentials: false", text)
         for forbidden in (
             "contents: write",
@@ -85,3 +88,4 @@ class UpstreamParserMonitorSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+```
