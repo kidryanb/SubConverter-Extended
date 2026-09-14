@@ -1,6 +1,4 @@
-Ryan，整个替换 `tests/test_sync_upstream_parser.py`：
-
-```python
+python
 from __future__ import annotations
 
 import importlib.util
@@ -88,4 +86,4 @@ class UpstreamParserMonitorSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-```
+
