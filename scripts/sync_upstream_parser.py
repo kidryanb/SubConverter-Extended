@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create read-only upstream parser review plans for the dev branch.
+"""Create read-only upstream parser review plans for the master branch.
 
 This module intentionally has no apply, commit, or push capability. It scans
 upstream history from a human-managed cursor, collects commits that touch the
@@ -136,7 +136,7 @@ def ensure_dev_checkout() -> None:
     branch = git("branch", "--show-current").strip()
     if branch != TARGET_BRANCH:
         raise RuntimeError(
-            f"upstream parser monitoring is dev-only; current branch is "
+            f"upstream parser monitoring is master-only; current branch is "
             f"{branch or 'detached HEAD'}"
         )
 
@@ -267,7 +267,7 @@ def plan(args: argparse.Namespace) -> int:
 
     if not seen:
         raise RuntimeError(
-            "no upstream cursor is available; initialize it explicitly on dev "
+            "no upstream cursor is available; initialize it explicitly on master "
             "after human review"
         )
 
@@ -394,7 +394,7 @@ def main() -> int:
     plan_parser.add_argument(
         "--cursor-file",
         default=DEFAULT_CURSOR_FILE,
-        help="human-managed dev baseline for upstream monitoring",
+        help="human-managed master baseline for upstream monitoring",
     )
     plan_parser.add_argument(
         "--since",
