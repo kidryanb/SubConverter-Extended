@@ -4,7 +4,10 @@
 #include <utility>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "handler/settings.h"
+#include "handler/settings_view.h"
 #include "handler/webget.h"
 #include "nodemanip.h"
 #include "parser/config/proxy.h"
@@ -15,11 +18,13 @@
 #include "script/script_quickjs.h"
 #include "subexport.h"
 #include "utils/file_extra.h"
+#include "utils/force_max_cooperation.h"
 #include "utils/logger.h"
 #include "utils/map_extra.h"
 #include "utils/network.h"
 #include "parser/config/proxy_utils.h"
 #include "utils/regexp.h"
+#include "utils/redact.h"
 #include "utils/string.h"
 #include "utils/urlencode.h"
 
@@ -109,6 +114,31 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
   std::vector<Proxy> nodes;
   Proxy node;
   std::string strSub, extra_headers, custom_group;
+  const string_icase_map empty_request_headers;
+  auto resolveSubscription = [&](const std::string &source) {
+    if(parse_set.resolved_subscription_content)
+    {
+      strSub = *parse_set.resolved_subscription_content;
+      if(parse_set.resolved_subscription_headers)
+        extra_headers = *parse_set.resolved_subscription_headers;
+      return 1;
+    }
+    const string_icase_map &headers =
+        request_headers ? *request_headers : empty_request_headers;
+    if(parse_set.resolved_subscription_lookup &&
+       parse_set.resolved_subscription_lookup(
+           source, parse_set.fetch_context, headers, strSub,
+           extra_headers))
+      return 1;
+    if(!parse_set.require_resolved_subscription)
+      return 0;
+    if(parse_set.missing_subscription_sources)
+      parse_set.missing_subscription_sources->push_back(
+          {source, parse_set.fetch_context, headers});
+    writeLog(LOG_LEVEL_DEBUG,
+             "NODE_SOURCE_SUSPENDED branch=sub reason=needs_fetch");
+    return -1;
+  };
 
   // TODO: replace with startsWith if appropriate
   link = replaceAllDistinct(link, "\"", "");
@@ -150,7 +180,7 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
             }
           }
         },
-        global.scriptCleanContext);
+        effectiveSettings().scriptCleanContext);
   /*
   duk_context *ctx = duktape_init();
   defer(duk_destroy_heap(ctx);)
@@ -280,7 +310,7 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
       isNodeLink = mihomo::isSupportedSchemeLink(link);
       // 规则 4: 其他未知协议 = 节点链接（喂给 Mihomo 尝试）
       // 例如: newproto://..., unknown://...
-      // 让 Mihomo 的静默失败机制过滤无效链接
+      // 解析器会拒绝自己不支持的协议。
       if (!isNodeLink) {
         isNodeLink = true;
         writeLog(LOG_TYPE_INFO,
@@ -328,8 +358,13 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
         }
       }
 
-      strSub = webGet(link, proxy, global.cacheSubscription, &extra_headers,
-                      request_headers, parse_set.fetch_context);
+      const int resolved = resolveSubscription(link);
+      if(resolved < 0)
+        return kAddNodesNeedsFetch;
+      if(resolved == 0)
+        strSub = webGet(link, proxy, effectiveSettings().cacheSubscription,
+                        &extra_headers, request_headers,
+                        parse_set.fetch_context);
     }
     /*
     if(strSub.size() == 0)
@@ -394,8 +429,18 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
       if (explodeConfContent(strSub, nodes) == 0) {
         writeLog(LOG_TYPE_ERROR, "无效订阅：'" + link + "'！");
         return -1;
-      }
 #endif
+      } else {
+        recordParserInvocation();
+        writeLog(LOG_LEVEL_VERBOSE,
+                 "NODE_PARSER_INVOKE parser=legacy branch=sub");
+        if (explodeConfContent(strSub, nodes) == 0) {
+          recordParserFailure();
+          writeLog(LOG_LEVEL_ERROR,
+                   "NODE_PARSER_FAILED parser=legacy branch=sub reason=no_nodes");
+          return -1;
+        }
+      }
 
       if (startsWith(strSub, "ssd://")) {
         getSubInfoFromSSD(strSub, subInfo);
@@ -523,9 +568,202 @@ bool chkIgnore(const Proxy &node, string_array &exclude_remarks,
   return excluded || !included;
 }
 
+namespace {
+
+struct PreparedRemarkMatcher {
+  const std::string *rule = nullptr;
+  std::unique_ptr<CompiledRegex> direct_regex;
+
+  bool matches(const Proxy &node) {
+    if (direct_regex && direct_regex->valid())
+      return direct_regex->matches(node.Remark);
+
+    // Keep the complete legacy path for !! matchers and invalid PCRE2 input.
+    // Besides preserving conditional matcher semantics, this retains the old
+    // fail-soft behavior when a pattern cannot be compiled.
+    std::string real_rule;
+    if (!applyMatcher(*rule, real_rule, node))
+      return false;
+    return real_rule.empty() || regFind(node.Remark, real_rule);
+  }
+};
+
+std::vector<PreparedRemarkMatcher>
+prepareRemarkMatchers(const string_array &rules) {
+  std::vector<PreparedRemarkMatcher> prepared;
+  prepared.reserve(rules.size());
+  for (const std::string &rule : rules) {
+    PreparedRemarkMatcher matcher;
+    matcher.rule = &rule;
+    if (!startsWith(rule, "!!")) {
+      auto regex =
+          std::make_unique<CompiledRegex>(rule, CompiledRegexMode::Search);
+      if (regex->valid())
+        matcher.direct_regex = std::move(regex);
+    }
+    prepared.emplace_back(std::move(matcher));
+  }
+  return prepared;
+}
+
+bool matchesAnyPrepared(std::vector<PreparedRemarkMatcher> &matchers,
+                        const Proxy &node) {
+  return std::any_of(matchers.begin(), matchers.end(),
+                     [&node](PreparedRemarkMatcher &matcher) {
+                       return matcher.matches(node);
+                     });
+}
+
+using PreparedRegexArray = std::vector<std::unique_ptr<CompiledRegex>>;
+
+PreparedRegexArray prepareDirectRegexes(const RegexMatchConfigs &rules,
+                                        const extra_settings &ext,
+                                        CompiledRegexMode mode) {
+  PreparedRegexArray prepared(rules.size());
+  for (std::size_t index = 0; index < rules.size(); ++index) {
+    const RegexMatchConfig &rule = rules[index];
+    if (rule.Match.empty() || startsWith(rule.Match, "!!") ||
+        (!rule.Script.empty() && ext.authorized))
+      continue;
+    auto regex = std::make_unique<CompiledRegex>(rule.Match, mode);
+    if (regex->valid())
+      prepared[index] = std::move(regex);
+  }
+  return prepared;
+}
+
+void nodeRenamePrepared(Proxy &node, const RegexMatchConfigs &rename_array,
+                        const PreparedRegexArray &prepared,
+                        extra_settings &ext) {
+  std::string &remark = node.Remark;
+  const std::string original_remark = remark;
+  std::string returned_remark;
+  std::string real_rule;
+
+  for (std::size_t index = 0; index < rename_array.size(); ++index) {
+    const RegexMatchConfig &rule = rename_array[index];
+    if (!rule.Script.empty() && ext.authorized) {
+      script_safe_runner(
+          ext.js_runtime, ext.js_context,
+          [&](qjs::Context &ctx) {
+            std::string script = rule.Script;
+            if (startsWith(script, "path:"))
+              script = fileGet(script.substr(5), true);
+            try {
+              ctx.eval(script);
+              auto rename =
+                  (std::function<std::string(const Proxy &)>)ctx.eval("rename");
+              returned_remark = rename(node);
+              if (!returned_remark.empty())
+                remark = returned_remark;
+            } catch (qjs::exception) {
+              script_print_stack(ctx);
+            }
+          },
+          effectiveSettings().scriptCleanContext);
+      continue;
+    }
+    if (prepared[index]) {
+      remark = prepared[index]->replace(remark, rule.Replace);
+      continue;
+    }
+    // Invalid direct expressions and conditional !! matchers retain the exact
+    // legacy applyMatcher + regReplace path.
+    if (applyMatcher(rule.Match, real_rule, node) && !real_rule.empty())
+      remark = regReplace(remark, real_rule, rule.Replace);
+  }
+  if (remark.empty())
+    remark = original_remark;
+}
+
+std::string addEmojiPrepared(const Proxy &node,
+                             const RegexMatchConfigs &emoji_array,
+                             const PreparedRegexArray &prepared,
+                             extra_settings &ext) {
+  std::string real_rule;
+  std::string ret;
+  for (std::size_t index = 0; index < emoji_array.size(); ++index) {
+    const RegexMatchConfig &rule = emoji_array[index];
+    if (!rule.Script.empty() && ext.authorized) {
+      std::string result;
+      script_safe_runner(
+          ext.js_runtime, ext.js_context,
+          [&](qjs::Context &ctx) {
+            std::string script = rule.Script;
+            if (startsWith(script, "path:"))
+              script = fileGet(script.substr(5), true);
+            try {
+              ctx.eval(script);
+              auto getEmoji =
+                  (std::function<std::string(const Proxy &)>)ctx.eval(
+                      "getEmoji");
+              ret = getEmoji(node);
+              if (!ret.empty())
+                result = ret + " " + node.Remark;
+            } catch (qjs::exception) {
+              script_print_stack(ctx);
+            }
+          },
+          effectiveSettings().scriptCleanContext);
+      if (!result.empty())
+        return result;
+      continue;
+    }
+    if (rule.Replace.empty())
+      continue;
+    if (prepared[index]) {
+      if (prepared[index]->matches(node.Remark))
+        return rule.Replace + " " + node.Remark;
+      continue;
+    }
+    if (applyMatcher(rule.Match, real_rule, node) && !real_rule.empty() &&
+        regFind(node.Remark, real_rule))
+      return rule.Replace + " " + node.Remark;
+  }
+  return node.Remark;
+}
+
+template <class Compare>
+void stableSortCooperatively(std::vector<Proxy> &nodes, Compare compare,
+                             ForceMaxCooperativeBatch &checkpoint) {
+  constexpr std::size_t kSortChunk = 256;
+  for (std::size_t begin = 0; begin < nodes.size(); begin += kSortChunk) {
+    const std::size_t end = std::min(nodes.size(), begin + kSortChunk);
+    std::stable_sort(nodes.begin() + static_cast<std::ptrdiff_t>(begin),
+                     nodes.begin() + static_cast<std::ptrdiff_t>(end), compare);
+    checkpoint.complete(end - begin);
+  }
+  for (std::size_t width = kSortChunk; width < nodes.size();) {
+    const std::size_t step =
+        width > nodes.size() - width ? nodes.size() : width * 2;
+    for (std::size_t begin = 0; begin < nodes.size(); begin += step) {
+      const std::size_t middle = std::min(nodes.size(), begin + width);
+      const std::size_t end = std::min(nodes.size(), begin + step);
+      if (middle != end) {
+        std::inplace_merge(
+            nodes.begin() + static_cast<std::ptrdiff_t>(begin),
+            nodes.begin() + static_cast<std::ptrdiff_t>(middle),
+            nodes.begin() + static_cast<std::ptrdiff_t>(end), compare);
+      }
+      checkpoint.complete(end - begin);
+    }
+    if (width > nodes.size() / 2)
+      break;
+    width *= 2;
+  }
+}
+
+} // namespace
+
 void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks,
                  string_array &include_remarks, int groupID) {
+  const size_t input_count = nodes.size();
+  size_t ignored_count = 0;
   int node_index = 0;
+  auto exclude_matchers = prepareRemarkMatchers(exclude_remarks);
+  auto include_matchers = prepareRemarkMatchers(include_remarks);
+  ForceMaxCooperativeBatch checkpoint(
+      effectiveSettings().resourceControlEffective == "force_max");
   auto write_iter = nodes.begin();
   for (auto iter = nodes.begin(); iter != nodes.end(); ++iter) {
     if (chkIgnore(*iter, exclude_remarks, include_remarks)) {
@@ -542,8 +780,13 @@ void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks,
     if (write_iter != iter)
       *write_iter = std::move(*iter);
     ++write_iter;
+    checkpoint.complete();
   }
   nodes.erase(write_iter, nodes.end());
+  writeLog(LOG_LEVEL_VERBOSE,
+           "NODE_FILTER_RESULT input_count=" + std::to_string(input_count) +
+               " kept_count=" + std::to_string(nodes.size()) +
+               " ignored_count=" + std::to_string(ignored_count));
   /*
   std::vector<std::unique_ptr<pcre2_code, decltype(&pcre2_code_free)>>
   exclude_patterns, include_patterns;
@@ -665,7 +908,7 @@ void nodeRename(Proxy &node, const RegexMatchConfigs &rename_array,
               script_print_stack(ctx);
             }
           },
-          global.scriptCleanContext);
+          effectiveSettings().scriptCleanContext);
       continue;
     }
     if (applyMatcher(x.Match, real_rule, node) && real_rule.size())
@@ -715,7 +958,7 @@ std::string addEmoji(const Proxy &node, const RegexMatchConfigs &emoji_array,
               script_print_stack(ctx);
             }
           },
-          global.scriptCleanContext);
+          effectiveSettings().scriptCleanContext);
       if (!result.empty())
         return result;
       continue;
@@ -730,15 +973,25 @@ std::string addEmoji(const Proxy &node, const RegexMatchConfigs &emoji_array,
 }
 
 void preprocessNodes(std::vector<Proxy> &nodes, extra_settings &ext) {
-  std::for_each(nodes.begin(), nodes.end(), [&ext](Proxy &x) {
+  const PreparedRegexArray prepared_renames = prepareDirectRegexes(
+      ext.rename_array, ext, CompiledRegexMode::Replace);
+  const PreparedRegexArray prepared_emojis =
+      ext.add_emoji
+          ? prepareDirectRegexes(ext.emoji_array, ext,
+                                 CompiledRegexMode::Search)
+          : PreparedRegexArray{};
+  ForceMaxCooperativeBatch checkpoint(
+      effectiveSettings().resourceControlEffective == "force_max");
+  for (Proxy &x : nodes) {
     if (ext.remove_emoji)
       x.Remark = trim(removeEmoji(x.Remark));
 
-    nodeRename(x, ext.rename_array, ext);
+    nodeRenamePrepared(x, ext.rename_array, prepared_renames, ext);
 
     if (ext.add_emoji)
-      x.Remark = addEmoji(x, ext.emoji_array, ext);
-  });
+      x.Remark = addEmojiPrepared(x, ext.emoji_array, prepared_emojis, ext);
+    checkpoint.complete();
+  }
 
   if (ext.sort_flag) {
     bool failed = true;
@@ -767,11 +1020,12 @@ void preprocessNodes(std::vector<Proxy> &nodes, extra_settings &ext) {
               script_print_stack(ctx);
             }
           },
-          global.scriptCleanContext);
+          effectiveSettings().scriptCleanContext);
     }
     if (failed)
-      std::stable_sort(
-          nodes.begin(), nodes.end(),
-          [](const Proxy &a, const Proxy &b) { return a.Remark < b.Remark; });
+      stableSortCooperatively(
+          nodes,
+          [](const Proxy &a, const Proxy &b) { return a.Remark < b.Remark; },
+          checkpoint);
   }
 }

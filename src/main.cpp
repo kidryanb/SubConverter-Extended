@@ -1,31 +1,39 @@
+#include <cerrno>
+#include <climits>
 #include <csignal>
+#include <cstdio>
+#include <cstdint>
+#include <fcntl.h>
 #include <iostream>
+#include <rapidjson/stringbuffer.h>
 #include <string>
 #include <unistd.h>
 
 #include <dirent.h>
 #include <sys/types.h>
 
+#include "config/preference_file.h"
 #include "config/ruleset.h"
 #include "handler/custom_openclash_rules_endpoint.h"
 #include "handler/dashboard_auth.h"
 #include "handler/dashboard_page.h"
 #include "handler/inspect_page.h"
 #include "handler/interfaces.h"
+#include "handler/multithread.h"
 #include "handler/settings.h"
 #include "handler/statistics.h"
 #include "handler/version_page.h"
 #include "handler/webget.h"
+#include "runtime/runtime_coordinator.h"
 #include "script/cron.h"
 #include "server/socket.h"
 #include "server/webserver.h"
 #include "utils/defer.h"
-#include "utils/file_extra.h"
+#include "utils/file.h"
 #include "utils/logger.h"
-#include "utils/network.h"
 #include "utils/rapidjson_extra.h"
+#include "utils/resource_control.h"
 #include "utils/system.h"
-#include "utils/urlencode.h"
 #include "version.h"
 
 // #include "vfs.h"
@@ -65,6 +73,35 @@ void setcd(std::string &file) {
   chdir(path.data());
 }
 
+struct LogRedirectResult {
+  bool success = false;
+  const char *stage = "open";
+  int error_number = 0;
+};
+
+LogRedirectResult redirectStderrToAppendFile(const char *path) {
+  std::fflush(stderr);
+  int flags = O_WRONLY | O_CREAT | O_APPEND;
+#ifdef _WIN32
+  // Preserve the text-mode line endings of the previous freopen("a") path.
+  flags |= O_TEXT;
+#endif
+  const int file_descriptor = open(path, flags, 0644);
+  if (file_descriptor < 0)
+    return {false, "open", errno};
+  if (file_descriptor != STDERR_FILENO &&
+      dup2(file_descriptor, STDERR_FILENO) < 0) {
+    const int error_number = errno;
+    close(file_descriptor);
+    return {false, "dup2", error_number};
+  }
+  if (file_descriptor != STDERR_FILENO)
+    close(file_descriptor);
+  clearerr(stderr);
+  std::cerr.clear();
+  return {true, "none", 0};
+}
+
 void chkArg(int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-cfw") == 0) {
@@ -83,6 +120,23 @@ void chkArg(int argc, char *argv[]) {
         if (freopen(argv[++i], "a", stderr) == nullptr)
           std::cerr << "无法将输出重定向到日志文件。\n";
     }
+  }
+}
+
+const char *shutdownSignalName(std::sig_atomic_t signal) {
+  switch (signal) {
+#ifndef _WIN32
+  case SIGHUP:
+    return "SIGHUP";
+  case SIGQUIT:
+    return "SIGQUIT";
+#endif
+  case SIGTERM:
+    return "SIGTERM";
+  case SIGINT:
+    return "SIGINT";
+  default:
+    return "UNKNOWN";
   }
 }
 
@@ -116,25 +170,47 @@ void cron_tick_caller() {
 }
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+  const UINT original_console_output_code_page = GetConsoleOutputCP();
+  const bool console_output_code_page_changed =
+      original_console_output_code_page != 0 &&
+      original_console_output_code_page != CP_UTF8 &&
+      SetConsoleOutputCP(CP_UTF8) != 0;
+  defer(if (console_output_code_page_changed)
+            SetConsoleOutputCP(original_console_output_code_page);)
+#endif
 #ifndef _DEBUG
   std::string prgpath = argv[0];
   setcd(prgpath); // first switch to program directory
 #endif            // _DEBUG
-  if (fileExist("pref.toml"))
-    global.prefPath = "pref.toml";
-  else if (fileExist("pref.yml"))
-    global.prefPath = "pref.yml";
-  else if (!fileExist("pref.ini")) {
-    if (fileExist("pref.example.toml")) {
-      fileCopy("pref.example.toml", "pref.toml");
-      global.prefPath = "pref.toml";
-    } else if (fileExist("pref.example.yml")) {
-      fileCopy("pref.example.yml", "pref.yml");
-      global.prefPath = "pref.yml";
-    } else if (fileExist("pref.example.ini"))
-      fileCopy("pref.example.ini", "pref.ini");
-  }
+  const PreferenceFileSelection default_preference =
+      prepareDefaultPreferenceFile();
+  global.prefPath = default_preference.path;
   chkArg(argc, argv);
+  if (default_preference.status ==
+      PreferenceFileStatus::CopyCommittedUnsynced) {
+    writeLog(LOG_LEVEL_WARNING,
+             "DEFAULT_PREFERENCE_COPY_VISIBLE source=" +
+                 default_preference.source +
+                 " destination=" + default_preference.path +
+                 " new_file_visible=true durability=unconfirmed "
+                 "action=continue");
+  }
+  if (defaultPreferenceRequiresExit(default_preference, global.prefPath)) {
+    const bool temporary_remaining =
+        default_preference.status ==
+        PreferenceFileStatus::CopyFailedTemporaryRemaining;
+    writeLog(LOG_LEVEL_FATAL,
+             std::string("DEFAULT_PREFERENCE_COPY_FAILED") +
+                 " source=" + default_preference.source +
+                 " destination=" + default_preference.path +
+                 " new_file_visible=false" +
+                 (temporary_remaining
+                      ? " temporary_file_remaining=true"
+                      : " temporary_file_remaining=false") +
+                 " action=exit");
+    return 1;
+  }
   setcd(global.prefPath); // then switch to pref directory
   writeLog(0, "SubConverter-Extended " VERSION " 正在启动...", LOG_LEVEL_INFO);
 #ifdef _WIN32
@@ -144,8 +220,7 @@ int main(int argc, char *argv[]) {
     writeLog(0, "WSAStartup 初始化失败。", LOG_LEVEL_FATAL);
     return 1;
   }
-  UINT origcp = GetConsoleOutputCP();
-  defer(SetConsoleOutputCP(origcp);) SetConsoleOutputCP(65001);
+  defer(WSACleanup();)
 #else
   signal(SIGPIPE, SIG_IGN);
   signal(SIGABRT, SIG_IGN);
@@ -162,9 +237,8 @@ int main(int argc, char *argv[]) {
   // vfs::vfs_read("vfs.ini");
   if (!global.updateRulesetOnRequest)
     refreshRulesets(global.customRulesets, global.rulesetsContent);
+  startResourceControlRuntime();
 
-  // API_MODE and API_TOKEN environment variables removed
-  // APIMode is hardcoded to true for security
   auto normalize_managed_prefix = [](const std::string &raw_value) {
     std::string value = trimWhitespace(raw_value, true, true);
     while (value.size() > 1 && value.back() == '/' && !endsWith(value, "://"))
@@ -188,6 +262,7 @@ int main(int argc, char *argv[]) {
   else if (!env_managed_prefix.empty())
     global.managedConfigPrefix = env_managed_prefix;
   global.templateVars["managed_config_prefix"] = global.managedConfigPrefix;
+  publishSettingsSnapshot(global);
 
   if (global.generatorMode)
     return simpleGenerator();
@@ -240,13 +315,8 @@ int main(int argc, char *argv[]) {
   /*
   webServer.append_response("GET", "/refreshrules", "text/plain",
                             [](RESPONSE_CALLBACK_ARGS) -> std::string {
-                              // Token authentication disabled - no
-                              // authorization required
-                              refreshRulesets(global.customRulesets,
-                                              global.rulesetsContent);
-                              return "done\n";
+                              return "ok\n";
                             });
-  */
 
   /*
   webServer.append_response("GET", "/readconf", "text/plain",
@@ -347,8 +417,12 @@ int main(int argc, char *argv[]) {
   // "text/plain;charset=utf-8", listProfiles);
 
   std::string env_port = getEnv("PORT");
-  if (!env_port.empty())
+  if (getEnv("SUBCONVERTER_LISTEN_PORT").empty() && !env_port.empty())
     global.listenPort = to_int(env_port, global.listenPort);
+  publishSettingsSnapshot(global);
+  const std::string runtime_state_path = publishRuntimeState();
+  defer(if (!runtime_state_path.empty())
+            std::remove(runtime_state_path.c_str());)
   if (global.securityProfile == "lan" &&
       (global.listenAddress == "0.0.0.0" || global.listenAddress == "::")) {
     writeLog(0,
@@ -356,9 +430,6 @@ int main(int argc, char *argv[]) {
              "security.profile=public。",
              LOG_LEVEL_WARNING);
   }
-  listener_args args = {global.listenAddress,   global.listenPort,
-                        global.maxPendingConns, global.maxConcurThreads,
-                        cron_tick_caller,       200};
   // std::cout<<"Serving HTTP @
   // http://"<<listen_address<<":"<<listen_port<<std::endl;
   writeLog(0,

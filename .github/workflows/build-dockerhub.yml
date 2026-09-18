@@ -1,4 +1,5 @@
 name: Build and Push Docker image
+run-name: ${{ inputs.refresh_dependencies && 'Refresh upstream dependencies on dev' || format('Build {0}', github.ref_name) }}
 
 on:
   push:
@@ -89,7 +90,7 @@ jobs:
       linux_matrix: ${{ steps.linux_matrix.outputs.matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           token: ${{ secrets.PAT_TOKEN || github.token }}
           fetch-depth: 0
@@ -261,7 +262,7 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.linux_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           token: ${{ secrets.PAT_TOKEN || github.token }}
           fetch-depth: 0
@@ -536,7 +537,7 @@ jobs:
     if: needs.prepare.outputs.is_release == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           token: ${{ github.event_name == 'pull_request' && github.token || secrets.PAT_TOKEN }}
           fetch-depth: 0
@@ -775,7 +776,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
 
@@ -810,6 +811,18 @@ jobs:
             git diff --name-only "$EMPTY_TREE" "$CURRENT_COMMIT^{tree}" > changed-files.md
             git diff --stat "$EMPTY_TREE" "$CURRENT_COMMIT^{tree}" > diffstat.md
           fi
+          if ! [[ "$PREVIOUS_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Latest published Release tag is not canonical SemVer: $PREVIOUS_TAG"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$PREVIOUS_TAG" "$CURRENT_COMMIT"; then
+            echo "::error::Latest published Release $PREVIOUS_TAG is not an ancestor of $CURRENT_TAG."
+            exit 1
+          fi
+          RANGE_LABEL="$PREVIOUS_TAG..$CURRENT_COMMIT"
+          git log --pretty=format:'- %h %s' "$PREVIOUS_TAG..$CURRENT_COMMIT" > commits.md
+          git diff --name-only "$PREVIOUS_TAG" "$CURRENT_COMMIT" > changed-files.md
+          git diff --stat "$PREVIOUS_TAG" "$CURRENT_COMMIT" > diffstat.md
 
           {
             echo "# Release Context"
@@ -865,7 +878,7 @@ jobs:
 
       - name: Set up Node.js
         if: steps.copilot_token.outputs.available == 'true'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
 
       - name: Generate Bilingual Release Notes with Copilot
         if: steps.copilot_token.outputs.available == 'true'
@@ -875,7 +888,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          npm install -g @github/copilot
+          npm install -g @github/copilot@1.0.70
 
           PROMPT="$(cat <<'EOF'
           You are writing release notes for SubConverter-Extended.
@@ -971,7 +984,7 @@ jobs:
           fi
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           pattern: '*'

@@ -3,6 +3,11 @@ version = 1
 enable_rule_generator = false
 overwrite_original_rules = false
 
+# SubConverter-Extended-only complete Clash rules; target=clash only.
+# Traditional subconverter ignores these fields.
+#ruleprepend = ["https://example.com/first.list"]
+#ruleappend = ["https://example.com/last.yaml"]
+
 # Options for custom base configuration file
 clash_rule_base = "base/forcerule.yml"
 #surge_rule_base = "base/surge.conf"
@@ -13,6 +18,7 @@ clash_rule_base = "base/forcerule.yml"
 #loon_rule_base = "base/loon.conf"
 #sssub_rule_base = "base/shadowsocks_base.json"
 #singbox_rule_base = "base/singbox.json"
+#stash_rule_base = "base/stash.yaml"
 
 # Options for adding emojis
 #add_emoji = true

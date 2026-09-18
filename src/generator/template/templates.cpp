@@ -2,16 +2,23 @@
 #include <algorithm>
 #include <map>
 #include <sstream>
+#include <streambuf>
+#include <stdexcept>
 #include <filesystem>
+#include <unordered_set>
 #include <inja.hpp>
 #include <nlohmann/json.hpp>
 
 #include "config/custom_openclash_rules.h"
 #include "handler/interfaces.h"
 #include "handler/settings.h"
+#include "handler/settings_view.h"
 #include "handler/webget.h"
+#include "server/request_context.h"
 #include "utils/logger.h"
+#include "utils/cooperative_cpu.h"
 #include "utils/network.h"
+#include "utils/redact.h"
 #include "utils/regexp.h"
 #include "utils/time_compat.h"
 #include "utils/urlencode.h"
@@ -23,6 +30,152 @@ extern string_array ClashRuleTypes;
 
 static thread_local FetchContext current_template_fetch_context =
     FetchContext::TrustedConfig;
+static thread_local bool *current_template_fetch_failed = nullptr;
+static thread_local const string_map *current_template_resolved_fetches =
+    nullptr;
+static thread_local string_array *current_template_missing_fetches = nullptr;
+
+struct TemplateFetchSuspended final
+{
+};
+
+static constexpr std::size_t rule_provider_file_name_max_length = 64;
+static constexpr std::size_t rule_provider_url_hash_hex_length = 16;
+
+static std::string ruleProviderUrlFingerprint(const std::string &source_url)
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    hash_t value = hash_(source_url);
+    std::string result(rule_provider_url_hash_hex_length, '0');
+    for(std::size_t index = result.size(); index > 0; --index)
+    {
+        result[index - 1] = hex[value & 0x0f];
+        value >>= 4;
+    }
+    return result;
+}
+
+static bool hasExtension(const std::string &path_or_url,
+                         const std::string &extension)
+{
+    size_t path_end = path_or_url.find_first_of("?#");
+    std::string path = path_or_url.substr(0, path_end);
+    size_t slash = path.rfind('/');
+    size_t dot = path.rfind('.');
+    return dot != std::string::npos &&
+           (slash == std::string::npos || dot > slash) &&
+           toLower(path.substr(dot)) == extension;
+}
+
+static bool isRuleProviderFileNameCharacter(unsigned char c)
+{
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '.' || c == '_' || c == '-';
+}
+
+static std::string sanitizeRuleProviderFileName(const std::string &name)
+{
+    std::string result;
+    result.reserve(std::min(name.size(), rule_provider_file_name_max_length));
+    bool pending_separator = false;
+    for(unsigned char c : name)
+    {
+        if(isRuleProviderFileNameCharacter(c))
+        {
+            if(pending_separator && !result.empty())
+                result += '_';
+            result += static_cast<char>(c);
+            pending_separator = false;
+        }
+        else
+            pending_separator = true;
+    }
+
+    const std::string trim_characters = "._-";
+    const std::size_t first = result.find_first_not_of(trim_characters);
+    if(first == std::string::npos)
+        return "provider";
+    result.erase(0, first);
+    const std::size_t last = result.find_last_not_of(trim_characters);
+    result.erase(last + 1);
+    if(result.size() > rule_provider_file_name_max_length)
+    {
+        result.resize(rule_provider_file_name_max_length);
+        const std::size_t truncated_last =
+            result.find_last_not_of(trim_characters);
+        if(truncated_last == std::string::npos)
+            return "provider";
+        result.erase(truncated_last + 1);
+    }
+    return result.empty() ? "provider" : result;
+}
+
+static std::string normalizeRuleProviderPathKey(std::string path)
+{
+    std::replace(path.begin(), path.end(), '\\', '/');
+    while(startsWith(path, "./"))
+        path.erase(0, 2);
+    for(char &c : path)
+    {
+        if(c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    }
+    return path;
+}
+
+static std::unordered_set<std::string>
+collectRuleProviderPaths(const YAML::Node &base_rule)
+{
+    std::unordered_set<std::string> paths;
+    YAML::Node providers;
+    if(base_rule.IsMap())
+    {
+        for(const auto &entry : base_rule)
+        {
+            if(entry.first.IsScalar() &&
+               entry.first.as<std::string>() == "rule-providers")
+            {
+                providers = entry.second;
+                break;
+            }
+        }
+    }
+    if(!providers.IsMap())
+        return paths;
+    for(const auto &provider : providers)
+    {
+        if(!provider.second.IsMap())
+            continue;
+        const YAML::Node path = provider.second["path"];
+        if(path.IsScalar())
+            paths.emplace(normalizeRuleProviderPathKey(path.as<std::string>()));
+    }
+    return paths;
+}
+
+static std::string reserveRuleProviderPath(
+    const std::string &provider_name, const std::string &behavior,
+    const std::string &source_url, const std::string &extension,
+    std::unordered_set<std::string> &used_paths)
+{
+    const std::string safe_name =
+        sanitizeRuleProviderFileName(provider_name);
+    const std::string url_hash =
+        ruleProviderUrlFingerprint(source_url);
+    for(std::size_t index = 1;; ++index)
+    {
+        std::string unique_name = safe_name;
+        if(index > 1)
+            unique_name += "-" + std::to_string(index);
+        const std::string path =
+            "./providers/" + unique_name + "-" + behavior + "-" +
+            url_hash + "." + extension;
+        if(used_paths.emplace(normalizeRuleProviderPathKey(path)).second)
+            return path;
+    }
+}
 
 namespace inja
 {
@@ -122,7 +275,7 @@ std::string parseHostname(inja::Arguments &args)
     ProxyPolicy proxy = parseProxy(global.proxyConfig);
     for(std::string &x : urls)
     {
-        input_content = webGet(x, proxy, global.cacheConfig);
+        input_content = webGet(x, proxy, settings.cacheConfig);
         regGetMatch(input_content, matcher, 2, 0, &hostname);
         if(hostname.size())
         {
@@ -152,23 +305,61 @@ std::string template_webGet(inja::Arguments &args)
 }
 #endif // NO_WEBGET
 
-int render_template(const std::string &content, const template_args &vars,
-                    std::string &output, const std::string &include_scope,
-                    FetchContext context)
+int render_template_resolved(
+    const std::string &content, const template_args &vars,
+    std::string &output, const std::string &include_scope,
+    FetchContext context, const string_map &resolved_fetches,
+    string_array &missing_fetches, bool *fetch_failed,
+    uint64_t max_output_bytes)
 {
+    struct ResolvedFetchGuard
+    {
+        const string_map *previous_resolved;
+        string_array *previous_missing;
+        ResolvedFetchGuard(const string_map &resolved,
+                           string_array &missing)
+            : previous_resolved(current_template_resolved_fetches),
+              previous_missing(current_template_missing_fetches)
+        {
+            current_template_resolved_fetches = &resolved;
+            current_template_missing_fetches = &missing;
+        }
+        ~ResolvedFetchGuard()
+        {
+            current_template_resolved_fetches = previous_resolved;
+            current_template_missing_fetches = previous_missing;
+        }
+    } guard(resolved_fetches, missing_fetches);
+    return render_template(content, vars, output, include_scope, context,
+                           fetch_failed, max_output_bytes);
+}
+
+int render_template(const std::string &content, const template_args &vars,
+                     std::string &output, const std::string &include_scope,
+                     FetchContext context, bool *fetch_failed,
+                     uint64_t max_output_bytes)
+{
+    RequestStageTimer template_timer(RequestStage::Template);
     struct TemplateFetchContextGuard
     {
         FetchContext previous;
-        explicit TemplateFetchContextGuard(FetchContext context)
-            : previous(current_template_fetch_context)
+        bool *previous_fetch_failed;
+        TemplateFetchContextGuard(FetchContext context, bool *fetch_failed)
+            : previous(current_template_fetch_context),
+              previous_fetch_failed(current_template_fetch_failed)
         {
             current_template_fetch_context = context;
+            current_template_fetch_failed = fetch_failed;
         }
         ~TemplateFetchContextGuard()
         {
             current_template_fetch_context = previous;
+            current_template_fetch_failed = previous_fetch_failed;
         }
-    } guard(context);
+    } guard(context, fetch_failed);
+
+    if(fetch_failed)
+        *fetch_failed = false;
 
     std::string absolute_scope;
     try
@@ -178,7 +369,9 @@ int render_template(const std::string &content, const template_args &vars,
     }
     catch(std::exception &e)
     {
-        writeLog(0, e.what(), LOG_LEVEL_ERROR);
+        writeLog(LOG_LEVEL_ERROR,
+                 "TEMPLATE_SCOPE_RESOLUTION_FAILED detail=" +
+                     summarizeSensitiveTextForLog(e.what()));
     }
     nlohmann::json data;
     for(auto &x : vars.global_vars)
@@ -194,7 +387,8 @@ int render_template(const std::string &content, const template_args &vars,
         }
         all_args += "&";
     }
-    all_args.erase(all_args.size() - 1);
+    if(!all_args.empty())
+        all_args.pop_back();
     parse_json_pointer(data["request"], "_args", all_args);
     for(auto &x : vars.local_vars)
         parse_json_pointer(data["local"], x.first, x.second);
@@ -270,7 +464,8 @@ int render_template(const std::string &content, const template_args &vars,
     });
     env.add_callback("getLink", 1, [](inja::Arguments &args)
     {
-        return global.managedConfigPrefix + args.at(0)->get<std::string>();
+        return effectiveSettings().managedConfigPrefix +
+               args.at(0)->get<std::string>();
     });
     env.add_callback("startsWith", 2, [](inja::Arguments &args)
     {
@@ -337,10 +532,66 @@ int render_template(const std::string &content, const template_args &vars,
 
     try
     {
-        std::stringstream out;
+        class BoundedStringBuffer final : public std::streambuf
+        {
+        public:
+            explicit BoundedStringBuffer(uint64_t limit) : limit_(limit) {}
+            std::string release() { return std::move(output_); }
+            bool exceeded() const noexcept { return exceeded_; }
+
+        protected:
+            std::streamsize xsputn(const char *data,
+                                   std::streamsize count) override
+            {
+                if(count < 0)
+                    throw std::length_error("negative template output");
+                const uint64_t bytes = static_cast<uint64_t>(count);
+                if(limit_ != 0 &&
+                   (bytes > limit_ || output_.size() > limit_ - bytes))
+                {
+                    exceeded_ = true;
+                    return count;
+                }
+                output_.append(data, static_cast<size_t>(count));
+                return count;
+            }
+
+            int overflow(int value) override
+            {
+                if(value == traits_type::eof())
+                    return traits_type::not_eof(value);
+                const char byte = static_cast<char>(value);
+                xsputn(&byte, 1);
+                return value;
+            }
+
+        private:
+            uint64_t limit_ = 0;
+            std::string output_;
+            bool exceeded_ = false;
+        } buffer(max_output_bytes);
+        std::ostream out(&buffer);
         env.render_to(out, env.parse(content), data);
-        output = out.str();
+        if(buffer.exceeded())
+        {
+            output.clear();
+            return -3;
+        }
+        output = buffer.release();
         return 0;
+    }
+    catch (const TemplateFetchSuspended &)
+    {
+        output.clear();
+        return -4;
+    }
+    catch (const std::length_error &e)
+    {
+        output.clear();
+        writeLog(LOG_LEVEL_WARNING,
+                 "TEMPLATE_OUTPUT_LIMIT_EXCEEDED detail=" +
+                     summarizeSensitiveTextForLog(e.what()));
+        return -3;
     }
     catch (std::exception &e)
     {
@@ -402,12 +653,14 @@ std::string findFileName(const std::string &path)
 
 int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_content_array, const std::string &remote_path_prefix, bool script, bool overwrite_original_rules, bool clash_classical_ruleset, RuleConversionStats *stats)
 {
+    RequestStageTimer rules_timer(RequestStage::Rules);
+    RuleConversionStats local_stats;
     nlohmann::json data;
     std::string match_group, geoips, retrieved_rules;
     std::string strLine, rule_group, rule_path, rule_path_typed, rule_name, old_rule_name;
     std::stringstream strStrm;
     string_array vArray, groups;
-    string_map keywords, urls, names;
+    string_map keywords, urls, source_urls, names;
     std::map<std::string, bool> has_domain, has_ipcidr;
     std::map<std::string, int> ruleset_interval, rule_type;
     string_array rules;
@@ -423,7 +676,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
         rule_path_typed = x.rule_path_typed;
         if(rule_path.empty())
         {
-            strLine = x.rule_content.get().substr(2);
+            strLine = materializeRulesetContent(x).substr(2);
             if(script)
             {
                 if(startsWith(strLine, "MATCH") || startsWith(strLine, "FINAL"))
@@ -457,6 +710,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                     rule_name = old_rule_name + " " + std::to_string(idx++);
                 names[rule_name] = rule_group;
                 urls[rule_name] = "*" + rule_path;
+                source_urls[rule_name] = rule_path;
                 rule_type[rule_name] = x.rule_type;
                 ruleset_interval[rule_name] = x.update_interval;
                 switch(x.rule_type)
@@ -500,6 +754,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                         rule_name = old_rule_name + " " + std::to_string(idx++);
                     names[rule_name] = rule_group;
                     urls[rule_name] = rule_path_typed;
+                    source_urls[rule_name] = rule_path;
                     rule_type[rule_name] = x.rule_type;
                     ruleset_interval[rule_name] = x.update_interval;
                     if(clash_classical_ruleset)
@@ -518,7 +773,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                     continue;
             }
 
-            retrieved_rules = x.rule_content.get();
+            retrieved_rules = materializeRulesetContent(x);
             if(retrieved_rules.empty())
             {
                 writeLog(0, "获取规则集失败或规则集为空：'" + x.rule_path + "'。", LOG_LEVEL_WARNING);
@@ -606,6 +861,8 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                 groups.emplace_back(rule_name);
         }
     }
+    std::unordered_set<std::string> used_provider_paths =
+        collectRuleProviderPaths(base_rule);
     for(std::string &x : groups)
     {
         std::string url = urls[x], keyword = keywords[x], name = names[x];
@@ -616,6 +873,29 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             custom_openclash_rules::hasMrsExtension(direct_url);
         bool group_has_domain = has_domain[x], group_has_ipcidr = has_ipcidr[x];
         int interval = ruleset_interval[x];
+
+        auto emit_provider = [&](const std::string &yaml_key,
+                                 const std::string &behavior,
+                                 int conversion_type)
+        {
+            YAML::Node provider = base_rule["rule-providers"][yaml_key];
+            provider["type"] = "http";
+            provider["behavior"] = behavior;
+            if(url[0] == '*')
+                provider["url"] = url.substr(1);
+            else
+                provider["url"] =
+                    remote_path_prefix + "/getruleset?type=" +
+                    std::to_string(conversion_type) + "&url=" +
+                    urlSafeBase64Encode(url);
+            provider["path"] = reserveRuleProviderPath(
+                x, behavior, source_urls[x], provider_extension,
+                used_provider_paths);
+            if(!provider_format.empty())
+                provider["format"] = provider_format;
+            if(interval)
+                provider["interval"] = interval;
+        };
 
         if(group_has_domain)
         {
@@ -713,5 +993,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
     }
     else
         base_rule["rules"] = rules;
+    if(stats)
+        stats->add(local_stats.rules);
     return 0;
 }

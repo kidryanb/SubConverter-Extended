@@ -284,73 +284,64 @@ enhanced-mode-by-rule = true
         "level": "info",
         "timestamp": true
     },
+    {% if default(request.singbox.legacy, "") == "1" %}
+    {% else %}
+    "http_clients": [
+        {
+            "tag": "rules-direct"
+        }
+    ],
+    {% endif %}
     "dns": {
         "servers": [
             {
+                "type": "tls",
                 "tag": "dns_proxy",
-                "address": "tls://1.1.1.1",
-                "address_resolver": "dns_resolver"
+                "server": "1.1.1.1"
             },
             {
+                "type": "h3",
                 "tag": "dns_direct",
-                "address": "h3://dns.alidns.com/dns-query",
-                "address_resolver": "dns_resolver",
-                "detour": "DIRECT"
+                "server": "dns.alidns.com",
+                "path": "/dns-query",
+                "domain_resolver": "dns_resolver"
             },
             {
+                "type": "fakeip",
                 "tag": "dns_fakeip",
-                "address": "fakeip"
+                {% if default(request.singbox.ipv6, "") == "1" %}
+                "inet6_range": "fc00::\/18",
+                {% endif %}
+                "inet4_range": "198.18.0.0\/15"
             },
             {
+                "type": "udp",
                 "tag": "dns_resolver",
-                "address": "223.5.5.5",
-                "detour": "DIRECT"
-            },
-            {
-                "tag": "block",
-                "address": "rcode://success"
+                "server": "223.5.5.5"
             }
         ],
         "rules": [
             {
-                "outbound": [
-                    "any"
-                ],
-                "server": "dns_resolver"
+                "rule_set": "geosite-category-ads-all",
+                "action": "predefined",
+                "rcode": "NOERROR"
             },
             {
-                "geosite": [
-                    "category-ads-all"
-                ],
-                "server": "dns_block",
-                "disable_cache": true
-            },
-            {
-                "geosite": [
-                    "geolocation-!cn"
-                ],
+                "rule_set": "geosite-geolocation-!cn",
                 "query_type": [
                     "A",
                     "AAAA"
                 ],
+                "action": "route",
                 "server": "dns_fakeip"
             },
             {
-                "geosite": [
-                    "geolocation-!cn"
-                ],
+                "rule_set": "geosite-geolocation-!cn",
+                "action": "route",
                 "server": "dns_proxy"
             }
         ],
-        "final": "dns_direct",
-        "independent_cache": true,
-        "fakeip": {
-            "enabled": true,
-            {% if default(request.singbox.ipv6, "") == "1" %}
-            "inet6_range": "fc00::\/18",
-            {% endif %}
-            "inet4_range": "198.18.0.0\/15"
-        }
+        "final": "dns_direct"
     },
     "ntp": {
         "enabled": true,
@@ -373,19 +364,55 @@ enhanced-mode-by-rule = true
         {
             "type": "tun",
             "tag": "tun-in",
-            "inet4_address": "172.19.0.1/30",
-            {% if default(request.singbox.ipv6, "") == "1" %}
-            "inet6_address": "fdfe:dcba:9876::1/126",
-            {% endif %}
+            "address": [
+                "172.19.0.1/30"{% if default(request.singbox.ipv6, "") == "1" %},
+                "fdfe:dcba:9876::1/126"{% endif %}
+            ],
             "auto_route": true,
             "strict_route": true,
-            "stack": "mixed",
-            "sniff": true
+            "stack": "mixed"
         }
     ],
     "outbounds": [],
     "route": {
-        "rules": [],
+        "rules": [
+            {
+                "action": "sniff"
+            },
+            {
+                "protocol": "dns",
+                "action": "hijack-dns"
+            }
+        ],
+        "rule_set": [
+            {
+                "type": "remote",
+                "tag": "geosite-category-ads-all",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+                {% if default(request.singbox.legacy, "") == "1" %}
+                "download_detour": "DIRECT"
+                {% else %}
+                "http_client": "rules-direct"
+                {% endif %}
+            },
+            {
+                "type": "remote",
+                "tag": "geosite-geolocation-!cn",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
+                {% if default(request.singbox.legacy, "") == "1" %}
+                "download_detour": "DIRECT"
+                {% else %}
+                "http_client": "rules-direct"
+                {% endif %}
+            }
+        ],
+        "default_domain_resolver": "dns_resolver",
+        {% if default(request.singbox.legacy, "") == "1" %}
+        {% else %}
+        "default_http_client": "rules-direct",
+        {% endif %}
         "auto_detect_interface": true
     },
     "experimental": {

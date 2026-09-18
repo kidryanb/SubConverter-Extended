@@ -220,9 +220,9 @@ rulesets:
   # Rule fields: rule is inline; ruleset is a local file or URL; group is the target policy group; interval is seconds; surge/quanx/clash-domain/clash-ipcidr/clash-classic prefixes are supported.
   rulesets:
 #  - {rule: "GEOIP,CN", group: "DIRECT"}
-#  - {ruleset: "rules/LocalAreaNetwork.list", group: "DIRECT"}
-#  - {ruleset: "surge:rules/LocalAreaNetwork.list", group: "DIRECT"}
-#  - {ruleset: "quanx:https://raw.githubusercontent.com/ConnersHua/Profiles/master/Quantumult/X/Filter/Advertising.list", group: "Advertising", interval: 86400}
+#  - {ruleset: "https://example.com/rules/lan.list", group: "DIRECT"}
+#  - {ruleset: "surge:https://example.com/rules/lan.list", group: "DIRECT"}
+#  - {ruleset: "quanx:https://example.com/rules/advertising.list", group: "Advertising", interval: 86400}
 #  - {ruleset: "clash-domain:https://ruleset.dev/clash_domestic_services_domains", group: "Domestic Services", interval: 86400}
 #  - {ruleset: "clash-ipcidr:https://ruleset.dev/clash_domestic_services_ips", group: "Domestic Services", interval: 86400}
 #  - {ruleset: "clash-ipcidr:https://example.com/cn-ip.yaml", group: "🎯 全球直连", interval: 28800, options: ["no-resolve"]}

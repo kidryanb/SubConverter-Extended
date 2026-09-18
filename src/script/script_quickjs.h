@@ -6,7 +6,49 @@
 
 #ifndef NO_JS_RUNTIME
 
+#include <cstddef>
+#include <memory>
 #include <quickjspp.hpp>
+#include <stdexcept>
+
+struct ScriptNestedRuntimeBudget {
+    size_t heap_bytes = 0;
+    size_t stack_bytes = 0;
+    int (*interrupt_handler)(JSRuntime *, void *) = nullptr;
+    void *interrupt_opaque = nullptr;
+    bool active = false;
+};
+
+inline thread_local ScriptNestedRuntimeBudget script_nested_runtime_budget;
+
+class ScopedScriptNestedRuntimeBudget {
+public:
+    ScopedScriptNestedRuntimeBudget(size_t heap_bytes,
+                                    size_t stack_bytes,
+                                    int (*interrupt_handler)(
+                                        JSRuntime *, void *) = nullptr,
+                                    void *interrupt_opaque = nullptr) noexcept
+        : previous_(script_nested_runtime_budget) {
+        script_nested_runtime_budget =
+            {heap_bytes, stack_bytes, interrupt_handler,
+             interrupt_opaque, heap_bytes != 0 && stack_bytes != 0};
+    }
+    ~ScopedScriptNestedRuntimeBudget() {
+        script_nested_runtime_budget = previous_;
+    }
+
+    ScopedScriptNestedRuntimeBudget(
+        const ScopedScriptNestedRuntimeBudget &) = delete;
+    ScopedScriptNestedRuntimeBudget &operator=(
+        const ScopedScriptNestedRuntimeBudget &) = delete;
+
+private:
+    ScriptNestedRuntimeBudget previous_;
+};
+
+inline ScriptNestedRuntimeBudget currentScriptNestedRuntimeBudget() noexcept {
+    return script_nested_runtime_budget;
+}
 
 void script_runtime_init(qjs::Runtime &runtime);
 int script_context_init(qjs::Context &context);
@@ -131,6 +173,14 @@ namespace qjs
             JS_DefinePropertyValueStr(ctx, obj, "TLS13", js_traits<tribool>::wrap(ctx, n.TLS13), JS_PROP_C_W_E);
 
             JS_DefinePropertyValueStr(ctx, obj, "SnellVersion", JS_NewInt32(ctx, n.SnellVersion), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "SnellReuse", js_traits<tribool>::wrap(ctx, n.SnellReuse), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "SnellUserKey", JS_NewString(ctx, n.SnellUserKey), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "SnellNetwork", JS_NewString(ctx, n.SnellNetwork), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "SnellMode", JS_NewString(ctx, n.SnellMode), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "SnellUDPPort", JS_NewUint32(ctx, n.SnellUDPPort), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "ShadowTLSPassword", JS_NewString(ctx, n.ShadowTLSPassword), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "ShadowTLSSNI", JS_NewString(ctx, n.ShadowTLSSNI), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "ShadowTLSVersion", JS_NewUint32(ctx, n.ShadowTLSVersion), JS_PROP_C_W_E);
             JS_DefinePropertyValueStr(ctx, obj, "ServerName", JS_NewString(ctx, n.ServerName), JS_PROP_C_W_E);
 
             JS_DefinePropertyValueStr(ctx, obj, "SelfIP", JS_NewString(ctx, n.SelfIP), JS_PROP_C_W_E);
@@ -144,6 +194,22 @@ namespace qjs
             JS_DefinePropertyValueStr(ctx, obj, "KeepAlive", JS_NewUint32(ctx, n.KeepAlive), JS_PROP_C_W_E);
             JS_DefinePropertyValueStr(ctx, obj, "TestUrl", JS_NewString(ctx, n.TestUrl), JS_PROP_C_W_E);
             JS_DefinePropertyValueStr(ctx, obj, "ClientId", JS_NewString(ctx, n.ClientId), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "Ports", JS_NewString(ctx, n.Ports), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "Auth", JS_NewString(ctx, n.Auth), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "AuthStr", JS_NewString(ctx, n.AuthStr), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "Alpn", JS_NewString(ctx, n.Alpn), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "AlpnList", js_traits<StringArray>::wrap(ctx, n.AlpnList), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "UpMbps", JS_NewString(ctx, n.UpMbps), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "DownMbps", JS_NewString(ctx, n.DownMbps), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "HysteriaHopInterval", JS_NewString(ctx, n.HysteriaHopInterval), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "MieruProfile", JS_NewString(ctx, n.MieruProfile), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "MieruSourceId", JS_NewString(ctx, n.MieruSourceId), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "MieruSourceRemark", JS_NewString(ctx, n.MieruSourceRemark), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "MieruBindingIndex", JS_NewUint32(ctx, n.MieruBindingIndex), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "MieruHasUnknownParameters", JS_NewBool(ctx, n.MieruHasUnknownParameters), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "MieruHandshakeMode", JS_NewString(ctx, n.MieruHandshakeMode), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "MieruTrafficPattern", JS_NewString(ctx, n.MieruTrafficPattern), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, obj, "Insecure", JS_NewString(ctx, n.Insecure), JS_PROP_C_W_E);
             return obj;
         }
 
@@ -186,6 +252,14 @@ namespace qjs
             node.TLS13 = unwrap_free<tribool>(ctx, v, "TLS13");
 
             node.SnellVersion = unwrap_free<int32_t>(ctx, v, "SnellVersion");
+            node.SnellReuse = unwrap_free<tribool>(ctx, v, "SnellReuse");
+            node.SnellUserKey = unwrap_free<std::string>(ctx, v, "SnellUserKey");
+            node.SnellNetwork = unwrap_free<std::string>(ctx, v, "SnellNetwork");
+            node.SnellMode = unwrap_free<std::string>(ctx, v, "SnellMode");
+            node.SnellUDPPort = unwrap_free<uint32_t>(ctx, v, "SnellUDPPort");
+            node.ShadowTLSPassword = unwrap_free<std::string>(ctx, v, "ShadowTLSPassword");
+            node.ShadowTLSSNI = unwrap_free<std::string>(ctx, v, "ShadowTLSSNI");
+            node.ShadowTLSVersion = unwrap_free<uint32_t>(ctx, v, "ShadowTLSVersion");
             node.ServerName = unwrap_free<std::string>(ctx, v, "ServerName");
 
             node.SelfIP = unwrap_free<std::string>(ctx, v, "SelfIP");
@@ -199,6 +273,22 @@ namespace qjs
             node.KeepAlive = unwrap_free<uint32_t>(ctx, v, "KeepAlive");
             node.TestUrl = unwrap_free<std::string>(ctx, v, "TestUrl");
             node.ClientId = unwrap_free<std::string>(ctx, v, "ClientId");
+            node.Ports = unwrap_free<std::string>(ctx, v, "Ports");
+            node.Auth = unwrap_free<std::string>(ctx, v, "Auth");
+            node.AuthStr = unwrap_free<std::string>(ctx, v, "AuthStr");
+            node.Alpn = unwrap_free<std::string>(ctx, v, "Alpn");
+            node.AlpnList = unwrap_free<StringArray>(ctx, v, "AlpnList");
+            node.UpMbps = unwrap_free<std::string>(ctx, v, "UpMbps");
+            node.DownMbps = unwrap_free<std::string>(ctx, v, "DownMbps");
+            node.HysteriaHopInterval = unwrap_free<std::string>(ctx, v, "HysteriaHopInterval");
+            node.MieruProfile = unwrap_free<std::string>(ctx, v, "MieruProfile");
+            node.MieruSourceId = unwrap_free<std::string>(ctx, v, "MieruSourceId");
+            node.MieruSourceRemark = unwrap_free<std::string>(ctx, v, "MieruSourceRemark");
+            node.MieruBindingIndex = unwrap_free<uint32_t>(ctx, v, "MieruBindingIndex");
+            node.MieruHasUnknownParameters = unwrap_free<bool>(ctx, v, "MieruHasUnknownParameters");
+            node.MieruHandshakeMode = unwrap_free<std::string>(ctx, v, "MieruHandshakeMode");
+            node.MieruTrafficPattern = unwrap_free<std::string>(ctx, v, "MieruTrafficPattern");
+            node.Insecure = unwrap_free<std::string>(ctx, v, "Insecure");
             
             return node;
         }
@@ -210,15 +300,41 @@ void script_safe_runner(qjs::Runtime *runtime, qjs::Context *context, Fn runnabl
 {
     qjs::Runtime *internal_runtime = runtime;
     qjs::Context *internal_context = context;
-    defer(if(clean_context) {delete internal_context; delete internal_runtime;} )
+    std::unique_ptr<qjs::Runtime> owned_runtime;
+    std::unique_ptr<qjs::Context> owned_context;
+    bool clean_context_initialized = false;
+    defer(if(clean_context_initialized && internal_context)
+              (void)script_cleanup(*internal_context);)
     if(clean_context)
     {
-        internal_runtime = new qjs::Runtime();
+        owned_runtime = std::make_unique<qjs::Runtime>();
+        internal_runtime = owned_runtime.get();
+        const ScriptNestedRuntimeBudget nested =
+            currentScriptNestedRuntimeBudget();
+        if(nested.active)
+        {
+            JS_SetMemoryLimit(internal_runtime->rt, nested.heap_bytes);
+            JS_SetMaxStackSize(internal_runtime->rt, nested.stack_bytes);
+            if(nested.interrupt_handler)
+                JS_SetInterruptHandler(internal_runtime->rt,
+                                       nested.interrupt_handler,
+                                       nested.interrupt_opaque);
+        }
         script_runtime_init(*internal_runtime);
-        internal_context = new qjs::Context(*internal_runtime);
-        script_context_init(*internal_context);
+        owned_context = std::make_unique<qjs::Context>(*internal_runtime);
+        internal_context = owned_context.get();
+        if(script_context_init(*internal_context) != 0)
+        {
+            (void)script_cleanup(*internal_context);
+            throw std::runtime_error("QuickJS clean context initialization failed");
+        }
+        clean_context_initialized = true;
     }
-    if(internal_runtime && internal_context)
+    // A bounded QuickJS lane owns the runtime and lends only its initialized
+    // Context to conversion code. The runtime pointer remains null so the
+    // legacy extra_settings destructor cannot accidentally free lane-owned
+    // state; a valid context is sufficient to execute the callback.
+    if(internal_context)
         runnable(*internal_context);
 }
 

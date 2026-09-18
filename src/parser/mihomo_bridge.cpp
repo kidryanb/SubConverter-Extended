@@ -63,20 +63,50 @@ private:
 
 namespace mihomo {
 
-std::string ProxyNode::toYAML() const {
-  std::stringstream ss;
-  ss << "  - name: \"" << name << "\"\n";
-  ss << "    type: " << type << "\n";
-  ss << "    server: " << server << "\n";
-  ss << "    port: " << port << "\n";
+constexpr size_t kLargeSubscriptionThreshold = 256 * 1024;
+constexpr auto kGoMemoryReleaseInterval = std::chrono::seconds(30);
 
-  // Add other parameters
-  for (const auto &[key, value] : params) {
-    ss << "    " << key << ": " << value << "\n";
+void releaseGoMemoryAfterLargeParse(size_t subscription_size) noexcept {
+  if (subscription_size < kLargeSubscriptionThreshold)
+    return;
+
+  try {
+    static std::mutex release_mutex;
+    static std::chrono::steady_clock::time_point last_release;
+    static bool released_once = false;
+
+    std::unique_lock<std::mutex> lock(release_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+      return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (released_once && now - last_release < kGoMemoryReleaseInterval)
+      return;
+
+    ReleaseUnusedMemory();
+    last_release = now;
+    released_once = true;
+  } catch (...) {
+    // Memory reclamation is opportunistic and must never fail a conversion.
+  }
+}
+
+class LargeParseMemoryGuard {
+public:
+  explicit LargeParseMemoryGuard(size_t subscription_size)
+      : subscription_size_(subscription_size) {}
+
+  ~LargeParseMemoryGuard() {
+    releaseGoMemoryAfterLargeParse(subscription_size_);
   }
 
-  return ss.str();
-}
+private:
+  size_t subscription_size_;
+};
+
+} // namespace
+
+namespace mihomo {
 
 std::vector<ProxyNode> parseSubscription(const std::string &subscription) {
   std::vector<ProxyNode> nodes;
@@ -107,6 +137,7 @@ std::vector<ProxyNode> parseSubscription(const std::string &subscription) {
       node.name = item.value("name", "");
       node.type = item.value("type", "");
       node.server = item.value("server", "");
+      node.canonical_json = item.dump();
 
       // Port: handle both number and string
       if (item.contains("port")) {

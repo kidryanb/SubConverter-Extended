@@ -1,0 +1,68 @@
+name: Sync Docker Hub description
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/DOCKERHUB_DESCRIPTION.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-dockerhub-description
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Update Docker Hub repository description
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          from scripts.ci.cleanup_container_registry import (
+              CleanupError,
+              _json_request,
+              _request,
+              dockerhub_token,
+          )
+
+          username = os.environ.get("DOCKERHUB_USERNAME", "")
+          secret = os.environ.get("DOCKERHUB_TOKEN", "")
+          token = dockerhub_token(username, secret)
+          url = (
+              "https://hub.docker.com/v2/namespaces/aethersailor/"
+              "repositories/subconverter-extended"
+          )
+          expected = {
+              "description": "多客户端订阅转换后端，重点增强 Mihomo Provider 与远程资源。",
+              "full_description": Path(
+                  ".github/DOCKERHUB_DESCRIPTION.md"
+              ).read_text(encoding="utf-8"),
+          }
+          _request(
+              "PATCH",
+              url,
+              headers={"Authorization": f"Bearer {token}"},
+              payload=expected,
+              expected=(200, 202, 204),
+          )
+          current, _headers = _json_request("GET", url)
+          if not isinstance(current, dict) or any(
+              current.get(key) != value for key, value in expected.items()
+          ):
+              raise CleanupError("Docker Hub description readback mismatch")
+          PY

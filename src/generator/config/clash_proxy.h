@@ -1,0 +1,49 @@
+#ifndef CLASH_PROXY_H_INCLUDED
+#define CLASH_PROXY_H_INCLUDED
+
+#include <string>
+#include <cstddef>
+#include <limits>
+
+#include <yaml-cpp/yaml.h>
+
+#include "parser/config/proxy.h"
+
+struct ClashProxyOverlay {
+  tribool udp;
+  tribool skip_cert_verify;
+  tribool tfo;
+  tribool xudp;
+};
+
+// Build one Clash proxy mapping from Mihomo's complete type-preserving JSON
+// result. Only compatibility-visible identity fields and explicitly requested
+// global overlays are changed.
+YAML::Node buildCanonicalClashProxy(const Proxy &proxy,
+                                    const ClashProxyOverlay &overlay);
+
+// Mark a scalar for quoted emission through dumpCanonicalClashYaml(). Use this
+// when a target syntax requires quotes even though yaml-cpp would emit plain
+// style, such as Stash DoH3 URLs containing a URI fragment.
+YAML::Node buildQuotedYamlString(const std::string &value);
+
+// Serialize Clash YAML while preserving the scalar types carried by Mihomo's
+// canonical JSON. This is the only supported dump path for YAML that may
+// contain nodes returned by buildCanonicalClashProxy().
+std::string dumpCanonicalClashYaml(const YAML::Node &node);
+std::string dumpCanonicalClashYaml(
+    const YAML::Node &node, std::size_t max_output_bytes);
+
+// yaml-cpp's default YAML::Dump owns an unbounded internal std::string. This
+// variant emits directly into a caller-sized stream buffer.
+std::string dumpYamlBounded(
+    const YAML::Node &node,
+    std::size_t max_output_bytes = std::numeric_limits<std::size_t>::max());
+
+// Finalize an already serialized Clash document. This is used by output paths
+// that compose independently dumped top-level fields.
+std::string finalizeCanonicalClashYaml(const std::string &yaml);
+std::string finalizeCanonicalClashYaml(std::string yaml,
+                                       std::size_t max_output_bytes);
+
+#endif // CLASH_PROXY_H_INCLUDED

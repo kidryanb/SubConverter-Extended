@@ -9,7 +9,7 @@ FROM ${GO_IMAGE} AS go-builder
 
 ARG TARGETARCH
 ARG TARGETVARIANT
-ARG MIHOMO_REF="Meta"
+ARG MIHOMO_REF="Alpha"
 ARG MIHOMO_CACHE_BUST=1
 ARG REFRESH_GO_DEPS=false
 
@@ -43,21 +43,72 @@ RUN go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated
 RUN go run ../scripts/generate_schemes.go mihomo_schemes.h
 RUN go run ../scripts/generate_param_compat.go -o param_compat.h
 
-# Build shared library (c-shared mode for musl compatibility)
+RUN CGO_ENABLED=0 go build \
+    -trimpath \
+    -ldflags='-s -w' \
+    -o subconverter-update \
+    ./cmd/portable-updater
+
+# Build the shared library used by the normal Alpine runtime and a glibc archive
+# for build/test consumers.  The sanitizer build instruments the Go archive so
+# its runtime cooperates with the outer C++ ASan process.  The c-shared form is
+# retained for production, but is not used in this glibc sanitizer composition.
 # 关键修改：
 # 1. 使用 c-shared 模式避免 musl 环境下 Go runtime 初始化问题
 # 2. musl libc 不向构造函数传递 argc/argv，c-archive 模式会导致 Segfault
 # 3. c-shared 模式下 Go runtime 边界清晰，初始化更稳定
-RUN echo "==> Building for $TARGETARCH with c-shared mode (musl compatible)" && \
-    CGO_ENABLED=1 \
-    go build \
+RUN set -xe && \
+    CGO_ENABLED=1 go build \
     -trimpath \
+    -ldflags='-s -w' \
     -buildmode=c-shared \
     -o libmihomo.so \
+    . && \
+    sanitizer_flags="" && \
+    if [ "${ENABLE_SANITIZERS}" = "true" ]; then \
+      sanitizer_flags="-asan"; \
+      echo "==> Building glibc Go archive with ASan interoperability"; \
+    fi && \
+    echo "==> Building glibc archive for $TARGETARCH" && \
+    CGO_ENABLED=1 \
+    go build ${sanitizer_flags} \
+    -trimpath \
+    -ldflags='-s -w' \
+    -buildmode=c-archive \
+    -o libmihomo.a \
     .
 
 # Verify build output
-RUN ls -lh libmihomo.so libmihomo.h
+RUN ls -lh libmihomo.so libmihomo.a libmihomo.h subconverter-update
+
+# Build the config validator from the exact Mihomo module selected by the
+# bridge. It is test-only and never copied into the runtime or CI export image.
+ARG BUILD_TESTS=false
+RUN set -eux; \
+    mkdir -p /build/test-tools; \
+    if [ "${BUILD_TESTS}" = "true" ]; then \
+      mihomo_dir="$(GOWORK=off go list -m -mod=readonly -f '{{.Dir}}' github.com/metacubex/mihomo)"; \
+      mihomo_version="$(GOWORK=off go list -m -mod=readonly -f '{{.Version}}' github.com/metacubex/mihomo)"; \
+      echo "Building Mihomo config validator ${mihomo_version}"; \
+      for attempt in 1 2 3; do \
+        if (cd "${mihomo_dir}" && \
+          GOWORK=off CGO_ENABLED=1 go build \
+            -mod=readonly \
+            -trimpath \
+            -ldflags='-s -w' \
+            -o /build/test-tools/mihomo \
+            .); then \
+          break; \
+        fi; \
+        if [ "${attempt}" = 3 ]; then \
+          echo "Mihomo config validator build failed after ${attempt} attempts" >&2; \
+          exit 1; \
+        fi; \
+        echo "Mihomo config validator build attempt ${attempt} failed; retrying" >&2; \
+        sleep "$((attempt * 5))"; \
+      done; \
+      test -x /build/test-tools/mihomo; \
+    fi
 
 # ========== C++ BUILD STAGE ==========
 # 使用 Debian (glibc) 编译，运行时再搬运依赖到 Alpine
@@ -84,7 +135,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git g++ build-essential cmake python3 python3-pip \
     pkg-config curl \
-    libcurl4-openssl-dev libpcre2-dev rapidjson-dev \
+    libcurl4-openssl-dev libpcre2-dev libboost-dev rapidjson-dev \
     libyaml-cpp-dev ca-certificates ninja-build ccache && \
     rm -rf /var/lib/apt/lists/*
 
@@ -134,6 +185,7 @@ RUN set -xe && \
 
 # Copy Go shared library and module files from go-builder stage
 COPY --from=go-builder /build/bridge/libmihomo.so /usr/lib/
+COPY --from=go-builder /build/bridge/libmihomo.a /usr/lib/
 COPY --from=go-builder /build/bridge/libmihomo.h /usr/include/
 
 # build SubConverter-Extended from THIS repository source
@@ -170,12 +222,23 @@ RUN set -xe && \
     fi
 
 RUN set -xe && \
-    [ -n "${SHA}" ] && sed -i "s/#define BUILD_ID \"\"/#define BUILD_ID \"${SHA}\"/ " src/version.h || true && \
+    BUILD_ID="$(printf '%.7s' "${SHA}")" && \
+    [ -n "${BUILD_ID}" ] && sed -i "s/#define BUILD_ID \"\"/#define BUILD_ID \"${BUILD_ID}\"/ " src/version.h || true && \
     [ -n "${VERSION}" ] && sed -i "s/#define VERSION \"dev\"/#define VERSION \"${VERSION}\"/" src/version.h || true && \
     [ -n "${BUILD_DATE}" ] && sed -i "s/#define BUILD_DATE \"\"/#define BUILD_DATE \"${BUILD_DATE}\"/" src/version.h || true && \
     mkdir -p bridge && \
-    cp /usr/lib/libmihomo.so bridge/ && \
+    rm -f bridge/libmihomo.so bridge/libmihomo.a && \
+    if [ "${ENABLE_SANITIZERS}" = "true" ]; then \
+      cp /usr/lib/libmihomo.a bridge/; \
+    else \
+      cp /usr/lib/libmihomo.so bridge/; \
+    fi && \
     cp /usr/include/libmihomo.h bridge/ && \
+    if [ "${BUILD_TESTS}" = "true" ]; then \
+      test -x /opt/subconverter-test-tools/mihomo; \
+      test -x /opt/subconverter-test-tools/sing-box-stable; \
+      test -x /opt/subconverter-test-tools/sing-box-next; \
+    fi && \
     export PATH="/usr/lib/ccache:$PATH" && \
     export CCACHE_DIR=/tmp/ccache && \
     export CCACHE_COMPILERCHECK=content && \
@@ -185,7 +248,25 @@ RUN set -xe && \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=OFF \
-    . && \
+    .
+
+# Keep sanitizer compilation resumable on hosted runners that can be recycled
+# during one long build step. The first target materializes the production
+# object graph and ccache; the final builder continues with every test target.
+FROM builder-base AS sanitizer-bootstrap
+ARG THREADS="4"
+RUN export PATH="/usr/lib/ccache:$PATH" && \
+    export CCACHE_DIR=/tmp/ccache && \
+    export CCACHE_COMPILERCHECK=content && \
+    ninja -j ${THREADS} subconverter
+
+FROM sanitizer-bootstrap AS builder
+ARG THREADS="4"
+ARG BUILD_TESTS=false
+ARG ENABLE_SANITIZERS=false
+RUN export PATH="/usr/lib/ccache:$PATH" && \
+    export CCACHE_DIR=/tmp/ccache && \
+    export CCACHE_COMPILERCHECK=content && \
     ninja -j ${THREADS}
 
 RUN if [ "${BUILD_TESTS}" = "true" ]; then ctest --output-on-failure; fi

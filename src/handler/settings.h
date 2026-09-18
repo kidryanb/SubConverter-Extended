@@ -8,6 +8,7 @@
 #include "config/regmatch.h"
 #include "config/ruleset.h"
 #include "handler/fetch_context.h"
+#include "handler/proxy_policy.h"
 #include "generator/config/ruleconvert.h"
 #include "generator/template/templates.h"
 #include "utils/logger.h"
@@ -16,6 +17,21 @@
 #include "utils/tribool.h"
 #include <toml.hpp>
 
+#include "config/proxy_provider_direct.h"
+#include "config/proxy_provider_interval.h"
+
+inline constexpr char kDefaultStashRuleBase[] = "base/stash.yaml";
+
+struct SecuritySettingsDiagnostics {
+  std::string profileSource = "builtin-default";
+  std::string profileFileSource;
+  bool profileInputValid = true;
+  bool profileUsedCompatibilityFallback = false;
+  std::string uploadSource = "builtin-default";
+  std::string uploadFileSource;
+  std::string uploadInput;
+  bool uploadInputValid = true;
+};
 
 struct Settings {
   // common settings
@@ -39,7 +55,7 @@ struct Settings {
   // accessToken removed - token authentication is disabled
   std::string basePath = "base";
   std::string custom_group;
-  int logLevel = LOG_LEVEL_VERBOSE;
+  LogLevel logLevel = LOG_LEVEL_INFO;
   long maxAllowedDownloadSize = 1048576L;
   string_map aliases;
   std::string serveFileRoot;
@@ -48,6 +64,7 @@ struct Settings {
   // request fetches, strict additionally disables public upload overrides.
   std::string securityProfile = "lan";
   bool allowPublicUpload = false;
+  SecuritySettingsDiagnostics securityDiagnostics;
 
   // global variables for template
   std::string templatePath = "templates";
@@ -67,13 +84,26 @@ struct Settings {
   bool clashUseNewField = false, singBoxAddClashModes = true;
   std::string clashProxiesStyle = "flow", clashProxyGroupsStyle = "block";
   std::string proxyConfig, proxyRuleset, proxySubscription;
+  std::string proxyBypass = kDefaultProxyBypass;
   int updateInterval = 0;
+  int proxyProviderInterval = kDefaultProxyProviderInterval;
+  bool proxyProviderDirect = kDefaultProxyProviderDirect;
+  bool surgePolicyPath = true;
+  bool surfboardPolicyPath = true;
+  bool loonRemoteProxy = true;
+  // Preserve the historical sing-box WireGuard outbound by default. Newer
+  // deployments can opt into the 1.11+ endpoint schema independently.
+  bool singBoxWireGuardEndpoint = false;
+  // Snell outbounds require sing-box 1.14+. Keep them disabled so existing
+  // deployments on the current stable client retain their historical output.
+  bool singBoxSnellOutbound = false;
   std::string sortScript, filterScript;
 
   std::string clashBase;
   ProxyGroupConfigs customProxyGroups;
   std::string surgeBase, surfboardBase, mellowBase, quanBase, quanXBase,
       loonBase, SSSubBase, singBoxBase;
+  std::string stashBase = kDefaultStashRuleBase;
   std::string surgeSSRPath, quanXDevID;
 
   // cache system
@@ -115,6 +145,9 @@ struct Settings {
 struct ExternalConfig {
   ProxyGroupConfigs custom_proxy_group;
   RulesetConfigs surge_ruleset;
+  string_array rule_prepend_sources;
+  string_array rule_append_sources;
+  FetchContext rule_sources_context = FetchContext::TrustedConfig;
   std::string clash_rule_base;
   std::string surge_rule_base;
   std::string surfboard_rule_base;
@@ -124,6 +157,7 @@ struct ExternalConfig {
   std::string loon_rule_base;
   std::string sssub_rule_base;
   std::string singbox_rule_base;
+  std::string stash_rule_base;
   RegexMatchConfigs rename;
   RegexMatchConfigs emoji;
   string_array include;
@@ -135,15 +169,86 @@ struct ExternalConfig {
   tribool remove_old_emoji;
 };
 
+enum class ExternalConfigLoadStatus {
+  Success,
+  FetchFailed,
+  RenderFailed,
+  ParseFailed,
+  ImportFailed,
+  ResourceLimitExceeded,
+  Cancelled,
+  Deadline,
+  Shutdown,
+};
+
+struct ExternalConfigLoadResult {
+  ExternalConfigLoadStatus status = ExternalConfigLoadStatus::ParseFailed;
+
+  bool ok() const { return status == ExternalConfigLoadStatus::Success; }
+};
+
 extern Settings global;
+extern const std::map<std::string, ruleset_type> RulesetTypes;
 
 bool isPublicFetchRestricted(FetchContext context);
 bool isTrustedLocalResourcePath(const std::string &path);
 bool isPublicUploadAllowed();
+void logSecurityPosture();
 int importItems(string_array &target, bool scope_limit = true,
                 FetchContext context = FetchContext::TrustedConfig);
-int loadExternalConfig(std::string &path, ExternalConfig &ext,
-                       FetchContext context = FetchContext::TrustedConfig);
+
+struct UnresolvedImportSource {
+  std::string path;
+  FetchContext context = FetchContext::TrustedConfig;
+};
+
+// Bind pre-resolved import content to the current worker while request-scoped
+// parsing runs. When a flow-missing sink is supplied, importItems never falls
+// back to synchronous I/O: missing sources are reported to the flow so it can
+// suspend and resolve them on the async/blocking-I/O lanes.
+class ScopedResolvedImportView {
+public:
+  ScopedResolvedImportView(const string_map *resolved,
+                           string_array *missing) noexcept;
+  ScopedResolvedImportView(
+      const string_map *resolved,
+      std::vector<UnresolvedImportSource> *missing) noexcept;
+  ~ScopedResolvedImportView();
+
+  ScopedResolvedImportView(const ScopedResolvedImportView &) = delete;
+  ScopedResolvedImportView &operator=(const ScopedResolvedImportView &) =
+      delete;
+
+private:
+  const string_map *previous_resolved_ = nullptr;
+  string_array *previous_missing_ = nullptr;
+  std::vector<UnresolvedImportSource> *previous_flow_missing_ = nullptr;
+  bool previous_active_ = false;
+};
+
+std::string resolvedImportKey(const std::string &path,
+                              FetchContext context);
+ExternalConfigLoadResult
+loadExternalConfig(const std::string &path, ExternalConfig &ext,
+                   FetchContext context = FetchContext::TrustedConfig);
+ExternalConfigLoadResult loadExternalConfigFromContent(
+    const std::string &path, const std::string &content,
+    ExternalConfig &ext,
+    FetchContext context = FetchContext::TrustedConfig,
+    const string_map *resolved_imports = nullptr,
+    string_array *missing_imports = nullptr);
+ExternalConfigLoadResult loadExternalConfigFromRenderedContent(
+    const std::string &path, const std::string &rendered_content,
+    ExternalConfig &ext,
+    FetchContext context = FetchContext::TrustedConfig,
+    const string_map *resolved_imports = nullptr,
+    string_array *missing_imports = nullptr,
+    bool source_cacheable = true);
+bool isExternalConfigCacheableContent(const std::string &content);
+size_t externalConfigCacheMaxEntries();
+size_t externalConfigCacheMaxBytes();
+void configureExternalConfigCache(size_t max_entries, size_t max_bytes);
+void setExternalConfigCacheGrowthFrozen(bool frozen) noexcept;
 // template <class T, class... U>
 // void find_if_exist(const toml::value &v, const toml::key &k, T& target,
 // U&&... args)

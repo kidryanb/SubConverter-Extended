@@ -1,7 +1,6 @@
 #ifndef MIHOMO_BRIDGE_H
 #define MIHOMO_BRIDGE_H
 
-#include <map>
 #include <string>
 #include <vector>
 

@@ -32,6 +32,7 @@ namespace toml
             {
             case "select"_hash:
                 conf.Type = ProxyGroupType::Select;
+                conf.Url = find_or<String>(v, "url", "");
                 break;
             case "url-test"_hash:
                 conf.Type = ProxyGroupType::URLTest;
@@ -88,6 +89,7 @@ namespace toml
             conf.Timeout = find_or(v, "timeout", 5);
             conf.Proxies = find_or<StrArray>(v, "rule", {});
             conf.UsingProvider = find_or<StrArray>(v, "use", {});
+            normalizeSelectHealthCheck(conf);
             if(conf.Proxies.empty() && conf.UsingProvider.empty())
                 throw serialization_error(format_error("Proxy Group must contains at least one of proxy match rule or provider!", v.location(), "here"), v.location());
             if(v.contains("disable-udp"))
@@ -270,6 +272,7 @@ namespace INIBinding
                     else
                         conf.Proxies.emplace_back(std::move(vArray[i]));
                 }
+                normalizeSelectHealthCheck(conf);
                 confs.emplace_back(std::move(conf));
             }
             return confs;

@@ -3,6 +3,7 @@
 #include "utils/ini_reader/ini_reader.h"
 #include "utils/logger.h"
 #include "utils/rapidjson_extra.h"
+#include "utils/redact.h"
 #include "utils/system.h"
 #include "handler/settings.h"
 #include "webget.h"
@@ -127,6 +128,31 @@ int uploadGist(std::string name, std::string path, std::string content, bool wri
     ini.set("type", name);
     ini.set("url", url);
 
-    ini.to_file("gistconf.ini");
+    const FileCommitResult persistence_result =
+        static_cast<FileCommitResult>(ini.to_file("gistconf.ini"));
+    if(fileCommitFailed(persistence_result))
+    {
+        writeLog(LOG_LEVEL_ERROR,
+                 "GIST_REMOTE_UPLOAD_COMPLETED_LOCAL_STATE_FAILED target=" +
+                     name + " remote=" + summarizeUrlForLog(url) +
+                     " local_state_visible=false" +
+                     (fileCommitTemporaryRemaining(persistence_result)
+                          ? " temporary_file_remaining=true"
+                          : " temporary_file_remaining=false") +
+                     " action=report-failure");
+        return -1;
+    }
+    if(fileCommitDurabilityUnconfirmed(persistence_result))
+    {
+        writeLog(LOG_LEVEL_WARNING,
+                 "GIST_UPLOAD_COMPLETE target=" + name +
+                     " remote=" + summarizeUrlForLog(url) +
+                     " local_state=visible durability=unconfirmed");
+        return 0;
+    }
+    writeLog(LOG_LEVEL_INFO,
+             "GIST_UPLOAD_COMPLETE target=" + name +
+                 " remote=" + summarizeUrlForLog(url) +
+                 " local_state=persisted");
     return 0;
 }

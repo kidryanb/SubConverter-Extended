@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <filesystem>
 
@@ -9,10 +10,16 @@
 #include "interfaces.h"
 #include "multithread.h"
 #include "script/cron.h"
+#include "server/request_context.h"
 #include "server/webserver.h"
 #include "settings.h"
+#include "settings_view.h"
 #include "utils/logger.h"
+#include "utils/concurrent_lru_cache.h"
+#include "utils/md5/md5_interface.h"
 #include "utils/network.h"
+#include "utils/redact.h"
+#include "utils/resource_control.h"
 #include "utils/system.h"
 
 // multi-thread lock
@@ -21,6 +28,145 @@ std::mutex gMutexConfigure;
 Settings global;
 
 extern WebServer webServer;
+
+namespace {
+
+constexpr const char *kDefaultExternalConfig =
+    "https://gcore.jsdelivr.net/gh/Aethersailor/"
+    "Custom_OpenClash_Rules@refs/heads/main/cfg/Custom_Clash.ini";
+
+struct CommonScalarSettings {
+  bool prependInsert;
+  std::string basePath;
+  std::string clashBase;
+  std::string surgeBase;
+  std::string surfboardBase;
+  std::string mellowBase;
+  std::string quanBase;
+  std::string quanXBase;
+  std::string loonBase;
+  std::string SSSubBase;
+  std::string singBoxBase;
+  std::string stashBase;
+  std::string defaultExtConfig;
+  bool fallbackToDefaultExternalConfig;
+  bool appendType;
+  std::string proxyConfig;
+  std::string proxyRuleset;
+  std::string proxySubscription;
+  std::string proxyBypass;
+  bool reloadConfOnRequest;
+};
+
+CommonScalarSettings captureCommonScalarSettings() {
+  return {global.prependInsert,
+          global.basePath,
+          global.clashBase,
+          global.surgeBase,
+          global.surfboardBase,
+          global.mellowBase,
+          global.quanBase,
+          global.quanXBase,
+          global.loonBase,
+          global.SSSubBase,
+          global.singBoxBase,
+          global.stashBase,
+          global.defaultExtConfig,
+          global.fallbackToDefaultExternalConfig,
+          global.appendType,
+          global.proxyConfig,
+          global.proxyRuleset,
+          global.proxySubscription,
+          global.proxyBypass,
+          global.reloadConfOnRequest};
+}
+
+void applyCommonScalarSettings(CommonScalarSettings settings) {
+  const ProxyBypassPolicy bypass =
+      ProxyBypassPolicy::parse(settings.proxyBypass);
+  if (!bypass.valid)
+    throw std::invalid_argument("proxy_bypass 配置无效：" + bypass.error + "。");
+  if (settings.defaultExtConfig.empty())
+    settings.defaultExtConfig = kDefaultExternalConfig;
+
+  global.prependInsert = settings.prependInsert;
+  global.basePath = std::move(settings.basePath);
+  global.clashBase = std::move(settings.clashBase);
+  global.surgeBase = std::move(settings.surgeBase);
+  global.surfboardBase = std::move(settings.surfboardBase);
+  global.mellowBase = std::move(settings.mellowBase);
+  global.quanBase = std::move(settings.quanBase);
+  global.quanXBase = std::move(settings.quanXBase);
+  global.loonBase = std::move(settings.loonBase);
+  global.SSSubBase = std::move(settings.SSSubBase);
+  global.singBoxBase = std::move(settings.singBoxBase);
+  global.stashBase = std::move(settings.stashBase);
+  global.defaultExtConfig = std::move(settings.defaultExtConfig);
+  global.fallbackToDefaultExternalConfig =
+      settings.fallbackToDefaultExternalConfig;
+  global.appendType = settings.appendType;
+  global.proxyConfig = std::move(settings.proxyConfig);
+  global.proxyRuleset = std::move(settings.proxyRuleset);
+  global.proxySubscription = std::move(settings.proxySubscription);
+  global.proxyBypass = std::move(settings.proxyBypass);
+  global.reloadConfOnRequest = settings.reloadConfOnRequest;
+}
+
+LogLevel configuredLogLevel(const std::string &value,
+                            bool print_debug_info) {
+  if (print_debug_info)
+    return LOG_LEVEL_VERBOSE;
+  const std::string normalized =
+      toLower(trimWhitespace(value, true, true));
+  switch (hash_(normalized)) {
+  case "warn"_hash:
+    return LOG_LEVEL_WARNING;
+  case "error"_hash:
+    return LOG_LEVEL_ERROR;
+  case "fatal"_hash:
+    return LOG_LEVEL_FATAL;
+  case "verbose"_hash:
+    return LOG_LEVEL_VERBOSE;
+  case "debug"_hash:
+    return LOG_LEVEL_DEBUG;
+  default:
+    return LOG_LEVEL_INFO;
+  }
+}
+
+const char *configuredLogLevelName(LogLevel level) {
+  switch (level) {
+  case LogLevel::Fatal:
+    return "fatal";
+  case LogLevel::Error:
+    return "error";
+  case LogLevel::Warning:
+    return "warn";
+  case LogLevel::Info:
+    return "info";
+  case LogLevel::Debug:
+    return "debug";
+  case LogLevel::Verbose:
+    return "verbose";
+  }
+  return "info";
+}
+
+void applyConfiguredLogLevel(const std::string &value,
+                             bool print_debug_info,
+                             ScopedLogLevelOverride &log_level_scope) {
+  global.printDbgInfo = print_debug_info;
+  global.logLevel = configuredLogLevel(value, print_debug_info);
+  log_level_scope.set(global.logLevel);
+  writeLog(LOG_LEVEL_DEBUG,
+           "LOG_LEVEL_CONFIGURED level=" +
+               std::string(configuredLogLevelName(global.logLevel)) +
+               " print_debug_info=" +
+               std::string(print_debug_info ? "true" : "false") +
+               " phase=pre-import");
+}
+
+} // namespace
 
 const std::map<std::string, ruleset_type> RulesetTypes = {
     {"clash-domain:", RULESET_CLASH_DOMAIN},
@@ -52,34 +198,147 @@ static bool parseBoolSetting(const std::string &value) {
          normalized == "on";
 }
 
-static bool pathInsideRoot(const std::string &path, const std::string &root) {
-  if (path.empty() || root.empty())
-    return false;
+static bool isRecognizedBoolSetting(const std::string &value) {
+  std::string normalized = toLower(trimWhitespace(value, true, true));
+  return normalized == "1" || normalized == "true" || normalized == "yes" ||
+         normalized == "on" || normalized == "0" || normalized == "false" ||
+         normalized == "no" || normalized == "off";
+}
+
+static int requireEnvironmentPort(const char *name, const std::string &value) {
+  const std::string normalized = trimWhitespace(value, true, true);
+  std::size_t consumed = 0;
+  long long parsed = 0;
   try {
-    std::filesystem::path absolute_path =
-        std::filesystem::weakly_canonical(std::filesystem::absolute(path));
-    std::filesystem::path absolute_root =
-        std::filesystem::weakly_canonical(std::filesystem::absolute(root));
-    std::filesystem::path relative =
-        std::filesystem::relative(absolute_path, absolute_root);
-    std::string rel = relative.generic_string();
-    return rel == "." ||
-           (!relative.is_absolute() && rel != ".." &&
-            !startsWith(rel, "../"));
-  } catch (std::exception &e) {
-    writeLog(0, e.what(), LOG_LEVEL_DEBUG);
-    return false;
+    parsed = std::stoll(normalized, &consumed, 10);
+  } catch (const std::exception &) {
+    throw std::invalid_argument(std::string(name) +
+                                " must be an integer from 1 to 65535");
   }
+  if (consumed != normalized.size() || parsed < 1 || parsed > 65535) {
+    throw std::invalid_argument(std::string(name) +
+                                " must be an integer from 1 to 65535");
+  }
+  return static_cast<int>(parsed);
+}
+
+static void finalizeBasicEnvironmentSettings() {
+  std::string listen_address = getEnv("SUBCONVERTER_LISTEN_ADDRESS");
+  if (!listen_address.empty()) {
+    listen_address = trimWhitespace(listen_address, true, true);
+    if (listen_address.empty())
+      throw std::invalid_argument(
+          "SUBCONVERTER_LISTEN_ADDRESS must not be blank");
+    global.listenAddress = listen_address;
+  }
+
+  const std::string listen_port = getEnv("SUBCONVERTER_LISTEN_PORT");
+  if (!listen_port.empty())
+    global.listenPort =
+        requireEnvironmentPort("SUBCONVERTER_LISTEN_PORT", listen_port);
+
+  const std::string log_level = getEnv("SUBCONVERTER_LOG_LEVEL");
+  if (!log_level.empty()) {
+    const std::string normalized =
+        toLower(trimWhitespace(log_level, true, true));
+    if (normalized != "fatal" && normalized != "error" &&
+        normalized != "warn" && normalized != "info" &&
+        normalized != "debug" && normalized != "verbose") {
+      throw std::invalid_argument(
+          "SUBCONVERTER_LOG_LEVEL must be fatal, error, warn, info, debug, "
+          "or verbose");
+    }
+    global.printDbgInfo = false;
+    global.logLevel = configuredLogLevel(normalized, false);
+  }
+
+  const std::string statistics_enabled =
+      getEnv("SUBCONVERTER_STATISTICS_ENABLED");
+  if (!statistics_enabled.empty()) {
+    if (!isRecognizedBoolSetting(statistics_enabled)) {
+      throw std::invalid_argument(
+          "SUBCONVERTER_STATISTICS_ENABLED must be a boolean value");
+    }
+    global.statisticsEnabled = parseBoolSetting(statistics_enabled);
+  }
+}
+
+static std::string securityLogValue(const std::string &value) {
+  static const char hex[] = "0123456789ABCDEF";
+  std::string escaped;
+  const size_t limit = std::min<size_t>(value.size(), 80);
+  escaped.reserve(limit);
+  for (size_t index = 0; index < limit; ++index) {
+    const unsigned char ch = static_cast<unsigned char>(value[index]);
+    if (ch < 0x20 || ch == 0x7f || ch == '\'' || ch == '\\') {
+      escaped += "\\x";
+      escaped += hex[ch >> 4];
+      escaped += hex[ch & 0x0f];
+    } else {
+      escaped.push_back(static_cast<char>(ch));
+    }
+  }
+  if (value.size() > limit)
+    escaped += "...";
+  return escaped;
+}
+
+static void beginSecuritySettingsLoad() {
+  auto &diagnostics = global.securityDiagnostics;
+  const bool first_load = global.configGeneration == 0;
+  diagnostics.profileSource =
+      first_load ? "builtin-default" : "reload-retained";
+  diagnostics.profileFileSource.clear();
+  diagnostics.profileInputValid = true;
+  diagnostics.profileUsedCompatibilityFallback = false;
+  diagnostics.uploadSource =
+      first_load ? "builtin-default" : "reload-retained";
+  diagnostics.uploadFileSource.clear();
+  diagnostics.uploadInput.clear();
+  diagnostics.uploadInputValid = true;
+}
+
+static int requireProxyProviderInterval(const std::string &value) {
+  int interval = 0;
+  if (!parseProxyProviderInterval(value, interval)) {
+    throw std::invalid_argument(
+        "proxy_provider.interval 必须是 0 到 2147483647 之间的十进制整数。");
+  }
+  return interval;
+}
+
+static int requireProxyProviderInterval(std::int64_t value) {
+  return requireProxyProviderInterval(std::to_string(value));
+}
+
+static bool requireProxyProviderDirect(const std::string &value) {
+  bool proxy_direct = false;
+  if (!parseProxyProviderDirect(value, proxy_direct)) {
+    throw std::invalid_argument(
+        "proxy_provider.proxy_direct 必须是 true、false、1 或 0。");
+  }
+  return proxy_direct;
+}
+
+static bool pathInsideRoot(const std::string &path, const std::string &root) {
+  return isPathInScope(path, root);
 }
 
 static void finalizeSecuritySettings() {
   std::string profile_override = getEnv("SUBCONVERTER_SECURITY_PROFILE");
-  if (!profile_override.empty())
+  if (!profile_override.empty()) {
     global.securityProfile = profile_override;
+    global.securityDiagnostics.profileSource = "environment";
+  }
 
   std::string upload_override = getEnv("SUBCONVERTER_ALLOW_PUBLIC_UPLOAD");
-  if (!upload_override.empty())
+  if (!upload_override.empty()) {
     global.allowPublicUpload = parseBoolSetting(upload_override);
+    global.securityDiagnostics.uploadSource = "environment";
+    global.securityDiagnostics.uploadInput = upload_override;
+    global.securityDiagnostics.uploadInputValid =
+        isRecognizedBoolSetting(upload_override);
+  }
 
   global.securityProfile =
       toLower(trimWhitespace(global.securityProfile, true, true));
@@ -151,9 +410,10 @@ static void finalizeRuntimeSettings() {
 }
 
 bool isPublicFetchRestricted(FetchContext context) {
+  const Settings &settings = effectiveSettings();
   return context == FetchContext::PublicRequest &&
-         (global.securityProfile == "public" ||
-          global.securityProfile == "strict");
+         (settings.securityProfile == "public" ||
+          settings.securityProfile == "strict");
 }
 
 bool isTrustedLocalResourcePath(const std::string &path) {
@@ -164,11 +424,153 @@ bool isTrustedLocalResourcePath(const std::string &path) {
 }
 
 bool isPublicUploadAllowed() {
-  if (global.securityProfile == "lan")
+  const Settings &settings = effectiveSettings();
+  if (settings.securityProfile == "lan")
     return true;
-  if (global.securityProfile == "strict")
+  if (settings.securityProfile == "strict")
     return false;
-  return global.allowPublicUpload;
+  return settings.allowPublicUpload;
+}
+
+void logSecurityPosture() {
+  const bool upload_allowed = isPublicUploadAllowed();
+  writeLog(LOG_LEVEL_INFO,
+           "SECURITY_UPLOAD_EFFECTIVE profile=" + global.securityProfile +
+               " configured_allow_public_upload=" +
+               (global.allowPublicUpload ? "true" : "false") + " source=" +
+               global.securityDiagnostics.uploadSource +
+               (global.securityDiagnostics.uploadSource != "environment" ||
+                        global.securityDiagnostics.uploadFileSource.empty()
+                    ? ""
+                    : " file_candidate=" +
+                          global.securityDiagnostics.uploadFileSource) +
+               " effective=" +
+               (upload_allowed ? "allowed" : "blocked") +
+               (global.securityProfile == "lan"
+                    ? " reason=lan-compatibility"
+                    : global.securityProfile == "strict"
+                          ? " reason=strict-policy"
+                          : " reason=public-upload-setting"));
+
+  const bool wildcard_bind = global.listenAddress == "0.0.0.0" ||
+                             global.listenAddress == "::" ||
+                             global.listenAddress == "[::]";
+  if (global.securityProfile == "lan" && wildcard_bind) {
+    std::string bind_endpoint = global.listenAddress;
+    if (bind_endpoint.find(':') != std::string::npos &&
+        !startsWith(bind_endpoint, "[")) {
+      bind_endpoint = "[" + bind_endpoint + "]";
+    }
+    writeLog(LOG_LEVEL_WARNING,
+             "SECURITY_EXPOSURE_POSSIBLE profile=lan bind=" +
+                 bind_endpoint + ":" +
+                 std::to_string(global.listenPort) +
+                 " public_reachability=unknown；监听所有本地接口不等于已暴露"
+                 "公网，请同时检查端口发布、宿主防火墙、云安全组、NAT 和"
+                 "反向代理。公网部署请显式使用 public 或 strict。");
+  }
+}
+
+static bool canImportLocalPath(const std::string &path, FetchContext context) {
+  if (!isPublicFetchRestricted(context) || isTrustedLocalResourcePath(path))
+    return true;
+  writeLog(LOG_LEVEL_WARNING, "已阻止公开请求导入本地文件：" + path);
+  return false;
+}
+
+static bool readImportLocalPath(const std::string &path, bool scope_limit,
+                                FetchContext context, std::string &content) {
+  const bool trusted = isTrustedLocalResourcePath(path);
+  const bool effective_scope_limit = scope_limit && !trusted;
+  if (!fileExist(path, effective_scope_limit) ||
+      !canImportLocalPath(path, context))
+    return false;
+  content = fileGet(path, effective_scope_limit);
+  return true;
+}
+
+namespace {
+
+struct ResolvedImportView {
+  const string_map *resolved = nullptr;
+  string_array *missing = nullptr;
+  std::vector<UnresolvedImportSource> *flow_missing = nullptr;
+  bool active = false;
+};
+
+thread_local ResolvedImportView resolved_import_view;
+
+bool readImportSource(const std::string &path, bool scope_limit,
+                      FetchContext context, const ProxyPolicy &proxy,
+                      unsigned int cache_ttl, std::string &content) {
+  if (!resolved_import_view.active) {
+    if (readImportLocalPath(path, scope_limit, context, content))
+      return true;
+    if (!isLink(path)) {
+      writeLog(LOG_LEVEL_ERROR, "文件不存在或不是有效 URL：" + path);
+      return false;
+    }
+    content = webGet(path, proxy, cache_ttl, nullptr, nullptr, context);
+    return !content.empty();
+  }
+
+  if (resolved_import_view.resolved) {
+    const std::string key = resolved_import_view.flow_missing
+                                ? resolvedImportKey(path, context)
+                                : path;
+    const auto found = resolved_import_view.resolved->find(key);
+    if (found != resolved_import_view.resolved->end()) {
+      content = found->second;
+      return !content.empty();
+    }
+  }
+  if (resolved_import_view.flow_missing) {
+    auto &missing = *resolved_import_view.flow_missing;
+    if (std::find_if(missing.begin(), missing.end(),
+                     [&](const UnresolvedImportSource &source) {
+                       return source.path == path &&
+                              source.context == context;
+                     }) == missing.end())
+      missing.push_back({path, context});
+    return false;
+  }
+  if (resolved_import_view.missing &&
+      std::find(resolved_import_view.missing->begin(),
+                resolved_import_view.missing->end(), path) ==
+          resolved_import_view.missing->end())
+    resolved_import_view.missing->push_back(path);
+  return false;
+}
+
+} // namespace
+
+ScopedResolvedImportView::ScopedResolvedImportView(
+    const string_map *resolved, string_array *missing) noexcept
+    : previous_resolved_(resolved_import_view.resolved),
+      previous_missing_(resolved_import_view.missing),
+      previous_flow_missing_(resolved_import_view.flow_missing),
+      previous_active_(resolved_import_view.active) {
+  resolved_import_view = {resolved, missing, nullptr, true};
+}
+
+ScopedResolvedImportView::ScopedResolvedImportView(
+    const string_map *resolved,
+    std::vector<UnresolvedImportSource> *missing) noexcept
+    : previous_resolved_(resolved_import_view.resolved),
+      previous_missing_(resolved_import_view.missing),
+      previous_flow_missing_(resolved_import_view.flow_missing),
+      previous_active_(resolved_import_view.active) {
+  resolved_import_view = {resolved, nullptr, missing, true};
+}
+
+ScopedResolvedImportView::~ScopedResolvedImportView() {
+  resolved_import_view = {previous_resolved_, previous_missing_,
+                          previous_flow_missing_, previous_active_};
+}
+
+std::string resolvedImportKey(const std::string &path,
+                              FetchContext context) {
+  return std::to_string(static_cast<unsigned>(context)) + ":" + path;
 }
 
 static bool canImportLocalPath(const std::string &path, FetchContext context) {
@@ -180,6 +582,7 @@ static bool canImportLocalPath(const std::string &path, FetchContext context) {
 }
 
 int importItems(string_array &target, bool scope_limit, FetchContext context) {
+  static thread_local unsigned int flow_import_depth = 0;
   string_array result;
   std::stringstream ss;
   std::string path, content, strLine;
@@ -232,13 +635,14 @@ toml::value parseToml(const std::string &content, const std::string &fname) {
   return toml::parse(is, fname);
 }
 
-void importItems(std::vector<toml::value> &root, const std::string &import_key,
-                 bool scope_limit = true,
-                 FetchContext context = FetchContext::TrustedConfig) {
+int importItems(std::vector<toml::value> &root, const std::string &import_key,
+                bool scope_limit = true,
+                FetchContext context = FetchContext::TrustedConfig) {
   std::string content;
   std::vector<toml::value> newRoot;
   auto iter = root.begin();
   size_t count = 0;
+  bool failed = false;
 
   ProxyPolicy proxy = parseProxy(global.proxyConfig);
   while (iter != root.end()) {
@@ -270,9 +674,9 @@ void importItems(std::vector<toml::value> &root, const std::string &import_key,
   writeLog(0, "已导入 " + std::to_string(count) + " 个项目。");
 }
 
-void readRegexMatch(YAML::Node node, const std::string &delimiter,
-                    string_array &dest, bool scope_limit = true,
-                    FetchContext context = FetchContext::TrustedConfig) {
+int readRegexMatch(YAML::Node node, const std::string &delimiter,
+                   string_array &dest, bool scope_limit = true,
+                   FetchContext context = FetchContext::TrustedConfig) {
   for (auto &&object : node) {
     std::string script, url, match, rep, strLine;
     object["script"] >>= script;
@@ -293,11 +697,11 @@ void readRegexMatch(YAML::Node node, const std::string &delimiter,
       continue;
     dest.emplace_back(std::move(strLine));
   }
-  importItems(dest, scope_limit, context);
+  return importItems(dest, scope_limit, context);
 }
 
-void readEmoji(YAML::Node node, string_array &dest, bool scope_limit = true,
-               FetchContext context = FetchContext::TrustedConfig) {
+int readEmoji(YAML::Node node, string_array &dest, bool scope_limit = true,
+              FetchContext context = FetchContext::TrustedConfig) {
   for (auto &&object : node) {
     std::string script, url, match, rep, strLine;
     object["script"] >>= script;
@@ -319,11 +723,11 @@ void readEmoji(YAML::Node node, string_array &dest, bool scope_limit = true,
       continue;
     dest.emplace_back(std::move(strLine));
   }
-  importItems(dest, scope_limit, context);
+  return importItems(dest, scope_limit, context);
 }
 
-void readGroup(YAML::Node node, string_array &dest, bool scope_limit = true,
-               FetchContext context = FetchContext::TrustedConfig) {
+int readGroup(YAML::Node node, string_array &dest, bool scope_limit = true,
+              FetchContext context = FetchContext::TrustedConfig) {
   for (YAML::Node &&object : node) {
     string_array tempArray;
     std::string name, type;
@@ -363,11 +767,11 @@ void readGroup(YAML::Node node, string_array &dest, bool scope_limit = true,
     std::string strLine = join(tempArray, "`");
     dest.emplace_back(std::move(strLine));
   }
-  importItems(dest, scope_limit, context);
+  return importItems(dest, scope_limit, context);
 }
 
-void readRuleset(YAML::Node node, string_array &dest, bool scope_limit = true,
-                 FetchContext context = FetchContext::TrustedConfig) {
+int readRuleset(YAML::Node node, string_array &dest, bool scope_limit = true,
+                FetchContext context = FetchContext::TrustedConfig) {
   for (auto &&object : node) {
     std::string strLine, name, url, group, interval;
     string_array options;
@@ -396,12 +800,14 @@ void readRuleset(YAML::Node node, string_array &dest, bool scope_limit = true,
       continue;
     dest.emplace_back(std::move(strLine));
   }
-  importItems(dest, scope_limit, context);
+  return importItems(dest, scope_limit, context);
 }
 
 void refreshRulesets(RulesetConfigs &ruleset_list,
                      std::vector<RulesetContent> &ruleset_content_array,
-                     FetchContext context) {
+                     FetchContext context, RulesetRefreshMode mode,
+                     const std::vector<RulesetContent> *reusable_content) {
+  RequestStageTimer rules_timer(RequestStage::Rules);
   ruleset_content_array.clear();
   ruleset_content_array.reserve(ruleset_list.size());
   std::string rule_group, rule_url, rule_url_typed, interval;
@@ -409,6 +815,7 @@ void refreshRulesets(RulesetConfigs &ruleset_list,
 
   ProxyPolicy proxy = parseProxy(global.proxyRuleset);
 
+  size_t source_index = 0;
   for (RulesetConfig &x : ruleset_list) {
     rule_group = x.Group;
     rule_url = x.Url;
@@ -515,13 +922,25 @@ void refreshRulesets(RulesetConfigs &ruleset_list,
             x.Options};
     }
     ruleset_content_array.emplace_back(std::move(rc));
+    ++source_index;
   }
 }
 
-void readYAMLConf(YAML::Node &node) {
+void readYAMLConf(YAML::Node &node,
+                  ScopedLogLevelOverride &log_level_scope) {
+  std::string early_log_level;
+  bool early_print_debug_info = false;
+  if (node["advanced"].IsDefined()) {
+    node["advanced"]["log_level"] >> early_log_level;
+    node["advanced"]["print_debug_info"] >> early_print_debug_info;
+  }
+  applyConfiguredLogLevel(early_log_level, early_print_debug_info,
+                          log_level_scope);
+
   YAML::Node section = node["common"];
   std::string strLine;
   string_array tempArray;
+  CommonScalarSettings common = captureCommonScalarSettings();
 
   // api_mode and api_access_token removed - hardcoded in settings.h
   if (section["default_url"].IsSequence()) {
@@ -547,7 +966,7 @@ void readYAMLConf(YAML::Node &node) {
       eraseElements(tempArray);
     }
   }
-  section["prepend_insert_url"] >> global.prependInsert;
+  section["prepend_insert_url"] >> common.prependInsert;
   if (section["exclude_remarks"].IsSequence())
     section["exclude_remarks"] >> global.excludeRemarks;
   if (section["include_remarks"].IsSequence())
@@ -555,29 +974,59 @@ void readYAMLConf(YAML::Node &node) {
   global.filterScript = safe_as<bool>(section["enable_filter"])
                             ? safe_as<std::string>(section["filter_script"])
                             : "";
-  section["base_path"] >> global.basePath;
-  section["clash_rule_base"] >> global.clashBase;
-  section["surge_rule_base"] >> global.surgeBase;
-  section["surfboard_rule_base"] >> global.surfboardBase;
-  section["mellow_rule_base"] >> global.mellowBase;
-  section["quan_rule_base"] >> global.quanBase;
-  section["quanx_rule_base"] >> global.quanXBase;
-  section["loon_rule_base"] >> global.loonBase;
-  section["sssub_rule_base"] >> global.SSSubBase;
-  section["singbox_rule_base"] >> global.singBoxBase;
+  section["base_path"] >> common.basePath;
+  section["clash_rule_base"] >> common.clashBase;
+  section["surge_rule_base"] >> common.surgeBase;
+  section["surfboard_rule_base"] >> common.surfboardBase;
+  section["mellow_rule_base"] >> common.mellowBase;
+  section["quan_rule_base"] >> common.quanBase;
+  section["quanx_rule_base"] >> common.quanXBase;
+  section["loon_rule_base"] >> common.loonBase;
+  section["sssub_rule_base"] >> common.SSSubBase;
+  section["singbox_rule_base"] >> common.singBoxBase;
+  section["stash_rule_base"] >> common.stashBase;
 
-  section["default_external_config"] >> global.defaultExtConfig;
-  // Set hardcoded default if not configured or empty
-  if (global.defaultExtConfig.empty()) {
-    global.defaultExtConfig =
-        "https://gcore.jsdelivr.net/gh/Aethersailor/"
-        "Custom_OpenClash_Rules@refs/heads/main/cfg/Custom_Clash.ini";
+  section["default_external_config"] >> common.defaultExtConfig;
+  section["fallback_to_default_external_config"] >>
+      common.fallbackToDefaultExternalConfig;
+  section["append_proxy_type"] >> common.appendType;
+  section["proxy_config"] >> common.proxyConfig;
+  section["proxy_ruleset"] >> common.proxyRuleset;
+  section["proxy_subscription"] >> common.proxySubscription;
+  section["proxy_bypass"] >> common.proxyBypass;
+  section["reload_conf_on_request"] >> common.reloadConfOnRequest;
+  applyCommonScalarSettings(std::move(common));
+
+  YAML::Node proxy_provider = node["proxy_provider"];
+  if (proxy_provider.IsDefined() && !proxy_provider.IsNull()) {
+    if (!proxy_provider.IsMap()) {
+      throw std::invalid_argument("proxy_provider 必须是配置映射。");
+    }
+    YAML::Node interval = proxy_provider["interval"];
+    if (interval.IsDefined()) {
+      if (!interval.IsScalar()) {
+        throw std::invalid_argument(
+            "proxy_provider.interval 必须是十进制整数。");
+      }
+      global.proxyProviderInterval =
+          requireProxyProviderInterval(interval.as<std::string>());
+    }
+    YAML::Node proxy_direct = proxy_provider["proxy_direct"];
+    if (proxy_direct.IsDefined()) {
+      if (!proxy_direct.IsScalar()) {
+        throw std::invalid_argument(
+            "proxy_provider.proxy_direct 必须是布尔值。");
+      }
+      global.proxyProviderDirect =
+          requireProxyProviderDirect(proxy_direct.as<std::string>());
+    }
   }
-  section["append_proxy_type"] >> global.appendType;
-  section["proxy_config"] >> global.proxyConfig;
-  section["proxy_ruleset"] >> global.proxyRuleset;
-  section["proxy_subscription"] >> global.proxySubscription;
-  section["reload_conf_on_request"] >> global.reloadConfOnRequest;
+
+  if (node["custom_openclash_rules"].IsDefined()) {
+    section = node["custom_openclash_rules"];
+    section["fallback_enabled"] >>
+        global.customOpenClashRulesSourceSwitch;
+  }
 
   if (node["custom_openclash_rules"].IsDefined()) {
     section = node["custom_openclash_rules"];
@@ -646,6 +1095,22 @@ void readYAMLConf(YAML::Node &node) {
     node["surge_external_proxy"]["surge_ssr_path"] >> global.surgeSSRPath;
     node["surge_external_proxy"]["resolve_hostname"] >>
         global.surgeResolveHostname;
+  }
+
+  if (node["remote_subscription"].IsDefined() &&
+      node["remote_subscription"].IsMap()) {
+    node["remote_subscription"]["surge_policy_path"] >>
+        global.surgePolicyPath;
+    node["remote_subscription"]["surfboard_policy_path"] >>
+        global.surfboardPolicyPath;
+    node["remote_subscription"]["loon_remote_proxy"] >>
+        global.loonRemoteProxy;
+  }
+
+  if (node["singbox"].IsDefined() && node["singbox"].IsMap()) {
+    node["singbox"]["wireguard_endpoint"] >>
+        global.singBoxWireGuardEndpoint;
+    node["singbox"]["snell_outbound"] >> global.singBoxSnellOutbound;
   }
 
   if (node["emojis"].IsDefined()) {
@@ -743,32 +1208,12 @@ void readYAMLConf(YAML::Node &node) {
   }
 
   if (node["advanced"].IsDefined()) {
-    std::string log_level;
-    node["advanced"]["log_level"] >> log_level;
-    node["advanced"]["print_debug_info"] >> global.printDbgInfo;
-    if (global.printDbgInfo)
-      global.logLevel = LOG_LEVEL_VERBOSE;
-    else {
-      switch (hash_(log_level)) {
-      case "warn"_hash:
-        global.logLevel = LOG_LEVEL_WARNING;
-        break;
-      case "error"_hash:
-        global.logLevel = LOG_LEVEL_ERROR;
-        break;
-      case "fatal"_hash:
-        global.logLevel = LOG_LEVEL_FATAL;
-        break;
-      case "verbose"_hash:
-        global.logLevel = LOG_LEVEL_VERBOSE;
-        break;
-      case "debug"_hash:
-        global.logLevel = LOG_LEVEL_DEBUG;
-        break;
-      default:
-        global.logLevel = LOG_LEVEL_INFO;
-      }
+    if (node["advanced"]["resource_control"].IsDefined()) {
+      node["advanced"]["resource_control"] >> global.resourceControl;
+      global.resourceControlSource = "file:yaml";
     }
+    node["advanced"]["force_max_curve_fingerprint"] >>
+        global.forceMaxCurveFingerprint;
     node["advanced"]["max_pending_connections"] >> global.maxPendingConns;
     node["advanced"]["max_concurrent_threads"] >> global.maxConcurThreads;
     node["advanced"]["max_server_threads"] >> global.maxServerThreads;
@@ -827,8 +1272,16 @@ void readYAMLConf(YAML::Node &node) {
     }
   }
   if (node["security"].IsDefined()) {
-    node["security"]["profile"] >> global.securityProfile;
-    node["security"]["allow_public_upload"] >> global.allowPublicUpload;
+    if (node["security"]["profile"].IsDefined()) {
+      global.securityDiagnostics.profileSource = "file:yaml";
+      global.securityDiagnostics.profileFileSource = "file:yaml";
+      node["security"]["profile"] >> global.securityProfile;
+    }
+    if (node["security"]["allow_public_upload"].IsDefined()) {
+      global.securityDiagnostics.uploadSource = "file:yaml";
+      global.securityDiagnostics.uploadFileSource = "file:yaml";
+      node["security"]["allow_public_upload"] >> global.allowPublicUpload;
+    }
   }
   finalizeRuntimeSettings();
   writeLog(0, "已加载 YAML 格式偏好设置。",
@@ -854,9 +1307,16 @@ void operate_toml_kv_table(
   }
 }
 
-void readTOMLConf(toml::value &root) {
+void readTOMLConf(toml::value &root,
+                  ScopedLogLevelOverride &log_level_scope) {
   auto section_common = toml::find(root, "common");
+  auto section_advanced = toml::find(root, "advanced");
+  applyConfiguredLogLevel(
+      toml::find_or<std::string>(section_advanced, "log_level", ""),
+      toml::find_or<bool>(section_advanced, "print_debug_info", false),
+      log_level_scope);
   string_array default_url, insert_url;
+  CommonScalarSettings common = captureCommonScalarSettings();
 
   find_if_exist(section_common, "default_url", default_url, "insert_url",
                 insert_url);
@@ -868,23 +1328,48 @@ void readTOMLConf(toml::value &root) {
   find_if_exist(
       section_common, "exclude_remarks", global.excludeRemarks,
       "include_remarks", global.includeRemarks, "enable_insert",
-      global.enableInsert, "prepend_insert_url", global.prependInsert,
+      global.enableInsert, "prepend_insert_url", common.prependInsert,
       "enable_filter", filter, "default_external_config",
-      global.defaultExtConfig, "base_path", global.basePath, "clash_rule_base",
-      global.clashBase, "surge_rule_base", global.surgeBase,
-      "surfboard_rule_base", global.surfboardBase, "mellow_rule_base",
-      global.mellowBase, "quan_rule_base", global.quanBase, "quanx_rule_base",
-      global.quanXBase, "loon_rule_base", global.loonBase, "sssub_rule_base",
-      global.SSSubBase, "singbox_rule_base", global.singBoxBase, "proxy_config",
-      global.proxyConfig, "proxy_ruleset", global.proxyRuleset,
-      "proxy_subscription", global.proxySubscription, "append_proxy_type",
-      global.appendType, "reload_conf_on_request", global.reloadConfOnRequest);
+      common.defaultExtConfig, "fallback_to_default_external_config",
+      common.fallbackToDefaultExternalConfig, "base_path", common.basePath,
+      "clash_rule_base",
+      common.clashBase, "surge_rule_base", common.surgeBase,
+      "surfboard_rule_base", common.surfboardBase, "mellow_rule_base",
+      common.mellowBase, "quan_rule_base", common.quanBase, "quanx_rule_base",
+      common.quanXBase, "loon_rule_base", common.loonBase, "sssub_rule_base",
+      common.SSSubBase, "singbox_rule_base", common.singBoxBase,
+      "stash_rule_base", common.stashBase, "proxy_config", common.proxyConfig,
+      "proxy_ruleset", common.proxyRuleset,
+      "proxy_subscription", common.proxySubscription, "proxy_bypass",
+      common.proxyBypass, "append_proxy_type",
+      common.appendType, "reload_conf_on_request", common.reloadConfOnRequest);
+  applyCommonScalarSettings(std::move(common));
 
-  // Set hardcoded default if not configured or empty (TOML)
-  if (global.defaultExtConfig.empty()) {
-    global.defaultExtConfig =
-        "https://gcore.jsdelivr.net/gh/Aethersailor/"
-        "Custom_OpenClash_Rules@refs/heads/main/cfg/Custom_Clash.ini";
+  if (root.contains("proxy_provider")) {
+    const auto &section_proxy_provider =
+        root.as_table().at("proxy_provider");
+    if (!section_proxy_provider.is_table()) {
+      throw std::invalid_argument("proxy_provider 必须是 TOML 表。");
+    }
+    if (section_proxy_provider.contains("interval")) {
+      const auto &interval =
+          section_proxy_provider.as_table().at("interval");
+      if (!interval.is_integer()) {
+        throw std::invalid_argument(
+            "proxy_provider.interval 必须是 TOML 整数。");
+      }
+      global.proxyProviderInterval =
+          requireProxyProviderInterval(interval.as_integer());
+    }
+    if (section_proxy_provider.contains("proxy_direct")) {
+      const auto &proxy_direct =
+          section_proxy_provider.as_table().at("proxy_direct");
+      if (!proxy_direct.is_boolean()) {
+        throw std::invalid_argument(
+            "proxy_provider.proxy_direct 必须是 TOML 布尔值。");
+      }
+      global.proxyProviderDirect = proxy_direct.as_boolean();
+    }
   }
 
   if (filter)
@@ -933,6 +1418,26 @@ void readTOMLConf(toml::value &root) {
   auto section_surge_external = toml::find(root, "surge_external_proxy");
   find_if_exist(section_surge_external, "surge_ssr_path", global.surgeSSRPath,
                 "resolve_hostname", global.surgeResolveHostname);
+
+  if (root.contains("remote_subscription")) {
+    const auto &section_remote_subscription =
+        root.as_table().at("remote_subscription");
+    if (section_remote_subscription.is_table()) {
+      find_if_exist(section_remote_subscription, "surge_policy_path",
+                    global.surgePolicyPath, "surfboard_policy_path",
+                    global.surfboardPolicyPath, "loon_remote_proxy",
+                    global.loonRemoteProxy);
+    }
+  }
+
+  if (root.contains("singbox")) {
+    const auto &section_singbox = root.as_table().at("singbox");
+    if (section_singbox.is_table()) {
+      find_if_exist(section_singbox, "wireguard_endpoint",
+                    global.singBoxWireGuardEndpoint, "snell_outbound",
+                    global.singBoxSnellOutbound);
+    }
+  }
 
   auto section_emojis = toml::find(root, "emojis");
 
@@ -989,12 +1494,19 @@ void readTOMLConf(toml::value &root) {
                 global.listenPort, "serve_file_root",
                 global.serveFileRoot);
 
-  auto section_advanced = toml::find(root, "advanced");
-
-  std::string log_level;
   bool enable_cache = true;
   int cache_subscription = global.cacheSubscription,
       cache_config = global.cacheConfig, cache_ruleset = global.cacheRuleset;
+
+  if (section_advanced.contains("resource_control")) {
+    global.resourceControl =
+        toml::find<std::string>(section_advanced, "resource_control");
+    global.resourceControlSource = "file:toml";
+  }
+
+  if (section_advanced.contains("force_max_curve_fingerprint"))
+    global.forceMaxCurveFingerprint = toml::find<std::string>(
+        section_advanced, "force_max_curve_fingerprint");
 
   find_if_exist(
       section_advanced, "log_level", log_level, "print_debug_info",
@@ -1074,6 +1586,14 @@ void readTOMLConf(toml::value &root) {
 
   auto section_security =
       toml::find_or(root, "security", toml::value(toml::table()));
+  if (section_security.contains("profile")) {
+    global.securityDiagnostics.profileSource = "file:toml";
+    global.securityDiagnostics.profileFileSource = "file:toml";
+  }
+  if (section_security.contains("allow_public_upload")) {
+    global.securityDiagnostics.uploadSource = "file:toml";
+    global.securityDiagnostics.uploadFileSource = "file:toml";
+  }
   find_if_exist(section_security, "profile", global.securityProfile,
                 "allow_public_upload", global.allowPublicUpload);
   finalizeRuntimeSettings();
@@ -1228,35 +1748,55 @@ bool readConf() {
   ini.get_if_exist("default_url", global.defaultUrls);
   global.enableInsert = ini.get("enable_insert");
   ini.get_if_exist("insert_url", global.insertUrls);
-  ini.get_bool_if_exist("prepend_insert_url", global.prependInsert);
+  ini.get_bool_if_exist("prepend_insert_url", common.prependInsert);
   if (ini.item_prefix_exist("exclude_remarks"))
     ini.get_all("exclude_remarks", global.excludeRemarks);
   if (ini.item_prefix_exist("include_remarks"))
     ini.get_all("include_remarks", global.includeRemarks);
   global.filterScript =
       ini.get_bool("enable_filter") ? ini.get("filter_script") : "";
-  ini.get_if_exist("base_path", global.basePath);
-  ini.get_if_exist("clash_rule_base", global.clashBase);
-  ini.get_if_exist("surge_rule_base", global.surgeBase);
-  ini.get_if_exist("surfboard_rule_base", global.surfboardBase);
-  ini.get_if_exist("mellow_rule_base", global.mellowBase);
-  ini.get_if_exist("quan_rule_base", global.quanBase);
-  ini.get_if_exist("quanx_rule_base", global.quanXBase);
-  ini.get_if_exist("loon_rule_base", global.loonBase);
-  ini.get_if_exist("sssub_rule_base", global.SSSubBase);
-  ini.get_if_exist("singbox_rule_base", global.singBoxBase);
-  ini.get_if_exist("default_external_config", global.defaultExtConfig);
-  // Set hardcoded default if not configured or empty
-  if (global.defaultExtConfig.empty()) {
-    global.defaultExtConfig =
-        "https://gcore.jsdelivr.net/gh/Aethersailor/"
-        "Custom_OpenClash_Rules@refs/heads/main/cfg/Custom_Clash.ini";
+  ini.get_if_exist("base_path", common.basePath);
+  ini.get_if_exist("clash_rule_base", common.clashBase);
+  ini.get_if_exist("surge_rule_base", common.surgeBase);
+  ini.get_if_exist("surfboard_rule_base", common.surfboardBase);
+  ini.get_if_exist("mellow_rule_base", common.mellowBase);
+  ini.get_if_exist("quan_rule_base", common.quanBase);
+  ini.get_if_exist("quanx_rule_base", common.quanXBase);
+  ini.get_if_exist("loon_rule_base", common.loonBase);
+  ini.get_if_exist("sssub_rule_base", common.SSSubBase);
+  ini.get_if_exist("singbox_rule_base", common.singBoxBase);
+  ini.get_if_exist("stash_rule_base", common.stashBase);
+  ini.get_if_exist("default_external_config", common.defaultExtConfig);
+  ini.get_bool_if_exist("fallback_to_default_external_config",
+                        common.fallbackToDefaultExternalConfig);
+  ini.get_bool_if_exist("append_proxy_type", common.appendType);
+  ini.get_if_exist("proxy_config", common.proxyConfig);
+  ini.get_if_exist("proxy_ruleset", common.proxyRuleset);
+  ini.get_if_exist("proxy_subscription", common.proxySubscription);
+  ini.get_if_exist("proxy_bypass", common.proxyBypass);
+  ini.get_bool_if_exist("reload_conf_on_request", common.reloadConfOnRequest);
+  applyCommonScalarSettings(std::move(common));
+
+  if (ini.section_exist("proxy_provider")) {
+    ini.enter_section("proxy_provider");
+    if (ini.item_exist("interval")) {
+      std::string interval;
+      ini.get_if_exist("interval", interval);
+      global.proxyProviderInterval = requireProxyProviderInterval(interval);
+    }
+    if (ini.item_exist("proxy_direct")) {
+      std::string proxy_direct;
+      ini.get_if_exist("proxy_direct", proxy_direct);
+      global.proxyProviderDirect =
+          requireProxyProviderDirect(proxy_direct);
+    }
   }
-  ini.get_bool_if_exist("append_proxy_type", global.appendType);
-  ini.get_if_exist("proxy_config", global.proxyConfig);
-  ini.get_if_exist("proxy_ruleset", global.proxyRuleset);
-  ini.get_if_exist("proxy_subscription", global.proxySubscription);
-  ini.get_bool_if_exist("reload_conf_on_request", global.reloadConfOnRequest);
+
+  if (ini.section_exist("custom_openclash_rules")) {
+    ini.enter_section("custom_openclash_rules");
+    ini.get_bool_if_exist("fallback_enabled",
+                          global.customOpenClashRulesSourceSwitch);
+  }
 
   if (ini.section_exist("custom_openclash_rules")) {
     ini.enter_section("custom_openclash_rules");
@@ -1270,6 +1810,21 @@ bool readConf() {
     ini.enter_section("surge_external_proxy");
     ini.get_if_exist("surge_ssr_path", global.surgeSSRPath);
     ini.get_bool_if_exist("resolve_hostname", global.surgeResolveHostname);
+  }
+
+  if (ini.section_exist("remote_subscription")) {
+    ini.enter_section("remote_subscription");
+    ini.get_bool_if_exist("surge_policy_path", global.surgePolicyPath);
+    ini.get_bool_if_exist("surfboard_policy_path",
+                          global.surfboardPolicyPath);
+    ini.get_bool_if_exist("loon_remote_proxy", global.loonRemoteProxy);
+  }
+
+  if (ini.section_exist("singbox")) {
+    ini.enter_section("singbox");
+    ini.get_bool_if_exist("wireguard_endpoint",
+                          global.singBoxWireGuardEndpoint);
+    ini.get_bool_if_exist("snell_outbound", global.singBoxSnellOutbound);
   }
 
   if (ini.section_exist("node_pref")) {
@@ -1412,32 +1967,12 @@ bool readConf() {
   global.serveFileRoot = ini.get("serve_file_root");
 
   ini.enter_section("advanced");
-  std::string log_level;
-  ini.get_if_exist("log_level", log_level);
-  ini.get_bool_if_exist("print_debug_info", global.printDbgInfo);
-  if (global.printDbgInfo)
-    global.logLevel = LOG_LEVEL_VERBOSE;
-  else {
-    switch (hash_(log_level)) {
-    case "warn"_hash:
-      global.logLevel = LOG_LEVEL_WARNING;
-      break;
-    case "error"_hash:
-      global.logLevel = LOG_LEVEL_ERROR;
-      break;
-    case "fatal"_hash:
-      global.logLevel = LOG_LEVEL_FATAL;
-      break;
-    case "verbose"_hash:
-      global.logLevel = LOG_LEVEL_VERBOSE;
-      break;
-    case "debug"_hash:
-      global.logLevel = LOG_LEVEL_DEBUG;
-      break;
-    default:
-      global.logLevel = LOG_LEVEL_INFO;
-    }
+  if (ini.item_exist("resource_control")) {
+    ini.get_if_exist("resource_control", global.resourceControl);
+    global.resourceControlSource = "file:ini";
   }
+  ini.get_if_exist("force_max_curve_fingerprint",
+                   global.forceMaxCurveFingerprint);
   ini.get_int_if_exist("max_pending_connections", global.maxPendingConns);
   ini.get_int_if_exist("max_concurrent_threads", global.maxConcurThreads);
   ini.get_int_if_exist("max_server_threads", global.maxServerThreads);
@@ -1512,8 +2047,20 @@ bool readConf() {
 
   if (ini.section_exist("security")) {
     ini.enter_section("security");
-    ini.get_if_exist("profile", global.securityProfile);
-    ini.get_bool_if_exist("allow_public_upload", global.allowPublicUpload);
+    if (ini.item_exist("profile")) {
+      global.securityDiagnostics.profileSource = "file:ini";
+      global.securityDiagnostics.profileFileSource = "file:ini";
+      ini.get_if_exist("profile", global.securityProfile);
+    }
+    if (ini.item_exist("allow_public_upload")) {
+      global.securityDiagnostics.uploadSource = "file:ini";
+      global.securityDiagnostics.uploadFileSource = "file:ini";
+      const std::string raw_upload = ini.get("allow_public_upload");
+      global.securityDiagnostics.uploadInput = raw_upload;
+      global.securityDiagnostics.uploadInputValid =
+          raw_upload == "true" || raw_upload == "false";
+      ini.get_bool_if_exist("allow_public_upload", global.allowPublicUpload);
+    }
   }
     finalizeRuntimeSettings();
 
@@ -1526,8 +2073,10 @@ bool readConf() {
   }
 }
 
-int loadExternalYAML(YAML::Node &node, ExternalConfig &ext,
-                     FetchContext context) {
+ExternalConfigLoadStatus loadExternalYAML(YAML::Node &node,
+                                          ExternalConfig &ext,
+                                          FetchContext context) {
+  const Settings &settings = effectiveSettings();
   YAML::Node section = node["custom"], object;
   std::string name, type, url, interval;
   std::string group, strLine;
@@ -1541,16 +2090,20 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext,
   section["loon_rule_base"] >> ext.loon_rule_base;
   section["sssub_rule_base"] >> ext.sssub_rule_base;
   section["singbox_rule_base"] >> ext.singbox_rule_base;
+  section["stash_rule_base"] >> ext.stash_rule_base;
 
   section["enable_rule_generator"] >> ext.enable_rule_generator;
   section["overwrite_original_rules"] >> ext.overwrite_original_rules;
+  section["ruleprepend"] >> ext.rule_prepend_sources;
+  section["ruleappend"] >> ext.rule_append_sources;
 
   const char *group_name = section["proxy_groups"].IsDefined()
                                ? "proxy_groups"
                                : "custom_proxy_group";
   if (section[group_name].size()) {
     string_array vArray;
-    readGroup(section[group_name], vArray, global.APIMode, context);
+    if (readGroup(section[group_name], vArray, settings.APIMode, context) != 0)
+      return ExternalConfigLoadStatus::ImportFailed;
     ext.custom_proxy_group =
         INIBinding::from<ProxyGroupConfig>::from_ini(vArray);
   }
@@ -1571,8 +2124,9 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext,
 
   if (section["rename_node"].size()) {
     string_array vArray;
-    readRegexMatch(section["rename_node"], "@", vArray, global.APIMode,
-                   context);
+    if (readRegexMatch(section["rename_node"], "@", vArray, settings.APIMode,
+                       context) != 0)
+      return ExternalConfigLoadStatus::ImportFailed;
     ext.rename = INIBinding::from<RegexMatchConfig>::from_ini(vArray, "@");
   }
 
@@ -1581,7 +2135,8 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext,
   const char *emoji_name = section["emojis"].IsDefined() ? "emojis" : "emoji";
   if (section[emoji_name].size()) {
     string_array vArray;
-    readEmoji(section[emoji_name], vArray, global.APIMode, context);
+    if (readEmoji(section[emoji_name], vArray, settings.APIMode, context) != 0)
+      return ExternalConfigLoadStatus::ImportFailed;
     ext.emoji = INIBinding::from<RegexMatchConfig>::from_ini(vArray, ",");
   }
 
@@ -1597,24 +2152,27 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext,
     }
   }
 
-  return 0;
+  return ExternalConfigLoadStatus::Success;
 }
 
-int loadExternalTOML(toml::value &root, ExternalConfig &ext,
-                     FetchContext context) {
+ExternalConfigLoadStatus loadExternalTOML(toml::value &root,
+                                          ExternalConfig &ext,
+                                          FetchContext context) {
   auto section = toml::find(root, "custom");
-  bool import_scope_limit = isPublicFetchRestricted(context) ? global.APIMode
-                                                            : false;
+  bool import_scope_limit = isPublicFetchRestricted(context);
 
   find_if_exist(section, "enable_rule_generator", ext.enable_rule_generator,
                 "overwrite_original_rules", ext.overwrite_original_rules,
+                "ruleprepend", ext.rule_prepend_sources, "ruleappend",
+                ext.rule_append_sources,
                 "clash_rule_base", ext.clash_rule_base, "surge_rule_base",
                 ext.surge_rule_base, "surfboard_rule_base",
                 ext.surfboard_rule_base, "mellow_rule_base",
                 ext.mellow_rule_base, "quan_rule_base", ext.quan_rule_base,
                 "quanx_rule_base", ext.quanx_rule_base, "loon_rule_base",
                 ext.loon_rule_base, "sssub_rule_base", ext.sssub_rule_base,
-                "singbox_rule_base", ext.singbox_rule_base, "add_emoji",
+                "singbox_rule_base", ext.singbox_rule_base,
+                "stash_rule_base", ext.stash_rule_base, "add_emoji",
                 ext.add_emoji, "remove_old_emoji", ext.remove_old_emoji,
                 "include_remarks", ext.include, "exclude_remarks", ext.exclude);
 
@@ -1628,7 +2186,8 @@ int loadExternalTOML(toml::value &root, ExternalConfig &ext,
 
   auto groups =
       toml::find_or<std::vector<toml::value>>(root, "custom_groups", {});
-  importItems(groups, "custom_groups", import_scope_limit, context);
+  if (importItems(groups, "custom_groups", import_scope_limit, context) != 0)
+    return ExternalConfigLoadStatus::ImportFailed;
   ext.custom_proxy_group = toml::get<ProxyGroupConfigs>(toml::value(groups));
 
   auto rulesets = toml::find_or<std::vector<toml::value>>(root, "rulesets", {});
@@ -1642,15 +2201,18 @@ int loadExternalTOML(toml::value &root, ExternalConfig &ext,
   ext.surge_ruleset = toml::get<RulesetConfigs>(toml::value(rulesets));
 
   auto emojiconfs = toml::find_or<std::vector<toml::value>>(root, "emoji", {});
-  importItems(emojiconfs, "emoji", import_scope_limit, context);
+  if (importItems(emojiconfs, "emoji", import_scope_limit, context) != 0)
+    return ExternalConfigLoadStatus::ImportFailed;
   ext.emoji = toml::get<RegexMatchConfigs>(toml::value(emojiconfs));
 
   auto renameconfs =
       toml::find_or<std::vector<toml::value>>(root, "rename_node", {});
-  importItems(renameconfs, "rename_node", import_scope_limit, context);
+  if (importItems(renameconfs, "rename_node", import_scope_limit, context) !=
+      0)
+    return ExternalConfigLoadStatus::ImportFailed;
   ext.rename = toml::get<RegexMatchConfigs>(toml::value(renameconfs));
 
-  return 0;
+  return ExternalConfigLoadStatus::Success;
 }
 
 int loadExternalConfig(std::string &path, ExternalConfig &ext,
@@ -1692,7 +2254,8 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext,
   if (ini.item_prefix_exist("custom_proxy_group")) {
     string_array vArray;
     ini.get_all("custom_proxy_group", vArray);
-    importItems(vArray, global.APIMode, context);
+    if (importItems(vArray, settings.APIMode, context) != 0)
+      return ExternalConfigLoadStatus::ImportFailed;
     ext.custom_proxy_group =
         INIBinding::from<ProxyGroupConfig>::from_ini(vArray);
   }
@@ -1720,15 +2283,19 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext,
   ini.get_if_exist("loon_rule_base", ext.loon_rule_base);
   ini.get_if_exist("sssub_rule_base", ext.sssub_rule_base);
   ini.get_if_exist("singbox_rule_base", ext.singbox_rule_base);
+  ini.get_if_exist("stash_rule_base", ext.stash_rule_base);
 
   ini.get_bool_if_exist("overwrite_original_rules",
                         ext.overwrite_original_rules);
   ini.get_bool_if_exist("enable_rule_generator", ext.enable_rule_generator);
+  ini.get_all("ruleprepend", ext.rule_prepend_sources);
+  ini.get_all("ruleappend", ext.rule_append_sources);
 
   if (ini.item_prefix_exist("rename")) {
     string_array vArray;
     ini.get_all("rename", vArray);
-    importItems(vArray, global.APIMode, context);
+    if (importItems(vArray, settings.APIMode, context) != 0)
+      return ExternalConfigLoadStatus::ImportFailed;
     ext.rename = INIBinding::from<RegexMatchConfig>::from_ini(vArray, "@");
   }
   ext.add_emoji = ini.get("add_emoji");
@@ -1736,7 +2303,8 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext,
   if (ini.item_prefix_exist("emoji")) {
     string_array vArray;
     ini.get_all("emoji", vArray);
-    importItems(vArray, global.APIMode, context);
+    if (importItems(vArray, settings.APIMode, context) != 0)
+      return ExternalConfigLoadStatus::ImportFailed;
     ext.emoji = INIBinding::from<RegexMatchConfig>::from_ini(vArray, ",");
   }
   if (ini.item_prefix_exist("include_remarks"))
@@ -1752,5 +2320,166 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext,
       ext.tpl_args->local_vars[x.first] = x.second;
   }
 
-  return 0;
+  return ExternalConfigLoadStatus::Success;
+}
+
+namespace {
+
+constexpr size_t kExternalConfigCacheEntries = 64;
+constexpr size_t kExternalConfigCacheBytes = 8 * 1024 * 1024;
+constexpr const char *kExternalConfigParserIdentity =
+    "external-config:auto-yaml-toml-ini:v3";
+
+struct CachedExternalConfig {
+  ExternalConfigLoadStatus status = ExternalConfigLoadStatus::ParseFailed;
+  ExternalConfig config;
+  string_map local_vars;
+  size_t cache_bytes = 0;
+};
+
+ConcurrentLruCache<std::string, CachedExternalConfig> external_config_cache(
+    kExternalConfigCacheEntries, kExternalConfigCacheBytes);
+
+static std::string buildExternalConfigCacheKey(
+    const std::string &base_content, FetchContext context,
+    unsigned long long config_generation) {
+  return getMD5(base_content) + ":" +
+         std::to_string(static_cast<int>(context)) + ":" +
+         std::to_string(config_generation) + ":" +
+         kExternalConfigParserIdentity;
+}
+
+static size_t localVarsSize(const string_map &vars) {
+  size_t bytes = 0;
+  for (const auto &[name, value] : vars)
+    bytes += name.size() + value.size();
+  return bytes;
+}
+
+} // namespace
+
+bool isExternalConfigCacheableContent(const std::string &content) {
+  std::string lower = toLower(content);
+  static const string_array dynamic_markers = {
+      "!!import:", "!!script:", "import:", "script:",
+      "import =",  "import=",    "script =", "script="};
+  for (const std::string &marker : dynamic_markers) {
+    if (lower.find(marker) != std::string::npos)
+      return false;
+  }
+  return true;
+}
+
+size_t externalConfigCacheMaxEntries() {
+  return external_config_cache.maxEntries();
+}
+
+size_t externalConfigCacheMaxBytes() {
+  return external_config_cache.maxBytes();
+}
+
+void configureExternalConfigCache(size_t max_entries, size_t max_bytes) {
+  external_config_cache.setLimits(max_entries, max_bytes);
+}
+
+void setExternalConfigCacheGrowthFrozen(bool frozen) noexcept {
+  try {
+    external_config_cache.setGrowthFrozen(frozen);
+  } catch (...) {
+  }
+}
+
+ExternalConfigLoadResult loadExternalConfigFromContent(
+    const std::string &path, const std::string &config,
+    ExternalConfig &ext, FetchContext context,
+    const string_map *resolved_imports,
+    string_array *missing_imports) {
+  template_args empty_tpl_args;
+  template_args *request_tpl_args =
+      ext.tpl_args ? ext.tpl_args : &empty_tpl_args;
+  const Settings &settings = effectiveSettings();
+  std::string base_content;
+  if (config.empty())
+    return {ExternalConfigLoadStatus::FetchFailed};
+
+  bool template_fetch_failed = false;
+  if (render_template(config, *request_tpl_args, base_content,
+                      settings.templatePath, context,
+                      &template_fetch_failed) != 0 ||
+      template_fetch_failed)
+    return {ExternalConfigLoadStatus::RenderFailed};
+
+  return loadExternalConfigFromRenderedContent(
+      path, base_content, ext, context, resolved_imports,
+      missing_imports, isExternalConfigCacheableContent(config));
+}
+
+ExternalConfigLoadResult loadExternalConfigFromRenderedContent(
+    const std::string &path, const std::string &base_content,
+    ExternalConfig &ext, FetchContext context,
+    const string_map *resolved_imports,
+    string_array *missing_imports,
+    bool source_cacheable) {
+  template_args empty_tpl_args;
+  template_args *request_tpl_args =
+      ext.tpl_args ? ext.tpl_args : &empty_tpl_args;
+  const Settings &settings = effectiveSettings();
+  if (base_content.empty())
+    return {ExternalConfigLoadStatus::FetchFailed};
+
+  ScopedResolvedImportView import_view(resolved_imports,
+                                       missing_imports);
+
+  bool cache_enabled =
+      settings.cacheConfig > 0 && source_cacheable &&
+      isExternalConfigCacheableContent(base_content);
+  const std::string key = buildExternalConfigCacheKey(
+      base_content, context, settings.configGeneration);
+
+  CachedExternalConfig cached = external_config_cache.getOrCompute(
+      key, cache_enabled,
+      [&] {
+        CachedExternalConfig value;
+        template_args parsed_tpl_args = *request_tpl_args;
+        parsed_tpl_args.local_vars.clear();
+        ExternalConfig parsed;
+        parsed.tpl_args = &parsed_tpl_args;
+        value.status =
+            parseExternalConfigContent(path, base_content, parsed, context);
+        value.local_vars = std::move(parsed_tpl_args.local_vars);
+        parsed.tpl_args = nullptr;
+        value.config = std::move(parsed);
+        value.cache_bytes =
+            base_content.size() + localVarsSize(value.local_vars);
+        return value;
+      },
+      [](const CachedExternalConfig &value)
+          -> ConcurrentLruCache<std::string,
+                                CachedExternalConfig>::CacheSize {
+        if (value.status != ExternalConfigLoadStatus::Success)
+          return std::nullopt;
+        return value.cache_bytes;
+      });
+
+  if (cached.status != ExternalConfigLoadStatus::Success)
+    return {cached.status};
+
+  template_args *destination_tpl_args = ext.tpl_args;
+  ext = std::move(cached.config);
+  ext.tpl_args = destination_tpl_args;
+  if (destination_tpl_args) {
+    for (const auto &[name, value] : cached.local_vars)
+      destination_tpl_args->local_vars[name] = value;
+  }
+  return {ExternalConfigLoadStatus::Success};
+}
+
+ExternalConfigLoadResult loadExternalConfig(const std::string &path,
+                                            ExternalConfig &ext,
+                                            FetchContext context) {
+  const Settings &settings = effectiveSettings();
+  ProxyPolicy proxy = parseProxy(settings.proxyConfig, settings.proxyBypass);
+  std::string config =
+      fetchFile(path, proxy, settings.cacheConfig, true, context);
+  return loadExternalConfigFromContent(path, config, ext, context);
 }

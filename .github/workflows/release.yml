@@ -1,0 +1,21 @@
+name: Formal Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Formal versions are serialized so one release finishes before the next starts.
+concurrency:
+  group: formal-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Tag release
+    uses: ./.github/workflows/build-dockerhub.yml
+    secrets: inherit
