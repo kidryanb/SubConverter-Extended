@@ -23,6 +23,7 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
       - name: Sync upstream master
         id: sync
