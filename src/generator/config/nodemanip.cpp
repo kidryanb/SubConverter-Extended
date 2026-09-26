@@ -510,6 +510,15 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
         std::vector<Proxy> parsed_nodes;
         appendMihomoNodes(mihomo_nodes, parsed_nodes);
         for (auto &node : parsed_nodes) {
+          if (explicit_http_node) {
+            auto canonical = nlohmann::json::parse(node.CanonicalProxyJson);
+            if (canonical.value("type", std::string()) != "http")
+              return -1;
+            canonical["skip-cert-verify"] =
+                parse_set.explicit_http_skip_cert_verify;
+            node.CanonicalProxyJson = canonical.dump();
+            node.AllowInsecure = parse_set.explicit_http_skip_cert_verify;
+          }
           node.GroupId = groupID;
           if (!custom_group.empty())
             node.Group = custom_group;

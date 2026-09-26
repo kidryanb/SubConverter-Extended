@@ -621,6 +621,7 @@ struct TaggedLink {
     DuplicateInterval,
     InvalidProxyDirect,
     DuplicateProxyDirect,
+    InvalidNode,
   };
 
   std::string tag;
@@ -632,6 +633,7 @@ struct TaggedLink {
   bool has_provider = false;
   bool has_interval = false;
   bool has_proxy_direct = false;
+  bool has_node = false;
   bool link_decoded = false;
   Error error = Error::None;
 };
@@ -727,6 +729,12 @@ static bool parseLinkPrefixes(const std::string &input, TaggedLink &result) {
       remainder = next;
       continue;
     }
+    if (startsWith(remainder, "node:")) {
+      parsed = true;
+      result.has_node = true;
+      remainder.erase(0, 5);
+      break;
+    }
     break;
   }
 
@@ -754,6 +762,11 @@ static bool parseLinkPrefixes(const std::string &input, TaggedLink &result) {
   if (saw_bracketed && !remainder.empty() && remainder.back() == '>')
     remainder.pop_back();
   result.link = remainder;
+  if (result.has_node &&
+      (result.has_provider || result.has_interval ||
+       result.has_proxy_direct ||
+       !mihomo::isExplicitHttpNodeUri(result.link)))
+    result.error = TaggedLink::Error::InvalidNode;
   return true;
 }
 
@@ -762,6 +775,7 @@ static bool looksLikeEncodedLinkPrefix(const std::string &input) {
   return startsWith(lower, "tag%3a") || startsWith(lower, "provider%3a") ||
          startsWith(lower, "interval%3a") ||
          startsWith(lower, "proxy_direct%3a") ||
+         startsWith(lower, "node%3a") ||
          startsWith(lower, "%3ctag%3a") ||
          startsWith(lower, "%3cprovider%3a") || startsWith(lower, "%3ctag:") ||
          startsWith(lower, "%3cinterval%3a") ||
@@ -799,6 +813,14 @@ static TaggedLink parseTaggedLink(const std::string &input) {
 static std::string providerLinkPrefixError(
     size_t item_index, TaggedLink::Error error) {
   const std::string item = std::to_string(item_index + 1);
+  if (error == TaggedLink::Error::InvalidNode) {
+    return "Invalid request: node: for URL item #" + item +
+           " requires an HTTP(S) proxy with a host and port, no credentials, "
+           "path, or query, and no provider-only prefixes.\n"
+           "无效请求：第 " + item +
+           " 个 url 项的 node: 必须是带主机和端口的 HTTP(S) 代理链接，"
+           "不得带认证信息、路径、查询参数或 Provider 专用前缀。";
+  }
   if (error == TaggedLink::Error::DuplicateInterval) {
     return "Invalid request: interval: is repeated for URL item #" + item +
            ".\n"
@@ -3261,7 +3283,7 @@ static SubStageResponse processSubscriptionNodes(
           *status_code = 400;
           return {true, providerDirectScopeError(index)};
         }
-        std::string node_link = link;
+        std::string node_link = tagged.has_node ? "node:" + link : link;
         if (tagged.has_tag)
           node_link = "tag:" + tagged.tag + "," + link;
         writeLog(0, "检测到节点链接：'" + link + "'，将直接解析。",
