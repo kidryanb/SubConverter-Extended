@@ -490,10 +490,11 @@ def main() -> int:
     if not args.apply:
         return 0
 
-    hub_token = dockerhub_token(docker_username, docker_secret)
-    delete_dockerhub_tags(
-        args.dockerhub_namespace, args.repository, hub_token, sorted(docker_targets)
-    )
+    if docker_targets:
+        hub_token = dockerhub_token(docker_username, docker_secret)
+        delete_dockerhub_tags(
+            args.dockerhub_namespace, args.repository, hub_token, sorted(docker_targets)
+        )
 
     if detach:
         versions = wait_for_package_tag_digests(
