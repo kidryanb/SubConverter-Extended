@@ -112,7 +112,7 @@ RUN set -eux; \
 
 # ========== C++ BUILD STAGE ==========
 # 使用 Debian (glibc) 编译，运行时再搬运依赖到 Alpine
-FROM ${DEBIAN_IMAGE} AS builder
+FROM ${DEBIAN_IMAGE} AS builder-base
 ARG THREADS="4"
 ARG SHA=""
 ARG VERSION="dev"
