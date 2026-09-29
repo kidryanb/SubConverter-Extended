@@ -1,15 +1,20 @@
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
+#include <climits>
 #include <condition_variable>
 #include <cstdint>
 #include <ctime>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -23,7 +28,8 @@
 #include <yaml-cpp/yaml.h>
 
 #include "config/binding.h"
-#include "config/custom_openclash_rules.h"
+#include "generator/config/clash_proxy.h"
+#include "generator/config/external_rules.h"
 #include "generator/config/nodemanip.h"
 #include "generator/config/ruleconvert.h"
 #include "generator/config/subexport.h"
@@ -32,8 +38,10 @@
 #include "conversion_pipeline.h"
 #include "interfaces.h"
 #include "multithread.h"
+#include "ruleset_output.h"
 #include "parser/mihomo_scheme_utils.h"
 #include "parser/mihomo_bridge.h"
+#include "parser/subparser.h"
 #include "script/cron.h"
 #include "script/script_quickjs.h"
 #include "runtime/owner_admission.h"
@@ -41,67 +49,13 @@
 #include "server/request_context.h"
 #include "server/webserver.h"
 #include "settings.h"
+#include "settings_view.h"
 #include "statistics.h"
+#include "sub_request_key.h"
 #include "upload.h"
+#include "user_agent.h"
+#include "webget.h"
 #include "utils/time_compat.h"
-
-const std::vector<std::string> DEFAULT_REMOTE_CONFIG_FALLBACKS = {
-    "https://gcore.jsdelivr.net/gh/Aethersailor/Custom_OpenClash_Rules@refs/"
-    "heads/main/cfg/Custom_Clash.ini",
-    "https://testingcf.jsdelivr.net/gh/Aethersailor/"
-    "Custom_OpenClash_Rules@refs/heads/main/cfg/Custom_Clash.ini",
-    "https://cdn.jsdelivr.net/gh/Aethersailor/Custom_OpenClash_Rules@refs/"
-    "heads/main/cfg/Custom_Clash.ini",
-    "https://raw.githubusercontent.com/Aethersailor/Custom_OpenClash_Rules/"
-    "main/cfg/Custom_Clash.ini"};
-
-static void appendUniqueConfig(std::vector<std::string> &configs,
-                               std::unordered_set<std::string> &seen,
-                               const std::string &config) {
-  if (!config.empty() && seen.insert(config).second)
-    configs.emplace_back(config);
-}
-
-static void appendBundledConfig(
-    std::vector<std::string> &configs,
-    std::unordered_set<std::string> &seen,
-    const custom_openclash_rules::Resource &resource) {
-  if (!resource.matched())
-    return;
-  for (const std::string &path :
-       custom_openclash_rules::localPathCandidates(resource))
-    appendUniqueConfig(configs, seen, path);
-}
-
-static std::vector<std::string>
-buildExternalConfigFallbacks(const std::string &failedConfig,
-                             bool enhancedFallback,
-                             bool legacyRemoteFallback) {
-  std::vector<std::string> configs;
-  std::unordered_set<std::string> seen;
-  seen.insert(failedConfig);
-
-  if (enhancedFallback) {
-    custom_openclash_rules::Resource same_name =
-        custom_openclash_rules::matchRepositoryUrl(failedConfig);
-    if (same_name.kind ==
-        custom_openclash_rules::ResourceKind::ConfigIni)
-      appendBundledConfig(configs, seen, same_name);
-  }
-
-  if (enhancedFallback || legacyRemoteFallback) {
-    for (const std::string &remote : DEFAULT_REMOTE_CONFIG_FALLBACKS)
-      appendUniqueConfig(configs, seen, remote);
-  }
-
-  if (enhancedFallback) {
-    appendBundledConfig(
-        configs, seen,
-        custom_openclash_rules::matchPublishedPath(
-            "/Custom_OpenClash_Rules/main/cfg/Custom_Clash.ini"));
-  }
-  return configs;
-}
 
 static string_icase_map buildSubscriptionRequestHeaders() {
   string_icase_map headers;
@@ -134,6 +88,117 @@ extern WebServer webServer;
 string_array gRegexBlacklist = {"(.*)*"};
 
 static constexpr size_t kProviderUserAgentMaxLen = 512;
+
+enum class RemoteSubscriptionMode {
+  ServerSideParse,
+  ClashProxyProvider,
+  QuanXServerRemote,
+  SurgePolicyPath,
+  SurfboardPolicyPath,
+  LoonRemoteProxy,
+  StashProxyProvider,
+};
+
+struct TargetDescriptor {
+  const char *name;
+  NodeParserMode parser_mode;
+  RemoteSubscriptionMode remote_subscription_mode;
+  bool simple_subscription;
+  SingleLinkTypes single_link_types;
+};
+
+static constexpr std::array<TargetDescriptor, 22> kTargetDescriptors = {{
+    {"clash", NodeParserMode::MihomoOnly,
+     RemoteSubscriptionMode::ClashProxyProvider, false, 0},
+    {"clashr", NodeParserMode::MihomoOnly,
+     RemoteSubscriptionMode::ClashProxyProvider, false, 0},
+    {"surge", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::SurgePolicyPath, false, 0},
+    {"quan", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, false, 0},
+    {"quanx", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::QuanXServerRemote, false, 0},
+    {"loon", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::LoonRemoteProxy, false, 0},
+    {"surfboard", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::SurfboardPolicyPath, false, 0},
+    {"stash", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::StashProxyProvider, false, 0},
+    {"mellow", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, false, 0},
+    {"singbox", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, false, 0},
+    {"ss", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true,
+     SingleLinkType::Shadowsocks},
+    {"ssd", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, 0},
+    {"ssr", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true,
+     SingleLinkType::ShadowsocksR},
+    {"sssub", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, 0},
+    {"v2ray", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, SingleLinkType::VMess},
+    {"v2rayn", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, 0},
+    {"v2rayng", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, 0},
+    {"shadowrocket", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, 0},
+    {"trojan", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, SingleLinkType::Trojan},
+    {"vless", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, SingleLinkType::VLESS},
+    {"hysteria2", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true,
+     SingleLinkType::Hysteria2},
+    {"mixed", NodeParserMode::LegacyOnly,
+     RemoteSubscriptionMode::ServerSideParse, true, SingleLinkType::Mixed},
+}};
+
+static const TargetDescriptor *findTargetDescriptor(const std::string &name) {
+  const auto found =
+      std::find_if(kTargetDescriptors.begin(), kTargetDescriptors.end(),
+                   [&](const TargetDescriptor &target) {
+                     return name == target.name;
+                   });
+  return found == kTargetDescriptors.end() ? nullptr : &*found;
+}
+
+static const char *nodeParserModeName(NodeParserMode mode) {
+  return mode == NodeParserMode::MihomoOnly ? "mihomo" : "legacy";
+}
+
+static const char *remoteSubscriptionModeName(RemoteSubscriptionMode mode) {
+  switch (mode) {
+  case RemoteSubscriptionMode::ClashProxyProvider:
+    return "clash-proxy-provider";
+  case RemoteSubscriptionMode::QuanXServerRemote:
+    return "quanx-server-remote";
+  case RemoteSubscriptionMode::SurgePolicyPath:
+    return "surge-policy-path";
+  case RemoteSubscriptionMode::SurfboardPolicyPath:
+    return "surfboard-policy-path";
+  case RemoteSubscriptionMode::LoonRemoteProxy:
+    return "loon-remote-proxy";
+  case RemoteSubscriptionMode::StashProxyProvider:
+    return "stash-proxy-provider";
+  case RemoteSubscriptionMode::ServerSideParse:
+  default:
+    return "server-side-parse";
+  }
+}
+
+static std::string supportedTargets(const std::string &separator) {
+  std::string result;
+  for (const TargetDescriptor &target : kTargetDescriptors) {
+    if (!result.empty())
+      result += separator;
+    result += target.name;
+  }
+  return result;
+}
 
 static std::string trimProviderUserAgentCandidate(const std::string &ua) {
   size_t begin = ua.find_first_not_of(" \t");
@@ -1008,7 +1073,61 @@ static std::string sanitizeProviderName(const std::string &input) {
   return cleaned;
 }
 
+static std::string sanitizeRemoteResourceName(const std::string &input) {
+  std::string tag = sanitizeProviderName(input);
+  std::replace(tag.begin(), tag.end(), ',', '_');
+  std::replace(tag.begin(), tag.end(), '=', '_');
+  tag = trimWhitespace(tag, true, true);
+  return tag;
+}
+
+static std::string reserveStashProviderName(
+    const std::string &base, std::unordered_set<std::string> &reserved_keys) {
+  std::string base_name = clampProviderNameLength(base, 64);
+  if (base_name.empty())
+    base_name = "SubConverter_Provider";
+  if (reserved_keys.insert(toLower(base_name)).second)
+    return base_name;
+  int suffix_index = 1;
+  while (true) {
+    const std::string suffix = "_" + std::to_string(suffix_index++);
+    const size_t max_base = 64 > suffix.size() ? 64 - suffix.size() : 0;
+    const std::string candidate =
+        clampProviderNameLength(base_name, max_base) + suffix;
+    if (reserved_keys.insert(toLower(candidate)).second)
+      return candidate;
+  }
+}
+
+static bool hasUnsafeQuanXRemoteUrlChar(const std::string &url) {
+  return std::any_of(url.begin(), url.end(), [](unsigned char ch) {
+    return ch <= 0x20 || ch == 0x7f;
+  });
+}
+
+static bool isHttpSubscriptionLink(const std::string &link,
+                                   bool explicitly_remote) {
+  if (!mihomo::isHttpSchemeLink(link))
+    return false;
+  const std::string lower_link = toLower(link);
+  if (startsWith(lower_link, "https://t.me/socks") ||
+      startsWith(lower_link, "https://t.me/http"))
+    return false;
+  if (isLegacyHttpProxyUri(link))
+    return false;
+  if (explicitly_remote)
+    return true;
+  const size_t protocol_end = link.find("://") + 3;
+  const size_t query_start = link.find('?', protocol_end);
+  if (query_start != std::string::npos)
+    return true;
+  const size_t path_start = link.find('/', protocol_end);
+  return path_start != std::string::npos &&
+         link.size() - path_start > 1;
+}
+
 static std::string subconverter_impl(Request &request, Response &response,
+                                     const Settings &settings,
                                      RuleConversionStats *rule_stats = nullptr);
 
 namespace {
@@ -1017,7 +1136,9 @@ struct CoalescedResponse {
   int status_code = 200;
   std::string content_type;
   string_icase_map headers;
-  std::string body;
+  shared_response_body body;
+  std::string fallback_body;
+  bool capacity_rejected = false;
   uint64_t rule_conversions = 0;
 };
 
@@ -1026,14 +1147,100 @@ using SharedCoalescedResponse = std::shared_ptr<const CoalescedResponse>;
 struct InflightSubRequest {
   std::mutex mutex;
   std::condition_variable cv;
+  std::string owner_request_id;
+  std::shared_ptr<RequestContext> work_context;
+  std::atomic<uint32_t> consumers{1};
   bool done = false;
   SharedCoalescedResponse result;
   std::exception_ptr exception;
+
+  uint32_t tryAddConsumer() noexcept {
+    uint32_t current = consumers.load(std::memory_order_acquire);
+    while (current != 0 && current != UINT32_MAX) {
+      if (consumers.compare_exchange_weak(current, current + 1,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire))
+        return current + 1;
+    }
+    return 0;
+  }
+
+  uint32_t releaseConsumer() noexcept {
+    uint32_t current = consumers.load(std::memory_order_acquire);
+    while (current != 0) {
+      if (consumers.compare_exchange_weak(current, current - 1,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire))
+        return current - 1;
+    }
+    return 0;
+  }
+};
+
+struct InflightConsumerState {
+  explicit InflightConsumerState(std::shared_ptr<InflightSubRequest> call)
+      : call(std::move(call)) {}
+
+  void release() noexcept {
+    bool expected = false;
+    if (!released.compare_exchange_strong(expected, true,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire))
+      return;
+    if (!call)
+      return;
+    const uint32_t remaining = call->releaseConsumer();
+    if (call->work_context)
+      call->work_context->setConsumerCount(remaining);
+    bool done = false;
+    {
+      std::lock_guard<std::mutex> lock(call->mutex);
+      done = call->done;
+    }
+    if (remaining == 0 && !done && call->work_context)
+      call->work_context->requestCancellation(
+          RequestCancellationReason::NoConsumers);
+  }
+
+  std::shared_ptr<InflightSubRequest> call;
+  std::atomic<bool> released{false};
+};
+
+struct InflightConsumerGuard {
+  InflightConsumerGuard(std::shared_ptr<InflightSubRequest> call,
+                        const std::shared_ptr<RequestContext> &client_context)
+      : state(std::make_shared<InflightConsumerState>(std::move(call))) {
+    if (client_context) {
+      const std::weak_ptr<InflightConsumerState> weak_state = state;
+      cancellation_registration = client_context->registerCancellationCallback(
+          [weak_state] {
+            if (auto current = weak_state.lock())
+              current->release();
+          });
+    }
+  }
+  ~InflightConsumerGuard() {
+    cancellation_registration.reset();
+    release();
+  }
+
+  void release() noexcept {
+    if (state)
+      state->release();
+  }
+
+  InflightConsumerGuard(const InflightConsumerGuard &) = delete;
+  InflightConsumerGuard &operator=(const InflightConsumerGuard &) = delete;
+
+  std::shared_ptr<InflightConsumerState> state;
+  RequestCancellationRegistration cancellation_registration;
 };
 
 struct CachedSubResponse {
   SharedCoalescedResponse result;
   std::chrono::steady_clock::time_point expires_at;
+  uint64_t bytes = 0;
+  uint64_t sequence = 0;
 };
 
 static std::mutex g_sub_inflight_mutex;
@@ -1041,16 +1248,66 @@ static std::map<std::string, std::shared_ptr<InflightSubRequest>>
     g_sub_inflight;
 static std::mutex g_sub_response_cache_mutex;
 static std::map<std::string, CachedSubResponse> g_sub_response_cache;
+static uint64_t g_sub_response_cache_bytes = 0;
+static uint64_t g_sub_response_cache_sequence = 0;
+static std::atomic<uint64_t> g_sub_response_cache_limit{0};
+static std::atomic<bool> g_sub_response_cache_growth_frozen{false};
+
+static void eraseInflightSubRequest(
+    const std::string &key,
+    const std::shared_ptr<InflightSubRequest> &expected_call) {
+  std::lock_guard<std::mutex> lock(g_sub_inflight_mutex);
+  auto iter = g_sub_inflight.find(key);
+  if (iter != g_sub_inflight.end() && iter->second == expected_call)
+    g_sub_inflight.erase(iter);
+}
+
+static std::map<std::string, CachedSubResponse>::iterator
+eraseSubResponseCacheEntry(
+    std::map<std::string, CachedSubResponse>::iterator iter) {
+  const uint64_t bytes = iter->second.bytes;
+  g_sub_response_cache_bytes =
+      bytes <= g_sub_response_cache_bytes
+          ? g_sub_response_cache_bytes - bytes
+          : 0;
+  return g_sub_response_cache.erase(iter);
+}
+
+static uint64_t subResponseCacheMaxBytes() {
+  const uint64_t applied =
+      g_sub_response_cache_limit.load(std::memory_order_acquire);
+  if (applied != 0)
+    return applied;
+  static const uint64_t limit = [] {
+    const std::string configured =
+        getEnv("SUBCONVERTER_RESPONSE_CACHE_MAX_BYTES");
+    if (configured.empty())
+      return UINT64_C(8) * 1024 * 1024;
+    try {
+      return static_cast<uint64_t>(std::clamp<unsigned long long>(
+          std::stoull(configured), 1024, UINT64_C(64) * 1024 * 1024));
+    } catch (...) {
+      return UINT64_C(8) * 1024 * 1024;
+    }
+  }();
+  return limit;
+}
 
 struct SubExplainProvider {
+  std::string backend = "mihomo";
   std::string name;
   std::string tag;
   std::string source_hash;
+  std::string source_summary;
   std::string path;
   std::string filter;
   std::string exclude_filter;
+  bool filter_present = false;
+  bool exclude_filter_present = false;
+  bool name_generated = false;
   int group_id = 0;
   uint32_t interval = 0;
+  bool proxy_direct = kDefaultProxyProviderDirect;
 };
 
 struct SubExplainParameter {
@@ -1087,11 +1344,14 @@ struct SubExplainReport {
   bool rule_generator_enabled = false;
   bool expand_rulesets = false;
   bool proxy_provider_mode = false;
+  std::string remote_subscription_backend = "server-side-parse";
+  std::string remote_subscription_reason = "target-default";
   bool nodelist = false;
   bool managed_config = false;
   std::string proxy_config;
   std::string proxy_ruleset;
   std::string proxy_subscription;
+  std::string proxy_bypass;
   std::string base_fetch_context = "trusted_config";
   std::string ruleset_fetch_context = "trusted_config";
   size_t raw_url_count = 0;
@@ -1100,10 +1360,18 @@ struct SubExplainReport {
   size_t node_link_count = 0;
   size_t unknown_node_link_count = 0;
   size_t provider_count = 0;
+  size_t remote_subscription_count = 0;
   size_t insert_node_count = 0;
   size_t direct_node_count = 0;
   size_t total_node_count = 0;
+  size_t generated_node_count = 0;
+  size_t unsupported_node_count = 0;
+  string_array unsupported_protocols;
   size_t ruleset_count = 0;
+  size_t rule_provider_count = 0;
+  size_t inline_rule_source_count = 0;
+  size_t expanded_rule_source_count = 0;
+  size_t unsupported_ruleset_count = 0;
   size_t custom_group_count = 0;
   size_t output_bytes = 0;
   std::vector<SubExplainProvider> providers;
@@ -1123,38 +1391,64 @@ static std::string fetchContextName(FetchContext context) {
   }
 }
 
-static std::string shortHash(const std::string &value) {
-  if (value.empty())
-    return "";
-  return getMD5(value).substr(0, 10);
-}
-
 static std::string boolString(bool value) { return value ? "true" : "false"; }
 
-static std::string previewExplainValue(const std::string &raw_value,
+static std::string previewExplainValue(const std::string &value,
                                        bool sensitive) {
-  std::string decoded = urlDecode(raw_value);
-  if (decoded.empty())
+  if (value.empty())
     return "";
   if (sensitive)
     return "[redacted]";
 
   static constexpr size_t kMaxPreview = 180;
-  if (decoded.size() <= kMaxPreview)
-    return decoded;
-  return decoded.substr(0, kMaxPreview) + "...";
+  std::string safe = sanitizeLogLine(value);
+  if (safe.size() <= kMaxPreview)
+    return safe;
+  return safe.substr(0, kMaxPreview) + "...";
 }
 
-static void writeJsonString(
-    rapidjson::Writer<rapidjson::StringBuffer> &writer, const char *key,
-    const std::string &value) {
+static std::string summarizeExplainSourceList(const std::string &value) {
+  if (value.empty())
+    return "not provided";
+
+  static constexpr size_t kMaxSummarizedSources = 8;
+  const string_array sources = split(value, "|");
+  string_array summaries;
+  summaries.reserve(std::min(sources.size(), kMaxSummarizedSources) + 1);
+  for (size_t index = 0;
+       index < sources.size() && index < kMaxSummarizedSources; ++index) {
+    const TaggedLink tagged = parseTaggedLink(sources[index]);
+    summaries.emplace_back(summarizeUrlForLog(tagged.link));
+  }
+  if (sources.size() > kMaxSummarizedSources) {
+    summaries.emplace_back("... " +
+                           std::to_string(sources.size() -
+                                          kMaxSummarizedSources) +
+                           " more source(s)");
+  }
+  return join(summaries, "; ");
+}
+
+static std::string explainParameterName(const std::string &name) {
+  static constexpr size_t kMaxParameterName = 64;
+  if (!name.empty() && name.size() <= kMaxParameterName &&
+      std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.';
+      }))
+    return name;
+  return "[redacted-name]";
+}
+
+template <typename Writer>
+static void writeJsonString(Writer &writer, const char *key,
+                            const std::string &value) {
   writer.Key(key);
   writer.String(value.c_str());
 }
 
-static void writeExplainParameter(
-    rapidjson::Writer<rapidjson::StringBuffer> &writer,
-    const SubExplainParameter &parameter) {
+template <typename Writer>
+static void writeExplainParameter(Writer &writer,
+                                  const SubExplainParameter &parameter) {
   writer.StartObject();
   writeJsonString(writer, "name", parameter.name);
   writer.Key("present");
@@ -1174,8 +1468,9 @@ static void writeExplainParameter(
   writer.EndObject();
 }
 
+template <typename Writer>
 static void writeExplainConfigSection(
-    rapidjson::Writer<rapidjson::StringBuffer> &writer,
+    Writer &writer,
     const SubExplainConfigSection &section) {
   writer.StartObject();
   writeJsonString(writer, "name", section.name);
@@ -1186,9 +1481,11 @@ static void writeExplainConfigSection(
 }
 
 static std::string serializeSubExplainReport(const SubExplainReport &report,
-                                             const Response &response) {
-  rapidjson::StringBuffer buffer;
-  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+                                             const Response &response,
+                                             size_t max_output_bytes =
+                                                 std::numeric_limits<size_t>::max()) {
+  BoundedOutputSink buffer(max_output_bytes);
+  rapidjson::Writer<BoundedOutputSink> writer(buffer);
 
   writer.StartObject();
   writer.Key("ok");
@@ -1204,6 +1501,10 @@ static std::string serializeSubExplainReport(const SubExplainReport &report,
   writer.Bool(report.simple_subscription);
   writer.Key("proxy_provider");
   writer.Bool(report.proxy_provider_mode);
+  writeJsonString(writer, "remote_subscription_backend",
+                  report.remote_subscription_backend);
+  writeJsonString(writer, "remote_subscription_reason",
+                  report.remote_subscription_reason);
   writer.Key("nodelist");
   writer.Bool(report.nodelist);
   writer.Key("expand_rulesets");
@@ -1272,6 +1573,7 @@ static std::string serializeSubExplainReport(const SubExplainReport &report,
   writeJsonString(writer, "config", report.proxy_config);
   writeJsonString(writer, "ruleset", report.proxy_ruleset);
   writeJsonString(writer, "subscription", report.proxy_subscription);
+  writeJsonString(writer, "bypass", report.proxy_bypass);
   writer.EndObject();
 
   writer.Key("resources");
@@ -1280,8 +1582,18 @@ static std::string serializeSubExplainReport(const SubExplainReport &report,
   writeJsonString(writer, "ruleset_fetch_context", report.ruleset_fetch_context);
   writer.Key("ruleset_count");
   writer.Uint64(report.ruleset_count);
+  writer.Key("rule_provider_count");
+  writer.Uint64(report.rule_provider_count);
+  writer.Key("inline_rule_source_count");
+  writer.Uint64(report.inline_rule_source_count);
+  writer.Key("expanded_rule_source_count");
+  writer.Uint64(report.expanded_rule_source_count);
+  writer.Key("unsupported_ruleset_count");
+  writer.Uint64(report.unsupported_ruleset_count);
   writer.Key("custom_group_count");
   writer.Uint64(report.custom_group_count);
+  writer.Key("remote_subscription_count");
+  writer.Uint64(report.remote_subscription_count);
   writer.EndObject();
 
   writer.Key("nodes");
@@ -1292,22 +1604,43 @@ static std::string serializeSubExplainReport(const SubExplainReport &report,
   writer.Uint64(report.direct_node_count);
   writer.Key("total");
   writer.Uint64(report.total_node_count);
+  writer.Key("generated");
+  writer.Uint64(report.generated_node_count);
+  writer.Key("unsupported");
+  writer.Uint64(report.unsupported_node_count);
+  writer.Key("unsupported_protocols");
+  writer.StartArray();
+  for (const std::string &protocol : report.unsupported_protocols)
+    writer.String(protocol.c_str());
+  writer.EndArray();
   writer.EndObject();
 
   writer.Key("providers");
   writer.StartArray();
   for (const SubExplainProvider &provider : report.providers) {
     writer.StartObject();
+    writeJsonString(writer, "backend", provider.backend);
     writeJsonString(writer, "name", provider.name);
     writeJsonString(writer, "tag", provider.tag);
     writeJsonString(writer, "source_hash", provider.source_hash);
+    writeJsonString(writer, "source_summary", provider.source_summary);
     writeJsonString(writer, "path", provider.path);
     writeJsonString(writer, "filter", provider.filter);
     writeJsonString(writer, "exclude_filter", provider.exclude_filter);
+    writer.Key("filter_present");
+    writer.Bool(provider.filter_present);
+    writer.Key("exclude_filter_present");
+    writer.Bool(provider.exclude_filter_present);
+    writer.Key("name_generated");
+    writer.Bool(provider.name_generated);
     writer.Key("group_id");
     writer.Int(provider.group_id);
     writer.Key("interval");
     writer.Uint(provider.interval);
+    writer.Key("proxy_direct");
+    writer.Bool(provider.proxy_direct);
+    writer.Key("proxy_field_emitted");
+    writer.Bool(provider.proxy_direct);
     writer.EndObject();
   }
   writer.EndArray();
@@ -1318,10 +1651,12 @@ static std::string serializeSubExplainReport(const SubExplainReport &report,
   writer.Uint64(report.output_bytes);
   writer.Key("provider_count");
   writer.Uint64(report.provider_count);
+  writer.Key("remote_subscription_count");
+  writer.Uint64(report.remote_subscription_count);
   writer.EndObject();
 
   writer.EndObject();
-  return buffer.GetString();
+  return buffer.release();
 }
 
 static bool isTruthyRequestValue(const std::string &value) {
@@ -1336,6 +1671,11 @@ struct AgeResponseContext {
   std::string recipient;
   std::string fingerprint;
 };
+
+static void applyExplainPrivacyHeaders(Response &response) {
+  response.headers["Cache-Control"] = "private, no-store, max-age=0";
+  response.headers["Pragma"] = "no-cache";
+}
 
 static AgeResponseContext consumeAgeResponseContext(Request &request) {
   AgeResponseContext context;
@@ -1370,7 +1710,15 @@ static std::string rejectAgeRequest(Response &response,
 
 static std::string finalizeSubResponse(const Request &request,
                                        Response &response, std::string body,
-                                       const AgeResponseContext &age) {
+                                       const AgeResponseContext &age,
+                                       size_t max_output_bytes =
+                                           std::numeric_limits<size_t>::max()) {
+  RequestStageTimer serialize_timer(request.context, RequestStage::Serialize);
+  if (isTruthyRequestValue(getUrlArg(request.argument, "explain")))
+    applyExplainPrivacyHeaders(response);
+  // User-Agent can select target=auto and affects subscription/provider
+  // request headers. Separate every /sub representation in shared caches.
+  appendVaryHeader(response, "User-Agent");
   // Every /sub representation varies on this header, including the plaintext
   // variant, so shared caches cannot serve plaintext to an encrypted request.
   appendVaryHeader(response, "X-Age-Public-Key");
@@ -1390,12 +1738,26 @@ static std::string finalizeSubResponse(const Request &request,
   }
 
   try {
+    const size_t fixed_overhead = checkedBoundedOutputSize(
+        8192, age.recipient.size(), std::numeric_limits<size_t>::max());
+    const size_t doubled_body = checkedBoundedOutputSize(
+        body.size(), body.size(), std::numeric_limits<size_t>::max());
+    const size_t encrypted_upper_bound = checkedBoundedOutputSize(
+        doubled_body, fixed_overhead, std::numeric_limits<size_t>::max());
+    if (body.capacity() > max_output_bytes ||
+        encrypted_upper_bound > max_output_bytes - body.capacity())
+      throw BoundedOutputExceeded();
     body = mihomo::encryptAgeArmored(body, age.recipient);
+    if (body.size() > encrypted_upper_bound ||
+        body.capacity() > max_output_bytes)
+      throw BoundedOutputExceeded();
     response.headers.erase("ETag");
     response.headers.erase("Content-MD5");
     response.headers.erase("Digest");
     response.headers["X-SCE-Age"] = "encrypted";
     return body;
+  } catch (const BoundedOutputExceeded &) {
+    throw;
   } catch (...) {
     response.status_code = 500;
     response.content_type = "text/plain; charset=utf-8";
@@ -1407,47 +1769,9 @@ static std::string finalizeSubResponse(const Request &request,
   }
 }
 
-class SubRequestKeyBuilder {
-public:
-  bool append(const std::string &name, const std::string &value) {
-    static constexpr size_t kMaxIdentitySize = 2 * 1024 * 1024;
-    size_t extra_size = name.size() + value.size() + 32;
-    if (size_ + extra_size > kMaxIdentitySize)
-      return false;
-
-    std::string value_size = std::to_string(value.size());
-    process(name);
-    process(":", 1);
-    process(value_size);
-    process(":", 1);
-    process(value);
-    process("\n", 1);
-    size_ += name.size() + value_size.size() + value.size() + 3;
-    return true;
-  }
-
-  std::string finish() {
-    char digest[MD5_STRING_SIZE];
-    md5_.finish();
-    md5_.get_string(digest);
-    return digest;
-  }
-
-private:
-  void process(const std::string &value) {
-    process(value.data(), value.size());
-  }
-
-  void process(const char *value, size_t size) {
-    md5_.process(value, static_cast<uint32_t>(size));
-  }
-
-  md5::md5_t md5_;
-  size_t size_ = 0;
-};
-
-static bool shouldCoalesceSubRequest(const Request &request) {
-  if (!global.enableRequestCoalescing)
+static bool shouldCoalesceSubRequest(const Request &request,
+                                     const Settings &settings) {
+  if (!settings.enableRequestCoalescing)
     return false;
   if (request.method != "GET" || request.url != "/sub")
     return false;
@@ -1456,48 +1780,61 @@ static bool shouldCoalesceSubRequest(const Request &request) {
   return true;
 }
 
-static std::string buildSubRequestKey(const Request &request,
-                                      const AgeResponseContext &age) {
-  SubRequestKeyBuilder identity;
-  if (!identity.append("version", VERSION) ||
-      !identity.append("config_generation",
-                       std::to_string(global.configGeneration)) ||
-      !identity.append("managed_config_prefix", global.managedConfigPrefix) ||
-      !identity.append("method", request.method) ||
-      !identity.append("path", request.url) ||
-      !identity.append("age_recipient_fingerprint", age.fingerprint))
-    return "";
-
-  for (const auto &arg : request.argument) {
-    if (!identity.append("arg_name", arg.first) ||
-        !identity.append("arg_value", arg.second))
-      return "";
-  }
-
-  for (const auto &header : request.headers) {
-    if (!identity.append("header_name", toLower(header.first)) ||
-        !identity.append("header_value", header.second))
-      return "";
-  }
-
-  return identity.finish();
-}
-
-static void copyCoalescedToResponse(const CoalescedResponse &result,
-                                    Response &response) {
+static std::string applyCoalescedToResponse(
+    const CoalescedResponse &result,
+    const std::shared_ptr<RequestContext> &client_context,
+    Response &response) {
   response.status_code = result.status_code;
   response.content_type = result.content_type;
   response.headers = result.headers;
+  response.shared_body = result.body;
+  if (result.capacity_rejected && client_context)
+    client_context->setFinalFailureAttribution(
+        RequestFailureAttribution::Capacity);
+  return result.body ? std::string() : result.fallback_body;
+}
+
+static shared_response_body tryMakeRetainedResponseBody(
+    std::string body) noexcept {
+  const uint64_t content_bytes = static_cast<uint64_t>(body.capacity());
+  RetainedResponseByteLease lease;
+  if (!lease.acquire(content_bytes))
+    return {};
+  try {
+    auto result = std::make_shared<ImmutableResponseBody>();
+    result->content = std::move(body);
+    result->retained_bytes = std::move(lease);
+    return result;
+  } catch (...) {
+    return {};
+  }
 }
 
 static SharedCoalescedResponse makeCoalescedResult(
-    std::string &&body, Response &&response, uint64_t rule_conversions) {
+    std::string &&body, Response &&response, uint64_t rule_conversions,
+    bool capacity_rejected = false) {
   auto result = std::make_shared<CoalescedResponse>();
+  result->capacity_rejected = capacity_rejected;
+  result->body = std::move(response.shared_body);
+  if (!result->body)
+    result->body = tryMakeRetainedResponseBody(std::move(body));
+  if (!result->body) {
+    if (const std::shared_ptr<RequestContext> context =
+            captureCurrentRequestContext())
+      context->suggestFailure(RequestFailureAttribution::Capacity);
+    response.status_code = 503;
+    response.content_type = "text/plain; charset=utf-8";
+    response.headers = {{"Cache-Control", "private, no-store"},
+                        {"Retry-After", "1"}};
+    result->fallback_body =
+        "Service temporarily unavailable: retained response byte capacity "
+        "is full.\n服务暂时不可用：响应字节容量已满。\n";
+    result->capacity_rejected = true;
+  }
   result->status_code = response.status_code;
   result->content_type = std::move(response.content_type);
   result->headers = std::move(response.headers);
-  result->body = std::move(body);
-  result->rule_conversions = rule_conversions;
+  result->rule_conversions = result->body ? rule_conversions : 0;
   return result;
 }
 
@@ -1505,16 +1842,37 @@ static void pruneExpiredSubResponseCache(
     std::chrono::steady_clock::time_point now) {
   for (auto iter = g_sub_response_cache.begin();
        iter != g_sub_response_cache.end();) {
-    if (iter->second.expires_at <= now)
-      iter = g_sub_response_cache.erase(iter);
-    else
+    if (iter->second.expires_at <= now) {
+      iter = eraseSubResponseCacheEntry(iter);
+    } else
       ++iter;
   }
 }
 
+static uint64_t coalescedResponseBytes(const CoalescedResponse &result) {
+  uint64_t bytes = (result.body ? result.body->content.capacity()
+                                : result.fallback_body.capacity()) +
+                   result.content_type.capacity();
+  for (const auto &[name, value] : result.headers)
+    bytes += name.capacity() + value.capacity();
+  return bytes;
+}
+
+static void evictOldestSubResponseCacheEntry() {
+  if (g_sub_response_cache.empty())
+    return;
+  auto oldest = std::min_element(
+      g_sub_response_cache.begin(), g_sub_response_cache.end(),
+      [](const auto &left, const auto &right) {
+        return left.second.sequence < right.second.sequence;
+      });
+  eraseSubResponseCacheEntry(oldest);
+}
+
 static bool getCachedSubResponse(const std::string &key,
-                                 SharedCoalescedResponse &result) {
-  if (global.responseCacheTtl <= 0)
+                                 SharedCoalescedResponse &result,
+                                 const Settings &settings) {
+  if (settings.responseCacheTtl <= 0)
     return false;
 
   auto now = std::chrono::steady_clock::now();
@@ -1523,57 +1881,86 @@ static bool getCachedSubResponse(const std::string &key,
   if (iter == g_sub_response_cache.end())
     return false;
   if (iter->second.expires_at <= now) {
-    g_sub_response_cache.erase(iter);
+    eraseSubResponseCacheEntry(iter);
     return false;
   }
   result = iter->second.result;
+  iter->second.sequence = ++g_sub_response_cache_sequence;
   return true;
 }
 
 static void storeCachedSubResponse(const std::string &key,
-                                   const SharedCoalescedResponse &result) {
-  if (global.responseCacheTtl <= 0 || !result || result->status_code != 200)
+                                   const SharedCoalescedResponse &result,
+                                   const Settings &settings) {
+  if (settings.responseCacheTtl <= 0 || !result || result->status_code != 200)
+    return;
+  if (g_sub_response_cache_growth_frozen.load(std::memory_order_acquire))
+    return;
+  const auto cache_control = result->headers.find("Cache-Control");
+  if (cache_control != result->headers.end() &&
+      toLower(cache_control->second).find("no-store") != std::string::npos)
     return;
 
-  int ttl = std::min(global.responseCacheTtl, 5);
+  int ttl = std::min(settings.responseCacheTtl, 5);
   if (ttl <= 0)
     return;
 
   auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(g_sub_response_cache_mutex);
+  if (g_sub_response_cache_growth_frozen.load(std::memory_order_acquire))
+    return;
   pruneExpiredSubResponseCache(now);
-  if (g_sub_response_cache.size() > 2048) {
-    writeLog(0,
-             "响应微缓存条目数量过多，已清空以避免占用过多内存。",
-             LOG_LEVEL_WARNING);
-    g_sub_response_cache.clear();
-  }
-  g_sub_response_cache[key] = {
-      result, now + std::chrono::seconds(ttl)};
+  const uint64_t bytes = coalescedResponseBytes(*result);
+  const uint64_t max_bytes = subResponseCacheMaxBytes();
+  if (bytes > max_bytes)
+    return;
+  auto existing = g_sub_response_cache.find(key);
+  if (existing != g_sub_response_cache.end())
+    eraseSubResponseCacheEntry(existing);
+  while (!g_sub_response_cache.empty() &&
+         (g_sub_response_cache.size() >= 2048 ||
+          g_sub_response_cache_bytes > max_bytes - bytes))
+    evictOldestSubResponseCacheEntry();
+  CachedSubResponse cached;
+  cached.result = result;
+  cached.expires_at = now + std::chrono::seconds(ttl);
+  cached.bytes = bytes;
+  cached.sequence = ++g_sub_response_cache_sequence;
+  g_sub_response_cache_bytes += bytes;
+  g_sub_response_cache.emplace(key, std::move(cached));
 }
 
 static std::string runSubconverterImplWithRetry(const Request &original,
                                                 Response &response,
+                                                const Settings &settings,
                                                 RuleConversionStats *stats) {
   Request first_request = original;
   Response first_response;
   RuleConversionStats first_stats;
-  std::string body = subconverter_impl(first_request, first_response,
+  std::string body = subconverter_impl(first_request, first_response, settings,
                                        stats ? &first_stats : nullptr);
-  if (first_response.status_code < 500 || !global.coalesceRetryOn5xx) {
+  if (first_response.status_code < 500 || !settings.coalesceRetryOn5xx) {
+    if (stats)
+      *stats = first_stats;
+    response = first_response;
+    return body;
+  }
+  if (original.context &&
+      (original.context->cancellationToken().isCancellationRequested() ||
+       original.context->deadlineExceeded())) {
     if (stats)
       *stats = first_stats;
     response = first_response;
     return body;
   }
 
-  writeLog(0,
-           "/sub 请求首次转换返回 5xx，正在进行一次服务端内部重试。",
-           LOG_LEVEL_WARNING);
+  writeLog(LOG_LEVEL_WARNING,
+           "/sub 请求首次转换返回 5xx，正在进行一次服务端内部重试。");
   Request retry_request = original;
   Response retry_response;
   RuleConversionStats retry_stats;
   std::string retry_body = subconverter_impl(retry_request, retry_response,
+                                             settings,
                                              stats ? &retry_stats : nullptr);
   if (retry_response.status_code < 500) {
     if (stats)
@@ -1598,116 +1985,324 @@ static void recordTrackedSubRequest(bool track, const Request &request,
   statistics::recordSubscriptionConversion(request, rule_conversions);
 }
 
-static std::string subconverterEntry(Request &request, Response &response,
-                                     bool track) {
-  AgeResponseContext age = consumeAgeResponseContext(request);
-  if (age.requested && !age.valid) {
-    return rejectAgeRequest(
+static SettingsSnapshot captureSettingsForSubRequest(Request &request) {
+  SettingsSnapshot current = captureEffectiveSettingsSnapshot();
+  if (!current->reloadConfOnRequest || !current->CFWChildProcess ||
+      current->generatorMode)
+    return current;
+
+  std::string target = getUrlArg(request.argument, "target");
+  if (target == "auto") {
+    tribool clash_new_field;
+    int surge_version =
+        to_int(getUrlArg(request.argument, "ver"), 3);
+    matchUserAgent(request.headers["User-Agent"], target, clash_new_field,
+                   surge_version);
+  }
+  if (findTargetDescriptor(target)) {
+    readConf();
+    return captureSettingsSnapshot();
+  }
+  return current;
+}
+
+static std::string runScheduledConversion(
+    Request &request, Response &response, const SettingsSnapshot &snapshot,
+    RuleConversionStats *stats, bool with_retry,
+    std::shared_ptr<RequestContext> admission_context = {});
+
+struct PreparedSubRequest {
+  SettingsSnapshot settings;
+  AgeResponseContext age;
+  std::string key;
+  bool explain_request = false;
+  bool coalesce = false;
+  bool early_complete = false;
+};
+
+struct ForceMaxFlowOutput {
+  Response response;
+  std::string body;
+  uint64_t rule_conversions = 0;
+  bool capacity_rejected = false;
+};
+
+using ForceMaxFlowCompletion =
+    std::function<void(ForceMaxFlowOutput, ConversionFlowTerminal)>;
+
+static bool forceMaxFlowEligible(
+    const Request &request, const PreparedSubRequest &prepared);
+static bool startForceMaxFlow(
+    Request request, std::shared_ptr<const PreparedSubRequest> prepared,
+    bool track_statistics, bool record_direct_statistics,
+    ForceMaxFlowCompletion completion);
+
+enum class AsyncInflightPhase {
+  Accepting,
+  Publishing,
+  Done,
+  Abandoned,
+};
+
+struct AsyncInflightSubRequest;
+
+struct AsyncSubRequestConsumer {
+  uint64_t id = 0;
+  bool follower = false;
+  std::atomic<bool> waiting_counted{false};
+  std::shared_ptr<RequestContext> context;
+  statistics::SubscriptionConversionMetadata statistics_metadata;
+  ConversionService::Completion completion;
+  std::weak_ptr<AsyncInflightSubRequest> call;
+  RequestCancellationRegistration cancellation_registration;
+  std::atomic<bool> completion_claimed{false};
+  std::atomic<bool> detached{false};
+};
+
+struct AsyncInflightSubRequest {
+  std::mutex mutex;
+  AsyncInflightPhase phase = AsyncInflightPhase::Accepting;
+  std::string key;
+  std::string owner_request_id;
+  std::shared_ptr<RequestContext> work_context;
+  std::unordered_map<uint64_t, std::shared_ptr<AsyncSubRequestConsumer>>
+      consumers;
+  uint64_t next_consumer_id = 1;
+  SharedCoalescedResponse result;
+  OwnerAdmissionLease owner_admission;
+  std::atomic<bool> active_released{false};
+};
+
+std::mutex g_async_sub_inflight_mutex;
+std::map<std::string, std::shared_ptr<AsyncInflightSubRequest>>
+    g_async_sub_inflight;
+std::atomic<uint64_t> g_async_singleflight_active_owners{0};
+std::atomic<uint64_t> g_async_singleflight_waiting_followers{0};
+std::atomic<uint64_t> g_async_singleflight_owners_created{0};
+std::atomic<uint64_t> g_async_singleflight_followers_attached{0};
+std::atomic<uint64_t> g_async_singleflight_followers_cancelled{0};
+std::atomic<uint64_t> g_async_singleflight_no_consumer_cancellations{0};
+std::atomic<uint64_t> g_async_singleflight_owner_flow_rejections{0};
+
+static PreparedSubRequest prepareSubRequest(Request &request,
+                                            Response &response,
+                                            std::string &early_body) {
+  PreparedSubRequest prepared;
+  // Early validation failures do not pass through finalizeSubResponse.
+  appendVaryHeader(response, "User-Agent");
+  prepared.explain_request =
+      isTruthyRequestValue(getUrlArg(request.argument, "explain"));
+  if (prepared.explain_request)
+    applyExplainPrivacyHeaders(response);
+  prepared.age = consumeAgeResponseContext(request);
+  if (prepared.age.requested && !prepared.age.valid) {
+    early_body = rejectAgeRequest(
         response,
         "Invalid X-Age-Public-Key: expected one Mihomo-supported Age public "
         "or secret key.\n"
-        "X-Age-Public-Key 无效：应提供一个 Mihomo 支持的 Age 公钥或私钥。"
-    );
+        "X-Age-Public-Key 无效：应提供一个 Mihomo 支持的 Age 公钥或私钥。");
+    prepared.early_complete = true;
+    return prepared;
   }
-  if (age.requested && getUrlArg(request.argument, "target") != "clash") {
-    return rejectAgeRequest(
+  if (prepared.age.requested &&
+      getUrlArg(request.argument, "target") != "clash") {
+    early_body = rejectAgeRequest(
         response,
         "Invalid request: Age response encryption is supported only for "
         "target=clash.\n"
-        "无效请求：Age 响应加密仅支持 target=clash。"
-    );
+        "无效请求：Age 响应加密仅支持 target=clash。");
+    prepared.early_complete = true;
+    return prepared;
   }
 
-  if (!shouldCoalesceSubRequest(request)) {
-    RuleConversionStats stats;
-    std::string body =
-        subconverter_impl(request, response, track ? &stats : nullptr);
-    body = finalizeSubResponse(request, response, std::move(body), age);
-    recordTrackedSubRequest(track, request, response, stats.rules);
-    return body;
+  // CFW's compatibility reload remains after target validation, matching the
+  // legacy control flow. Capture the view only after that transaction ends.
+  prepared.settings = captureSettingsForSubRequest(request);
+  ScopedSettingsView settings_scope(prepared.settings);
+  const Settings &settings = *prepared.settings;
+  prepared.coalesce = shouldCoalesceSubRequest(request, settings);
+  if (prepared.coalesce) {
+    prepared.key = buildSubRequestKey(
+        request, prepared.age.fingerprint, settings.configGeneration,
+        settings.managedConfigPrefix);
+    prepared.coalesce = !prepared.key.empty();
   }
+  return prepared;
+}
 
-  std::string key = buildSubRequestKey(request, age);
-  if (key.empty()) {
+static SharedCoalescedResponse executePreparedSubRequestOwner(
+    Request &request, const PreparedSubRequest &prepared,
+    RuleConversionStats *stats,
+    std::shared_ptr<RequestContext> admission_context = {}) {
+  ScopedSettingsView settings_scope(prepared.settings);
+  Response owner_response;
+  std::string body = runScheduledConversion(
+      request, owner_response, prepared.settings, stats, true,
+      std::move(admission_context));
+  body = finalizeSubResponse(request, owner_response, std::move(body),
+                             prepared.age);
+  return makeCoalescedResult(std::move(body), std::move(owner_response),
+                             stats ? stats->rules : 0);
+}
+
+static std::string subconverterEntry(Request &request, Response &response,
+                                     bool track) {
+  std::string early_body;
+  PreparedSubRequest prepared =
+      prepareSubRequest(request, response, early_body);
+  if (prepared.early_complete)
+    return early_body;
+
+  ScopedSettingsView settings_scope(prepared.settings);
+  const Settings &settings = *prepared.settings;
+  if (!prepared.coalesce) {
     RuleConversionStats stats;
-    std::string body =
-        subconverter_impl(request, response, track ? &stats : nullptr);
-    body = finalizeSubResponse(request, response, std::move(body), age);
+    std::string body = runScheduledConversion(
+        request, response, prepared.settings, track ? &stats : nullptr, false);
+    body = finalizeSubResponse(request, response, std::move(body), prepared.age);
     recordTrackedSubRequest(track, request, response, stats.rules);
     return body;
   }
 
   SharedCoalescedResponse cached_result;
-  if (getCachedSubResponse(key, cached_result)) {
-    writeLog(0, "/sub 响应微缓存命中。", LOG_LEVEL_DEBUG);
-    copyCoalescedToResponse(*cached_result, response);
+  if (!prepared.explain_request &&
+      getCachedSubResponse(prepared.key, cached_result, settings)) {
+    writeLog(LOG_LEVEL_DEBUG, "/sub 响应微缓存命中。");
+    if (request.context)
+      request.context->setCostClass(RequestCostClass::Low);
+    if (request.context)
+      request.context->markWorkAdmitted();
+    std::string body = applyCoalescedToResponse(
+        *cached_result, request.context, response);
     recordTrackedSubRequest(track, request, response,
                             cached_result->rule_conversions);
-    return cached_result->body;
+    return body;
   }
 
   std::shared_ptr<InflightSubRequest> call;
   bool owner = false;
+  uint32_t follower_consumers = 0;
   {
     std::lock_guard<std::mutex> lock(g_sub_inflight_mutex);
-    auto iter = g_sub_inflight.find(key);
-    if (iter == g_sub_inflight.end()) {
+    auto iter = g_sub_inflight.find(prepared.key);
+    if (iter != g_sub_inflight.end()) {
+      follower_consumers = iter->second->tryAddConsumer();
+      if (follower_consumers != 0) {
+        call = iter->second;
+      } else {
+        g_sub_inflight.erase(iter);
+      }
+    }
+    if (!call) {
       call = std::make_shared<InflightSubRequest>();
-      g_sub_inflight.emplace(key, call);
+      call->owner_request_id = currentLogRequestId();
+      const auto work_started = RequestContext::Clock::now();
+      const auto configured_deadline =
+          work_started + std::chrono::milliseconds(
+                             std::max(1, settings.requestDeadlineMs));
+      const auto absolute_deadline =
+          request.context &&
+                  request.context->deadline() !=
+                      RequestContext::Clock::time_point::max()
+              ? std::min(configured_deadline,
+                         request.context->deadline())
+              : configured_deadline;
+      call->work_context = std::make_shared<RequestContext>(
+          call->owner_request_id, work_started, absolute_deadline,
+          RequestContextKind::InternalWork);
+      call->work_context->setConsumerCount(1);
+      if (request.context) {
+        request.context->setSingleflightRole(RequestSingleflightRole::Owner);
+        request.context->setConsumerCount(1);
+      }
+      g_sub_inflight.emplace(prepared.key, call);
       owner = true;
-    } else {
-      call = iter->second;
     }
   }
 
   if (!owner) {
-    writeLog(0, "/sub 请求已合并到正在执行的同 key 转换。",
-             LOG_LEVEL_DEBUG);
-    std::unique_lock<std::mutex> lock(call->mutex);
-    call->cv.wait(lock, [&call] { return call->done; });
+    if (request.context)
+      request.context->markWorkAdmitted();
+    if (request.context)
+      request.context->setSingleflightRole(RequestSingleflightRole::Follower);
+    if (call->work_context)
+      call->work_context->setConsumerCount(follower_consumers);
+    InflightConsumerGuard consumer_guard(call, request.context);
+    writeLog(LOG_LEVEL_INFO,
+             "SUB_REQUEST_COALESCED owner_request_id=" +
+                 (call->owner_request_id.empty() ? "unavailable"
+                                                 : call->owner_request_id));
+    std::optional<RequestCancellationResponse> follower_cancellation =
+        waitWithoutCpuPermit([&]()
+                                 -> std::optional<
+                                     RequestCancellationResponse> {
+          std::unique_lock<std::mutex> lock(call->mutex);
+          while (!call->done) {
+            RequestCancellationResponse cancellation_response;
+            if (requestCancellationResponse(request.context,
+                                            cancellation_response))
+              return cancellation_response;
+            auto wake = RequestContext::Clock::now() +
+                        std::chrono::milliseconds(10);
+            if (request.context &&
+                request.context->deadline() !=
+                    RequestContext::Clock::time_point::max())
+              wake = std::min(wake, request.context->deadline());
+            call->cv.wait_until(lock, wake);
+          }
+          return std::nullopt;
+        });
+    if (follower_cancellation) {
+      response.status_code = follower_cancellation->status_code;
+      response.content_type = "text/plain; charset=utf-8";
+      response.headers = std::move(follower_cancellation->headers);
+      return std::move(follower_cancellation->body);
+    }
     if (call->exception)
       std::rethrow_exception(call->exception);
-    copyCoalescedToResponse(*call->result, response);
+    if (request.context) {
+      if (call->work_context)
+        request.context->setCostClass(call->work_context->costClass());
+    }
+    std::string body = applyCoalescedToResponse(
+        *call->result, request.context, response);
     recordTrackedSubRequest(track, request, response,
                             call->result->rule_conversions);
-    return call->result->body;
+    return body;
   }
 
+  InflightConsumerGuard consumer_guard(call, request.context);
   try {
-    writeLog(0, "/sub 请求成为同 key 转换 owner。", LOG_LEVEL_DEBUG);
-    Response owner_response;
+    writeLog(LOG_LEVEL_DEBUG, "/sub 请求成为同 key 转换 owner。");
+    Request work_request = request;
+    work_request.context = call->work_context;
+    ScopedRequestContext work_scope(call->work_context);
     RuleConversionStats stats;
-    std::string body = runSubconverterImplWithRetry(
-        request, owner_response, track ? &stats : nullptr);
-    body = finalizeSubResponse(request, owner_response, std::move(body), age);
-    SharedCoalescedResponse result = makeCoalescedResult(
-        std::move(body), std::move(owner_response), stats.rules);
-    copyCoalescedToResponse(*result, response);
+    SharedCoalescedResponse result = executePreparedSubRequestOwner(
+        work_request, prepared, track ? &stats : nullptr, request.context);
+    if (request.context && call->work_context)
+      request.context->setCostClass(call->work_context->costClass());
+    std::string response_body = applyCoalescedToResponse(
+        *result, request.context, response);
     {
       std::lock_guard<std::mutex> lock(call->mutex);
       call->result = result;
       call->done = true;
     }
-    {
-      std::lock_guard<std::mutex> lock(g_sub_inflight_mutex);
-      g_sub_inflight.erase(key);
-    }
-    if (!age.requested)
-      storeCachedSubResponse(key, result);
+    if (!prepared.age.requested && !prepared.explain_request)
+      storeCachedSubResponse(prepared.key, result, settings);
+    eraseInflightSubRequest(prepared.key, call);
     call->cv.notify_all();
     recordTrackedSubRequest(track, request, response,
                             result->rule_conversions);
-    return result->body;
+    return response_body;
   } catch (...) {
     {
       std::lock_guard<std::mutex> lock(call->mutex);
       call->exception = std::current_exception();
       call->done = true;
     }
-    {
-      std::lock_guard<std::mutex> lock(g_sub_inflight_mutex);
-      g_sub_inflight.erase(key);
-    }
+    eraseInflightSubRequest(prepared.key, call);
     call->cv.notify_all();
     throw;
   }
@@ -1715,16 +2310,1436 @@ static std::string subconverterEntry(Request &request, Response &response,
 
 } // namespace
 
+namespace {
+
+std::atomic<WorkloadScheduler *> conversion_scheduler_instance{nullptr};
+std::atomic<WorkloadScheduler *> compatibility_request_flow_instance{nullptr};
+std::atomic<CpuPermitGate *> conversion_cpu_gate_instance{nullptr};
+std::atomic<bool> conversion_shutdown_requested{false};
+std::atomic<uint64_t> desired_cpu_permits{0};
+
+CpuPermitGate &conversionCpuGate() {
+  const uint64_t desired = desired_cpu_permits.load(std::memory_order_acquire);
+  static CpuPermitGate gate(static_cast<std::size_t>(
+      std::max<uint64_t>(1, desired != 0
+                                ? desired
+                                : static_cast<uint64_t>(std::max(
+                                      1, effectiveSettings().maxConcurThreads)))));
+  conversion_cpu_gate_instance.store(&gate, std::memory_order_release);
+  uint64_t published_desired = 0;
+  do {
+    published_desired =
+        desired_cpu_permits.load(std::memory_order_acquire);
+    if (published_desired != 0)
+      gate.setLimit(static_cast<std::size_t>(std::min<uint64_t>(
+          published_desired, std::numeric_limits<std::size_t>::max())));
+  } while (desired_cpu_permits.load(std::memory_order_acquire) !=
+           published_desired);
+  if (conversion_shutdown_requested.load(std::memory_order_acquire))
+    gate.requestShutdown();
+  return gate;
+}
+
+WorkloadScheduler &conversionScheduler();
+
+WorkloadScheduler &compatibilityRequestFlowScheduler() {
+  const Settings &settings = effectiveSettings();
+  const unsigned int hardware_threads =
+      std::max(1U, std::thread::hardware_concurrency());
+  const std::size_t workers = static_cast<std::size_t>(
+      std::clamp(std::min(settings.maxConcurThreads,
+                          static_cast<int>(hardware_threads)),
+                 1, INT_MAX));
+  const std::size_t entries = static_cast<std::size_t>(
+      std::max(settings.maxPendingConns, 1));
+  static WorkloadScheduler scheduler(
+      workers, entries, requestAdmissionSnapshot().max_bytes);
+  compatibility_request_flow_instance.store(&scheduler,
+                                             std::memory_order_release);
+  if (conversion_shutdown_requested.load(std::memory_order_acquire))
+    scheduler.requestShutdown(true);
+  return scheduler;
+}
+
+WorkloadScheduler &requestFlowFallbackScheduler(
+    const PreparedSubRequest &prepared) {
+  return prepared.settings &&
+                 prepared.settings->resourceControlEffective == "force_max"
+             ? conversionScheduler()
+             : compatibilityRequestFlowScheduler();
+}
+
+WorkloadScheduler &conversionScheduler() {
+  const Settings &settings = effectiveSettings();
+  const unsigned int hardware_threads =
+      std::max(1U, std::thread::hardware_concurrency());
+  const std::size_t workers = static_cast<std::size_t>(
+      std::clamp(std::min(settings.maxConcurThreads,
+                          static_cast<int>(hardware_threads)),
+                 1, INT_MAX));
+  const std::size_t entries = static_cast<std::size_t>(
+      std::max(settings.maxPendingConns, 1));
+  const ResourceControlSnapshot resources = resourceControlSnapshot();
+  const bool force_max = resources.effective_mode == "force_max" &&
+                         resources.calculated_force_max_budget.valid;
+  const std::size_t queue_entries = force_max
+      ? static_cast<std::size_t>(std::min<uint64_t>(
+            resources.calculated_force_max_budget.flow_queue_entries,
+            SIZE_MAX))
+      : entries;
+  const uint64_t queue_bytes = force_max
+      ? resources.calculated_force_max_budget.flow_queue_bytes
+      : requestAdmissionSnapshot().max_bytes;
+  static WorkloadScheduler scheduler(workers, queue_entries,
+                                     queue_bytes);
+  conversion_scheduler_instance.store(&scheduler, std::memory_order_release);
+  if (conversion_shutdown_requested.load(std::memory_order_acquire))
+    scheduler.requestShutdown(true);
+  return scheduler;
+}
+
+RequestCostClass estimateConversionCost(const Request &request) {
+  const std::string target = getUrlArg(request.argument, "target");
+  const std::string url = getUrlArg(request.argument, "url");
+  const bool list = isTruthyRequestValue(getUrlArg(request.argument, "list"));
+  const bool script =
+      isTruthyRequestValue(getUrlArg(request.argument, "script"));
+  const bool expand =
+      isTruthyRequestValue(getUrlArg(request.argument, "expand"));
+  const bool multiple = url.find('|') != std::string::npos;
+  const bool external_config =
+      !getUrlArg(request.argument, "config").empty();
+  static constexpr const char *transform_parameters[] = {
+      "include", "exclude", "rename", "emoji", "add_emoji",
+      "remove_emoji", "append_type", "sort", "filter_deprecated",
+      "udp", "tfo", "scv", "tls13", "group", "ruleprepend",
+      "ruleappend", "ruleset", "provider_headers"};
+  bool transformation = false;
+  for (const char *name : transform_parameters) {
+    if (!getUrlArg(request.argument, name).empty()) {
+      transformation = true;
+      break;
+    }
+  }
+  if (script || expand || multiple || external_config || transformation)
+    return RequestCostClass::High;
+  (void)target;
+  (void)list;
+  return RequestCostClass::Medium;
+}
+
+ConversionResult schedulerFailureResult(Request &request,
+                                        SchedulerSubmitStatus status) {
+  int http_status = 503;
+  std::string body =
+      "Service temporarily unavailable: conversion capacity is full.\n"
+      "服务暂时不可用：转换容量已满。\n";
+  string_icase_map headers{{"Cache-Control", "private, no-store"}};
+  switch (status) {
+  case SchedulerSubmitStatus::Deadline:
+    http_status = 504;
+    body = "Gateway timeout: request deadline exceeded before conversion.\n"
+           "网关超时：请求在转换开始前已超过截止时间。\n";
+    if (request.context) {
+      request.context->requestCancellation(RequestCancellationReason::Deadline);
+      request.context->suggestFailure(RequestFailureAttribution::Client);
+    }
+    break;
+  case SchedulerSubmitStatus::Cancelled:
+    http_status = 499;
+    body = "Client closed request before conversion started.\n"
+           "客户端在转换开始前关闭了请求。\n";
+    if (request.context) {
+      request.context->requestCancellation(
+          RequestCancellationReason::ClientDisconnected);
+      request.context->suggestFailure(RequestFailureAttribution::Client);
+    }
+    break;
+  case SchedulerSubmitStatus::EntryLimit:
+  case SchedulerSubmitStatus::ByteLimit:
+    headers.emplace("Retry-After", "1");
+    if (request.context)
+      request.context->suggestFailure(RequestFailureAttribution::Capacity);
+    break;
+  case SchedulerSubmitStatus::Stopping:
+    body = "Service is shutting down.\n服务正在关闭。\n";
+    if (request.context)
+      request.context->suggestFailure(RequestFailureAttribution::Server);
+    break;
+  case SchedulerSubmitStatus::Accepted:
+    break;
+  }
+  return ConversionResult(http_status, "text/plain; charset=utf-8",
+                          std::move(headers), std::move(body));
+}
+
+SchedulerSubmitStatus ownerAdmissionSchedulerStatus(
+    OwnerAdmissionStatus status) noexcept {
+  switch (status) {
+  case OwnerAdmissionStatus::Granted:
+    return SchedulerSubmitStatus::Accepted;
+  case OwnerAdmissionStatus::EntryLimit:
+    return SchedulerSubmitStatus::EntryLimit;
+  case OwnerAdmissionStatus::ByteLimit:
+    return SchedulerSubmitStatus::ByteLimit;
+  case OwnerAdmissionStatus::Cancelled:
+    return SchedulerSubmitStatus::Cancelled;
+  case OwnerAdmissionStatus::Deadline:
+    return SchedulerSubmitStatus::Deadline;
+  case OwnerAdmissionStatus::Shutdown:
+    return SchedulerSubmitStatus::Stopping;
+  }
+  return SchedulerSubmitStatus::Stopping;
+}
+
+SchedulerSubmitStatus conversionFlowSchedulerStatus(
+    ConversionFlowTerminalState state) noexcept {
+  switch (state) {
+  case ConversionFlowTerminalState::Completed:
+    return SchedulerSubmitStatus::Accepted;
+  case ConversionFlowTerminalState::Cancelled:
+    return SchedulerSubmitStatus::Cancelled;
+  case ConversionFlowTerminalState::Deadline:
+    return SchedulerSubmitStatus::Deadline;
+  case ConversionFlowTerminalState::Shutdown:
+    return SchedulerSubmitStatus::Stopping;
+  case ConversionFlowTerminalState::Capacity:
+    return SchedulerSubmitStatus::EntryLimit;
+  case ConversionFlowTerminalState::Failed:
+    return SchedulerSubmitStatus::Accepted;
+  }
+  return SchedulerSubmitStatus::Stopping;
+}
+
+ConversionResult executorFailureResult(Request &request,
+                                       ExecutorSubmitStatus status) {
+  int http_status = 503;
+  std::string body =
+      "Service temporarily unavailable: ruleset capacity is full.\n"
+      "服务暂时不可用：规则集处理容量已满。\n";
+  string_icase_map headers{{"Cache-Control", "private, no-store"}};
+  switch (status) {
+  case ExecutorSubmitStatus::Deadline:
+    http_status = 504;
+    body = "Gateway timeout: ruleset processing exceeded the request "
+           "deadline.\n网关超时：规则集处理已超过请求截止时间。\n";
+    if (request.context) {
+      request.context->requestCancellation(RequestCancellationReason::Deadline);
+      request.context->suggestFailure(RequestFailureAttribution::Client);
+    }
+    break;
+  case ExecutorSubmitStatus::Cancelled:
+    if (request.context &&
+        request.context->cancellationToken().reason() ==
+            RequestCancellationReason::Shutdown) {
+      body = "Service is shutting down.\n服务正在关闭。\n";
+      request.context->suggestFailure(RequestFailureAttribution::Server);
+    } else {
+      http_status = 499;
+      body = "Client closed request during ruleset processing.\n"
+             "客户端在规则集处理期间关闭了请求。\n";
+      if (request.context)
+        request.context->suggestFailure(RequestFailureAttribution::Client);
+    }
+    break;
+  case ExecutorSubmitStatus::QueueFull:
+  case ExecutorSubmitStatus::Recursive:
+    headers.emplace("Retry-After", "1");
+    if (request.context)
+      request.context->suggestFailure(RequestFailureAttribution::Capacity);
+    break;
+  case ExecutorSubmitStatus::Stopping:
+    body = "Service is shutting down.\n服务正在关闭。\n";
+    if (request.context)
+      request.context->suggestFailure(RequestFailureAttribution::Server);
+    break;
+  case ExecutorSubmitStatus::Accepted:
+    break;
+  }
+  return ConversionResult(http_status, "text/plain; charset=utf-8",
+                          std::move(headers), std::move(body));
+}
+
+std::string runScheduledConversion(
+    Request &request, Response &response, const SettingsSnapshot &snapshot,
+    RuleConversionStats *stats, bool with_retry,
+    std::shared_ptr<RequestContext> admission_context) {
+  const std::shared_ptr<RequestContext> admitted_context =
+      admission_context ? std::move(admission_context) : request.context;
+  if (cooperativeCpuPermitActive()) {
+    if (admitted_context)
+      admitted_context->markWorkAdmitted();
+    ScopedSettingsView settings_scope(snapshot);
+    if (with_retry)
+      return runSubconverterImplWithRetry(request, response, *snapshot, stats);
+    return subconverter_impl(request, response, *snapshot, stats);
+  }
+  const std::string scheduler_mode =
+      toLower(getEnv("SUBCONVERTER_CONVERSION_SCHEDULER"));
+  if (scheduler_mode == "direct") {
+    if (admitted_context)
+      admitted_context->markWorkAdmitted();
+    if (with_retry)
+      return runSubconverterImplWithRetry(request, response, *snapshot, stats);
+    return subconverter_impl(request, response, *snapshot, stats);
+  }
+  if (!scheduler_mode.empty() && scheduler_mode != "bounded") {
+    static std::atomic<bool> invalid_mode_logged{false};
+    bool expected = false;
+    if (invalid_mode_logged.compare_exchange_strong(expected, true))
+      writeLog(LOG_LEVEL_ERROR,
+               "CONVERSION_SCHEDULER_INVALID value_length=" +
+                   std::to_string(scheduler_mode.size()) +
+                   " fallback=direct");
+    if (admitted_context)
+      admitted_context->markWorkAdmitted();
+    if (with_retry)
+      return runSubconverterImplWithRetry(request, response, *snapshot, stats);
+    return subconverter_impl(request, response, *snapshot, stats);
+  }
+  const RequestCostClass cost = estimateConversionCost(request);
+  if (request.context)
+    request.context->setCostClass(cost);
+  writeLog(LOG_LEVEL_DEBUG,
+           "CONVERSION_ADMISSION cost=" +
+               std::string(requestCostClassName(cost)));
+  const uint64_t bytes = request.context
+                             ? request.context->estimatedBytes()
+                             : static_cast<uint64_t>(request.postdata.size());
+  const auto deadline = request.context
+                            ? request.context->deadline()
+                            : RequestContext::Clock::time_point::max();
+  const RequestCancellationToken cancellation =
+      request.context ? request.context->cancellationToken()
+                      : RequestCancellationToken();
+  const std::shared_ptr<RequestContext> context = request.context;
+  const auto queued_at = RequestContext::Clock::now();
+  auto submission = conversionScheduler().submit(
+      cost, bytes, deadline, cancellation,
+      [&request, &response, snapshot, stats, with_retry, context,
+       queued_at]() -> std::string {
+        ScopedSettingsView settings_scope(snapshot);
+        ScopedRequestContext request_scope(context);
+        ScopedLogRequestContext log_scope(context ? context->requestId()
+                                                   : std::string());
+        if (context) {
+          context->addStageDuration(RequestStage::Queue,
+                                    RequestContext::Clock::now() - queued_at);
+          context->setCurrentStage(RequestStage::Parse);
+        }
+        if (with_retry)
+          return runSubconverterImplWithRetry(request, response, *snapshot,
+                                              stats);
+        return subconverter_impl(request, response, *snapshot, stats);
+      });
+  if (submission.status == SchedulerSubmitStatus::Accepted) {
+    if (admitted_context)
+      admitted_context->markWorkAdmitted();
+    try {
+      return submission.future.get();
+    } catch (const SchedulerSubmitError &error) {
+      ConversionResult failure =
+          schedulerFailureResult(request, error.status());
+      response.status_code = failure.statusCode();
+      response.content_type = std::move(failure).releaseContentType();
+      response.headers = std::move(failure).releaseHeaders();
+      return std::move(failure).releaseBody();
+    } catch (const ExecutorSubmitError &error) {
+      ConversionResult failure =
+          executorFailureResult(request, error.status());
+      response.status_code = failure.statusCode();
+      response.content_type = std::move(failure).releaseContentType();
+      response.headers = std::move(failure).releaseHeaders();
+      return std::move(failure).releaseBody();
+    } catch (const std::future_error &) {
+      ConversionResult failure = executorFailureResult(
+          request, ExecutorSubmitStatus::Stopping);
+      response.status_code = failure.statusCode();
+      response.content_type = std::move(failure).releaseContentType();
+      response.headers = std::move(failure).releaseHeaders();
+      return std::move(failure).releaseBody();
+    }
+  }
+  ConversionResult failure =
+      schedulerFailureResult(request, submission.status);
+  response.status_code = failure.statusCode();
+  response.content_type = std::move(failure).releaseContentType();
+  response.headers = std::move(failure).releaseHeaders();
+  return std::move(failure).releaseBody();
+}
+
+} // namespace
+
+static ConversionResult makeConversionResult(Response response,
+                                             std::string body) {
+  if (response.shared_body)
+    return ConversionResult(response.status_code,
+                            std::move(response.content_type),
+                            std::move(response.headers),
+                            std::move(response.shared_body));
+  return ConversionResult(response.status_code,
+                          std::move(response.content_type),
+                          std::move(response.headers), std::move(body));
+}
+
+ConversionResult ConversionService::convertSubscription(
+    Request &request, bool track_statistics) const {
+  if (conversion_shutdown_requested.load(std::memory_order_acquire))
+    return schedulerFailureResult(request, SchedulerSubmitStatus::Stopping);
+  Response response;
+  std::string body =
+      subconverterEntry(request, response, track_statistics);
+  return makeConversionResult(std::move(response), std::move(body));
+}
+
+const ConversionService &defaultConversionService() {
+  static const ConversionService service;
+  return service;
+}
+
+namespace {
+
+void eraseAsyncInflightSubRequest(
+    const std::shared_ptr<AsyncInflightSubRequest> &call) noexcept {
+  if (!call)
+    return;
+  std::lock_guard<std::mutex> lock(g_async_sub_inflight_mutex);
+  auto iter = g_async_sub_inflight.find(call->key);
+  if (iter != g_async_sub_inflight.end() && iter->second == call)
+    g_async_sub_inflight.erase(iter);
+}
+
+void releaseAsyncInflightOwner(
+    const std::shared_ptr<AsyncInflightSubRequest> &call) noexcept {
+  if (!call ||
+      call->active_released.exchange(true, std::memory_order_acq_rel))
+    return;
+  OwnerAdmissionLease admission;
+  {
+    std::lock_guard<std::mutex> lock(call->mutex);
+    admission = std::move(call->owner_admission);
+  }
+  admission.reset();
+  g_async_singleflight_active_owners.fetch_sub(1,
+                                                std::memory_order_relaxed);
+}
+
+void detachAsyncSubRequestConsumer(
+    const std::shared_ptr<AsyncSubRequestConsumer> &consumer,
+    bool cancelled) noexcept {
+  if (!consumer || consumer->detached.exchange(true, std::memory_order_acq_rel))
+    return;
+  const std::shared_ptr<AsyncInflightSubRequest> call = consumer->call.lock();
+  if (!call) {
+    if (consumer->waiting_counted.exchange(false,
+                                            std::memory_order_acq_rel)) {
+      g_async_singleflight_waiting_followers.fetch_sub(
+          1, std::memory_order_relaxed);
+    }
+    if (consumer->follower && cancelled)
+      g_async_singleflight_followers_cancelled.fetch_add(
+          1, std::memory_order_relaxed);
+    return;
+  }
+  bool cancel_owner = false;
+  bool counted_waiting = false;
+  uint32_t remaining = 0;
+  {
+    std::lock_guard<std::mutex> lock(call->mutex);
+    call->consumers.erase(consumer->id);
+    counted_waiting = consumer->waiting_counted.exchange(
+        false, std::memory_order_acq_rel);
+    remaining = static_cast<uint32_t>(std::min<std::size_t>(
+        call->consumers.size(), std::numeric_limits<uint32_t>::max()));
+    if (call->work_context)
+      call->work_context->setConsumerCount(remaining);
+    if (remaining == 0 && call->phase == AsyncInflightPhase::Accepting) {
+      call->phase = AsyncInflightPhase::Abandoned;
+      cancel_owner = true;
+    }
+  }
+  if (counted_waiting) {
+    g_async_singleflight_waiting_followers.fetch_sub(
+        1, std::memory_order_relaxed);
+  }
+  if (consumer->follower && cancelled)
+    g_async_singleflight_followers_cancelled.fetch_add(
+        1, std::memory_order_relaxed);
+  if (cancel_owner) {
+    g_async_singleflight_no_consumer_cancellations.fetch_add(
+        1, std::memory_order_relaxed);
+    if (call->work_context)
+      call->work_context->requestCancellation(
+          RequestCancellationReason::NoConsumers);
+    eraseAsyncInflightSubRequest(call);
+    releaseAsyncInflightOwner(call);
+  }
+}
+
+ConversionResult asyncConsumerCancellationResult(
+    const std::shared_ptr<RequestContext> &context) {
+  RequestCancellationResponse cancellation;
+  if (requestCancellationResponse(context, cancellation))
+    return ConversionResult(cancellation.status_code,
+                            "text/plain; charset=utf-8",
+                            std::move(cancellation.headers),
+                            std::move(cancellation.body));
+  Request failure_request;
+  failure_request.context = context;
+  return schedulerFailureResult(failure_request,
+                                SchedulerSubmitStatus::Cancelled);
+}
+
+ConversionResult asyncInternalServerErrorResult(
+    const std::shared_ptr<RequestContext> &context) {
+  if (context)
+    context->suggestFailure(RequestFailureAttribution::Server);
+  return ConversionResult(
+      500, "text/plain; charset=utf-8",
+      {{"Cache-Control", "private, no-store"}},
+      "Internal server error while processing request.\n"
+      "处理请求时发生内部服务器错误。\n");
+}
+
+template <class Factory>
+void invokeAsyncSubRequestCompletion(
+    ConversionService::Completion completion,
+    const std::shared_ptr<RequestContext> &context,
+    Factory &&factory) noexcept {
+  if (!completion)
+    return;
+  bool invoked = false;
+  try {
+    ConversionResult result = std::invoke(std::forward<Factory>(factory));
+    invoked = true;
+    completion(std::move(result));
+  } catch (...) {
+    if (invoked)
+      return;
+    try {
+      invoked = true;
+      completion(asyncInternalServerErrorResult(context));
+    } catch (...) {
+    }
+  }
+}
+
+void completeAsyncSubRequestCancellation(
+    const std::shared_ptr<AsyncSubRequestConsumer> &consumer) noexcept {
+  if (!consumer ||
+      consumer->completion_claimed.exchange(true, std::memory_order_acq_rel))
+    return;
+  detachAsyncSubRequestConsumer(consumer, true);
+  ConversionService::Completion completion = std::move(consumer->completion);
+  const std::shared_ptr<RequestContext> context =
+      std::exchange(consumer->context, {});
+  invokeAsyncSubRequestCompletion(
+      std::move(completion), context,
+      [&] { return asyncConsumerCancellationResult(context); });
+}
+
+void registerAsyncSubRequestCancellation(
+    const std::shared_ptr<AsyncSubRequestConsumer> &consumer) {
+  if (!consumer || !consumer->context)
+    return;
+  const std::weak_ptr<AsyncSubRequestConsumer> weak_consumer = consumer;
+  consumer->cancellation_registration =
+      consumer->context->registerCancellationCallback([weak_consumer] {
+        if (auto current = weak_consumer.lock())
+          completeAsyncSubRequestCancellation(current);
+      });
+}
+
+void completeAsyncSubRequestSuccess(
+    const std::shared_ptr<AsyncSubRequestConsumer> &consumer,
+    const SharedCoalescedResponse &result) noexcept {
+  if (!consumer || !result ||
+      consumer->completion_claimed.exchange(true, std::memory_order_acq_rel))
+    return;
+  const std::shared_ptr<AsyncInflightSubRequest> call = consumer->call.lock();
+  const std::shared_ptr<RequestContext> context =
+      std::exchange(consumer->context, {});
+  RequestCancellationResponse cancellation;
+  const bool cancelled = requestCancellationResponse(context, cancellation);
+  detachAsyncSubRequestConsumer(consumer, cancelled);
+  ConversionService::Completion completion = std::move(consumer->completion);
+  invokeAsyncSubRequestCompletion(
+      std::move(completion), context, [&]() -> ConversionResult {
+        if (cancelled)
+          return ConversionResult(cancellation.status_code,
+                                  "text/plain; charset=utf-8",
+                                  std::move(cancellation.headers),
+                                  std::move(cancellation.body));
+        if (context && call && call->work_context)
+          context->setCostClass(call->work_context->costClass());
+        Response response;
+        std::string body =
+            applyCoalescedToResponse(*result, context, response);
+        if (response.status_code >= 200 && response.status_code < 300)
+          statistics::recordSubscriptionConversion(
+              consumer->statistics_metadata, result->rule_conversions);
+        return makeConversionResult(std::move(response), std::move(body));
+      });
+}
+
+void completeAsyncSubRequestFailure(
+    const std::shared_ptr<AsyncSubRequestConsumer> &consumer,
+    SchedulerSubmitStatus status, const std::exception_ptr &error) noexcept {
+  if (!consumer ||
+      consumer->completion_claimed.exchange(true, std::memory_order_acq_rel))
+    return;
+  const std::shared_ptr<RequestContext> context =
+      std::exchange(consumer->context, {});
+  RequestCancellationResponse cancellation;
+  const bool cancelled = requestCancellationResponse(context, cancellation);
+  detachAsyncSubRequestConsumer(consumer, cancelled);
+  ConversionService::Completion completion = std::move(consumer->completion);
+  invokeAsyncSubRequestCompletion(
+      std::move(completion), context, [&]() -> ConversionResult {
+        if (cancelled)
+          return ConversionResult(cancellation.status_code,
+                                  "text/plain; charset=utf-8",
+                                  std::move(cancellation.headers),
+                                  std::move(cancellation.body));
+        Request failure_request;
+        failure_request.context = context;
+        if (status != SchedulerSubmitStatus::Accepted)
+          return schedulerFailureResult(failure_request, status);
+        if (error) {
+          try {
+            std::rethrow_exception(error);
+          } catch (const SchedulerSubmitError &submit_error) {
+            return schedulerFailureResult(failure_request,
+                                          submit_error.status());
+          } catch (...) {
+          }
+        }
+        return asyncInternalServerErrorResult(context);
+      });
+}
+
+std::shared_ptr<AsyncSubRequestConsumer> makeAsyncSubRequestConsumer(
+    const std::shared_ptr<RequestContext> &context, bool follower,
+    statistics::SubscriptionConversionMetadata statistics_metadata,
+    ConversionService::Completion completion) {
+  auto consumer = std::make_shared<AsyncSubRequestConsumer>();
+  consumer->follower = follower;
+  consumer->context = context;
+  consumer->statistics_metadata = statistics_metadata;
+  consumer->completion = std::move(completion);
+  return consumer;
+}
+
+void publishAsyncSubRequestSuccess(
+    const std::shared_ptr<AsyncInflightSubRequest> &call,
+    const std::shared_ptr<const PreparedSubRequest> &prepared,
+    SharedCoalescedResponse result) noexcept {
+  if (!call || !prepared || !result)
+    return;
+  bool publish_cache = false;
+  {
+    std::lock_guard<std::mutex> lock(call->mutex);
+    if (call->phase == AsyncInflightPhase::Abandoned ||
+        call->consumers.empty()) {
+      call->phase = AsyncInflightPhase::Abandoned;
+    } else {
+      call->phase = AsyncInflightPhase::Publishing;
+      call->result = result;
+      publish_cache = !prepared->age.requested &&
+                      !prepared->explain_request;
+    }
+  }
+  if (publish_cache) {
+    try {
+      storeCachedSubResponse(call->key, result, *prepared->settings);
+    } catch (...) {
+    }
+  }
+
+  std::unordered_map<uint64_t, std::shared_ptr<AsyncSubRequestConsumer>>
+      consumers;
+  {
+    std::lock_guard<std::mutex> lock(call->mutex);
+    if (call->phase != AsyncInflightPhase::Abandoned)
+      call->phase = AsyncInflightPhase::Done;
+    consumers.swap(call->consumers);
+  }
+  if (call->work_context)
+    call->work_context->setConsumerCount(0);
+  eraseAsyncInflightSubRequest(call);
+  releaseAsyncInflightOwner(call);
+  for (auto &[_, consumer] : consumers)
+    completeAsyncSubRequestSuccess(consumer, result);
+}
+
+void publishAsyncSubRequestFailure(
+    const std::shared_ptr<AsyncInflightSubRequest> &call,
+    SchedulerSubmitStatus status, std::exception_ptr error) noexcept {
+  if (!call)
+    return;
+  if (status != SchedulerSubmitStatus::Accepted &&
+      status != SchedulerSubmitStatus::Cancelled)
+    g_async_singleflight_owner_flow_rejections.fetch_add(
+        1, std::memory_order_relaxed);
+  std::unordered_map<uint64_t, std::shared_ptr<AsyncSubRequestConsumer>>
+      consumers;
+  {
+    std::lock_guard<std::mutex> lock(call->mutex);
+    if (call->phase != AsyncInflightPhase::Abandoned)
+      call->phase = AsyncInflightPhase::Done;
+    consumers.swap(call->consumers);
+  }
+  if (call->work_context)
+    call->work_context->setConsumerCount(0);
+  eraseAsyncInflightSubRequest(call);
+  releaseAsyncInflightOwner(call);
+  for (auto &[_, consumer] : consumers)
+    completeAsyncSubRequestFailure(consumer, status, error);
+}
+
+ConversionResult executePreparedStandalone(Request &request,
+                                           const PreparedSubRequest &prepared,
+                                           bool track_statistics) {
+  ScopedSettingsView settings_scope(prepared.settings);
+  Response response;
+  RuleConversionStats stats;
+  std::string body = runScheduledConversion(
+      request, response, prepared.settings,
+      track_statistics ? &stats : nullptr, false);
+  body = finalizeSubResponse(request, response, std::move(body), prepared.age);
+  recordTrackedSubRequest(track_statistics, request, response, stats.rules);
+  return makeConversionResult(std::move(response), std::move(body));
+}
+
+} // namespace
+
+void ConversionService::convertSubscriptionAsync(Request request,
+                                                  bool track_statistics,
+                                                  Completion completion) const {
+  if (!completion)
+    return;
+  if (conversion_shutdown_requested.load(std::memory_order_acquire)) {
+    Request failure_request;
+    failure_request.context = request.context;
+    completion(schedulerFailureResult(failure_request,
+                                      SchedulerSubmitStatus::Stopping));
+    return;
+  }
+  RequestCancellationResponse cancellation_response;
+  if (requestCancellationResponse(request.context, cancellation_response)) {
+    completion(ConversionResult(cancellation_response.status_code,
+                                "text/plain; charset=utf-8",
+                                std::move(cancellation_response.headers),
+                                std::move(cancellation_response.body)));
+    return;
+  }
+  const RequestCostClass cost = estimateConversionCost(request);
+  if (request.context)
+    request.context->setCostClass(cost);
+  writeLog(LOG_LEVEL_DEBUG,
+           "CONVERSION_ADMISSION cost=" +
+               std::string(requestCostClassName(cost)));
+  const uint64_t bytes = request.context
+                             ? request.context->estimatedBytes()
+                             : static_cast<uint64_t>(request.postdata.size());
+  const std::shared_ptr<RequestContext> context = request.context;
+  Response prepared_response;
+  std::string early_body;
+  PreparedSubRequest prepared =
+      prepareSubRequest(request, prepared_response, early_body);
+  if (prepared.early_complete) {
+    completion(makeConversionResult(std::move(prepared_response),
+                                    std::move(early_body)));
+    return;
+  }
+  uint64_t owner_working_bytes = bytes;
+  const uint64_t owner_wait_bytes = forceMaxOwnerWaitReservation(bytes);
+  if (prepared.settings &&
+      prepared.settings->resourceControlEffective == "force_max") {
+    const ResourceControlSnapshot resources = resourceControlSnapshot();
+    const uint64_t maximum_download =
+        prepared.settings->maxAllowedDownloadSize > 0
+            ? static_cast<uint64_t>(
+                  prepared.settings->maxAllowedDownloadSize)
+            : 0;
+    owner_working_bytes = forceMaxOwnerWorkingReservation(
+        resources.calculated_force_max_budget, bytes, maximum_download);
+  }
+  statistics::SubscriptionConversionMetadata statistics_metadata;
+  if (track_statistics) {
+    ScopedSettingsView settings_scope(prepared.settings);
+    statistics_metadata =
+        statistics::prepareSubscriptionConversionMetadata(request);
+  }
+  if (prepared.coalesce) {
+    SharedCoalescedResponse cached_result;
+    if (!prepared.explain_request &&
+        getCachedSubResponse(prepared.key, cached_result,
+                             *prepared.settings)) {
+      writeLog(LOG_LEVEL_DEBUG, "/sub 响应微缓存命中。");
+      if (context)
+        context->setCostClass(RequestCostClass::Low);
+      if (context)
+        context->markWorkAdmitted();
+      Response response;
+      std::string body =
+          applyCoalescedToResponse(*cached_result, context, response);
+      if (response.status_code >= 200 && response.status_code < 300)
+        statistics::recordSubscriptionConversion(
+            statistics_metadata, cached_result->rule_conversions);
+      completion(makeConversionResult(std::move(response), std::move(body)));
+      return;
+    }
+
+    for (;;) {
+      std::shared_ptr<AsyncInflightSubRequest> call;
+      std::shared_ptr<AsyncSubRequestConsumer> owner_consumer;
+      bool owner = false;
+      {
+        std::lock_guard<std::mutex> lock(g_async_sub_inflight_mutex);
+        auto iter = g_async_sub_inflight.find(prepared.key);
+        if (iter != g_async_sub_inflight.end()) {
+          call = iter->second;
+        } else {
+          call = std::make_shared<AsyncInflightSubRequest>();
+          call->key = prepared.key;
+          call->owner_request_id = currentLogRequestId();
+          const auto work_started = RequestContext::Clock::now();
+          const auto configured_deadline =
+              work_started + std::chrono::milliseconds(std::max(
+                                 1, prepared.settings->requestDeadlineMs));
+          const auto absolute_deadline =
+              context && context->deadline() !=
+                             RequestContext::Clock::time_point::max()
+                  ? std::min(configured_deadline, context->deadline())
+                  : configured_deadline;
+          call->work_context = std::make_shared<RequestContext>(
+              call->owner_request_id, work_started, absolute_deadline,
+              RequestContextKind::InternalWork);
+          call->work_context->setCostClass(cost);
+          call->work_context->setEstimatedBytes(bytes);
+          owner_consumer = makeAsyncSubRequestConsumer(
+              context, false, statistics_metadata, std::move(completion));
+          owner_consumer->id = call->next_consumer_id++;
+          owner_consumer->call = call;
+          call->consumers.emplace(owner_consumer->id, owner_consumer);
+          call->work_context->setConsumerCount(1);
+          g_async_sub_inflight.emplace(call->key, call);
+          g_async_singleflight_active_owners.fetch_add(
+              1, std::memory_order_relaxed);
+          g_async_singleflight_owners_created.fetch_add(
+              1, std::memory_order_relaxed);
+          owner = true;
+        }
+      }
+
+      if (!owner) {
+        SharedCoalescedResponse ready_result;
+        auto consumer = makeAsyncSubRequestConsumer(
+            context, true, statistics_metadata, std::move(completion));
+        bool prepare_attach = false;
+        bool attached = false;
+        bool cancelled_before_attach = false;
+        bool retry = false;
+        {
+          std::lock_guard<std::mutex> lock(call->mutex);
+          if (call->phase == AsyncInflightPhase::Accepting) {
+            consumer->id = call->next_consumer_id++;
+            consumer->call = call;
+            prepare_attach = true;
+          } else if ((call->phase == AsyncInflightPhase::Publishing ||
+                      call->phase == AsyncInflightPhase::Done) &&
+                     call->result) {
+            consumer->call = call;
+            ready_result = call->result;
+          } else {
+            retry = true;
+          }
+        }
+        if (prepare_attach) {
+          registerAsyncSubRequestCancellation(consumer);
+          if (consumer->completion_claimed.load(std::memory_order_acquire))
+            return;
+          {
+            std::lock_guard<std::mutex> lock(call->mutex);
+            if (call->phase == AsyncInflightPhase::Accepting &&
+                !consumer->completion_claimed.load(
+                    std::memory_order_acquire)) {
+              call->consumers.emplace(consumer->id, consumer);
+              consumer->waiting_counted.store(true,
+                                               std::memory_order_release);
+              g_async_singleflight_waiting_followers.fetch_add(
+                  1, std::memory_order_relaxed);
+              if (call->work_context)
+                call->work_context->setConsumerCount(
+                    static_cast<uint32_t>(std::min<std::size_t>(
+                        call->consumers.size(),
+                        std::numeric_limits<uint32_t>::max())));
+              attached = true;
+            } else if (call->phase == AsyncInflightPhase::Accepting &&
+                       consumer->completion_claimed.load(
+                           std::memory_order_acquire)) {
+              cancelled_before_attach = true;
+            } else if ((call->phase == AsyncInflightPhase::Publishing ||
+                        call->phase == AsyncInflightPhase::Done) &&
+                       call->result) {
+              ready_result = call->result;
+            } else {
+              retry = true;
+            }
+          }
+        }
+        if (cancelled_before_attach)
+          return;
+        if (retry) {
+          eraseAsyncInflightSubRequest(call);
+          if (consumer->completion_claimed.exchange(
+                  true, std::memory_order_acq_rel))
+            return;
+          completion = std::move(consumer->completion);
+          continue;
+        }
+        if (context)
+          context->markWorkAdmitted();
+        if (context)
+          context->setSingleflightRole(RequestSingleflightRole::Follower);
+        g_async_singleflight_followers_attached.fetch_add(
+            1, std::memory_order_relaxed);
+        if (attached) {
+          writeLog(LOG_LEVEL_INFO,
+                   "SUB_REQUEST_COALESCED owner_request_id=" +
+                       (call->owner_request_id.empty()
+                            ? "unavailable"
+                            : call->owner_request_id));
+        } else {
+          completeAsyncSubRequestSuccess(consumer, ready_result);
+        }
+        return;
+      }
+
+      if (context) {
+        context->setSingleflightRole(RequestSingleflightRole::Owner);
+        context->setConsumerCount(1);
+      }
+      try {
+        registerAsyncSubRequestCancellation(owner_consumer);
+        auto prepared_owner =
+            std::make_shared<const PreparedSubRequest>(std::move(prepared));
+        Request work_request = std::move(request);
+        work_request.context = call->work_context;
+        auto start_owner =
+            [cost, bytes, context, call, prepared_owner,
+             work_request = std::move(work_request), track_statistics](
+                OwnerAdmissionLease admission,
+                bool governed) mutable {
+              if (governed) {
+                bool attached = false;
+                {
+                  std::lock_guard<std::mutex> lock(call->mutex);
+                  if (!call->active_released.load(
+                          std::memory_order_acquire) &&
+                      call->phase == AsyncInflightPhase::Accepting) {
+                    call->owner_admission = std::move(admission);
+                    attached = true;
+                  }
+                }
+                if (!attached)
+                  return;
+                if (context)
+                  context->markWorkAdmitted();
+              }
+              if (forceMaxFlowEligible(work_request,
+                                       *prepared_owner)) {
+                const bool flow_started = startForceMaxFlow(
+                    std::move(work_request), prepared_owner,
+                    track_statistics, false,
+                    [call, prepared_owner](
+                        ForceMaxFlowOutput output,
+                        ConversionFlowTerminal terminal) mutable {
+                      if (terminal.state ==
+                          ConversionFlowTerminalState::Completed) {
+                        SharedCoalescedResponse result =
+                            makeCoalescedResult(
+                                std::move(output.body),
+                                std::move(output.response),
+                                output.rule_conversions,
+                                output.capacity_rejected);
+                        publishAsyncSubRequestSuccess(
+                            call, prepared_owner, std::move(result));
+                        return;
+                      }
+                      publishAsyncSubRequestFailure(
+                          call,
+                          conversionFlowSchedulerStatus(terminal.state),
+                          std::move(terminal.error));
+                    });
+                if (!flow_started)
+                  publishAsyncSubRequestFailure(
+                      call, SchedulerSubmitStatus::EntryLimit, {});
+                return;
+              }
+              const auto work_deadline = call->work_context->deadline();
+              const RequestCancellationToken work_cancellation =
+                  call->work_context->cancellationToken();
+              const auto queued_at = RequestContext::Clock::now();
+              const SchedulerSubmitStatus owner_submit_status =
+                  requestFlowFallbackScheduler(*prepared_owner).submitAsync(
+                  cost, bytes, work_deadline, work_cancellation,
+                  [work_request = std::move(work_request), prepared_owner,
+                   call, track_statistics, work_deadline,
+                   work_cancellation, queued_at]() mutable {
+                    ScopedRequestContext request_scope(call->work_context);
+                    ScopedLogRequestContext log_scope(
+                        call->owner_request_id);
+                    if (call->work_context) {
+                      call->work_context->addStageDuration(
+                          RequestStage::Queue,
+                          RequestContext::Clock::now() - queued_at);
+                      call->work_context->setCurrentStage(
+                          RequestStage::Parse);
+                    }
+                    CpuPermitLease permit(conversionCpuGate(),
+                                          work_deadline,
+                                          work_cancellation);
+                    const SchedulerSubmitStatus permit_status =
+                        permit.acquire();
+                    if (permit_status != SchedulerSubmitStatus::Accepted)
+                      throw SchedulerSubmitError(permit_status);
+                    ScopedCpuPermit permit_scope(permit);
+                    RuleConversionStats stats;
+                    return executePreparedSubRequestOwner(
+                        work_request, *prepared_owner,
+                        track_statistics ? &stats : nullptr);
+                  },
+                  [call, prepared_owner](
+                      SchedulerAsyncResult<SharedCoalescedResponse>
+                          result) mutable {
+                    if (result.status ==
+                            SchedulerSubmitStatus::Accepted &&
+                        !result.error && result.value && *result.value) {
+                      publishAsyncSubRequestSuccess(
+                          call, prepared_owner,
+                          std::move(*result.value));
+                      return;
+                    }
+                    publishAsyncSubRequestFailure(
+                        call, result.status, std::move(result.error));
+                  });
+              if (!governed &&
+                  owner_submit_status ==
+                      SchedulerSubmitStatus::Accepted &&
+                  context)
+                context->markWorkAdmitted();
+            };
+        if (OwnerAdmission *admission = globalOwnerAdmission()) {
+          OwnerAdmissionOptions options{
+              .cost = cost,
+              .bytes = owner_working_bytes,
+              .wait_bytes = owner_wait_bytes,
+              .request_context = call->work_context};
+          if (auto immediate = admission->tryAdmitImmediate(options)) {
+            start_owner(std::move(immediate->lease), true);
+          } else {
+            (void)admission->admit(
+                std::move(options),
+                [call, start_owner = std::move(start_owner)](
+                    OwnerAdmissionResult result) mutable {
+                  if (result.status != OwnerAdmissionStatus::Granted) {
+                    publishAsyncSubRequestFailure(
+                        call,
+                        ownerAdmissionSchedulerStatus(result.status),
+                        {});
+                    return;
+                  }
+                  start_owner(std::move(result.lease), true);
+                });
+          }
+        } else {
+          start_owner({}, false);
+        }
+      } catch (...) {
+        g_async_singleflight_owner_flow_rejections.fetch_add(
+            1, std::memory_order_relaxed);
+        publishAsyncSubRequestFailure(
+            call, SchedulerSubmitStatus::Accepted,
+            std::current_exception());
+      }
+      return;
+    }
+  }
+
+  const auto deadline = context ? context->deadline()
+                                : RequestContext::Clock::time_point::max();
+  const RequestCancellationToken cancellation =
+      context ? context->cancellationToken() : RequestCancellationToken();
+  auto prepared_standalone =
+      std::make_shared<const PreparedSubRequest>(std::move(prepared));
+  auto start_standalone =
+      [cost, bytes, context, request = std::move(request),
+       prepared_standalone, track_statistics, deadline, cancellation,
+       completion = std::move(completion)](
+          OwnerAdmissionResult admission_result,
+          bool governed) mutable {
+        if (governed &&
+            admission_result.status != OwnerAdmissionStatus::Granted) {
+          Request failure_request;
+          failure_request.context = context;
+          completion(schedulerFailureResult(
+              failure_request,
+              ownerAdmissionSchedulerStatus(admission_result.status)));
+          return;
+        }
+        if (governed && context)
+          context->markWorkAdmitted();
+        if (forceMaxFlowEligible(request,
+                                 *prepared_standalone)) {
+          auto flow_admission =
+              std::make_shared<OwnerAdmissionLease>(
+                  std::move(admission_result.lease));
+          const bool flow_started = startForceMaxFlow(
+              std::move(request), prepared_standalone,
+              track_statistics, true,
+              [context, completion, flow_admission](
+                  ForceMaxFlowOutput output,
+                  ConversionFlowTerminal terminal) mutable {
+                (void)flow_admission;
+                if (terminal.state ==
+                    ConversionFlowTerminalState::Completed) {
+                  if (output.capacity_rejected && context)
+                    context->setFinalFailureAttribution(
+                        RequestFailureAttribution::Capacity);
+                  completion(makeConversionResult(
+                      std::move(output.response),
+                      std::move(output.body)));
+                  return;
+                }
+                Request failure_request;
+                failure_request.context = context;
+                completion(schedulerFailureResult(
+                    failure_request,
+                    conversionFlowSchedulerStatus(terminal.state)));
+              });
+          if (!flow_started) {
+            Request failure_request;
+            failure_request.context = context;
+            completion(schedulerFailureResult(
+                failure_request, SchedulerSubmitStatus::EntryLimit));
+          }
+          return;
+        }
+        const auto queued_at = RequestContext::Clock::now();
+        const SchedulerSubmitStatus standalone_submit_status =
+            requestFlowFallbackScheduler(*prepared_standalone).submitAsync(
+            cost, bytes, deadline, cancellation,
+            [request = std::move(request), prepared_standalone,
+             track_statistics, deadline, cancellation,
+             queued_at]() mutable {
+              ScopedRequestContext request_scope(request.context);
+              ScopedLogRequestContext log_scope(
+                  request.context ? request.context->requestId()
+                                  : std::string());
+              if (request.context) {
+                request.context->addStageDuration(
+                    RequestStage::Queue,
+                    RequestContext::Clock::now() - queued_at);
+                request.context->setCurrentStage(RequestStage::Parse);
+              }
+              CpuPermitLease permit(conversionCpuGate(), deadline,
+                                    cancellation);
+              const SchedulerSubmitStatus permit_status = permit.acquire();
+              if (permit_status != SchedulerSubmitStatus::Accepted)
+                throw SchedulerSubmitError(permit_status);
+              ScopedCpuPermit permit_scope(permit);
+              return executePreparedStandalone(
+                  request, *prepared_standalone, track_statistics);
+            },
+            [context, completion = std::move(completion),
+             admission = std::move(admission_result.lease)](
+                SchedulerAsyncResult<ConversionResult> result) mutable {
+              (void)admission;
+              if (result.status == SchedulerSubmitStatus::Accepted &&
+                  !result.error && result.value) {
+                completion(std::move(*result.value));
+                return;
+              }
+              Request failure_request;
+              failure_request.context = context;
+              if (result.status != SchedulerSubmitStatus::Accepted) {
+                completion(
+                    schedulerFailureResult(failure_request, result.status));
+                return;
+              }
+              if (result.error) {
+                try {
+                  std::rethrow_exception(result.error);
+                } catch (const SchedulerSubmitError &error) {
+                  completion(schedulerFailureResult(failure_request,
+                                                    error.status()));
+                  return;
+                } catch (...) {
+                }
+              }
+              if (context)
+                context->suggestFailure(RequestFailureAttribution::Server);
+              writeLog(LOG_LEVEL_ERROR,
+                       "ASYNC_REQUEST_FLOW_FAILED "
+                       "reason=unexpected_exception");
+              completion(ConversionResult(
+                  500, "text/plain; charset=utf-8",
+                  {{"Cache-Control", "private, no-store"}},
+                  "Internal server error while processing request.\n"
+                  "处理请求时发生内部服务器错误。\n"));
+            });
+        if (!governed &&
+            standalone_submit_status == SchedulerSubmitStatus::Accepted &&
+            context)
+          context->markWorkAdmitted();
+      };
+  if (OwnerAdmission *admission = globalOwnerAdmission()) {
+    OwnerAdmissionOptions options{.cost = cost,
+                                  .bytes = owner_working_bytes,
+                                  .wait_bytes = owner_wait_bytes,
+                                  .deadline = deadline,
+                                  .request_context = context};
+    if (auto immediate = admission->tryAdmitImmediate(options)) {
+      start_standalone(std::move(*immediate), true);
+    } else {
+      (void)admission->admit(
+          std::move(options),
+          [start_standalone = std::move(start_standalone)](
+              OwnerAdmissionResult result) mutable {
+            start_standalone(std::move(result), true);
+          });
+    }
+  } else {
+    OwnerAdmissionResult result;
+    result.status = OwnerAdmissionStatus::Granted;
+    start_standalone(std::move(result), false);
+  }
+}
+
+WorkloadSchedulerSnapshot conversionSchedulerSnapshot() {
+  if (WorkloadScheduler *scheduler =
+          conversion_scheduler_instance.load(std::memory_order_acquire))
+    return scheduler->snapshot();
+  return {};
+}
+
+WorkloadSchedulerSnapshot legacyRequestFlowSnapshot() {
+  if (WorkloadScheduler *scheduler =
+          compatibility_request_flow_instance.load(std::memory_order_acquire))
+    return scheduler->snapshot();
+  return {};
+}
+
+SubscriptionOwnerAdmissionSnapshot subscriptionOwnerAdmissionSnapshot() {
+  const OwnerAdmissionSnapshot owner =
+      globalOwnerAdmissionSnapshot();
+  if (owner.ready) {
+    SubscriptionOwnerAdmissionSnapshot result;
+    result.source = "force_max_waitable";
+    result.waiting_entries = owner.waiting_entries;
+    result.waiting_bytes = owner.waiting_bytes;
+    result.active = owner.active_entries;
+    result.active_bytes = owner.active_bytes;
+    result.accepted_total = owner.accepted_total;
+    result.rejected_total = owner.rejected_total;
+    result.cancelled_total = owner.cancelled_total;
+    result.deadline_total = owner.deadline_total;
+    result.shutdown_total = owner.shutdown_total;
+    result.max_active_entries = owner.max_active_entries;
+    result.max_active_bytes = owner.max_active_bytes;
+    result.max_wait_entries = owner.max_wait_entries;
+    result.max_wait_bytes = owner.max_wait_bytes;
+    result.oldest_wait_ms = owner.oldest_wait_ms;
+    return result;
+  }
+  auto make_snapshot = [](const char *source, WorkloadScheduler *scheduler) {
+    SubscriptionOwnerAdmissionSnapshot result;
+    result.source = source;
+    const WorkloadSchedulerSnapshot snapshot = scheduler->snapshot();
+    result.waiting_entries = snapshot.queued_entries;
+    result.waiting_bytes = snapshot.queued_bytes;
+    result.active = snapshot.active;
+    result.accepted_total = snapshot.accepted;
+    result.rejected_total = snapshot.rejected;
+    result.cancelled_total = snapshot.cancelled;
+    result.max_wait_entries = scheduler->maxEntries();
+    result.max_wait_bytes = scheduler->maxBytes();
+    result.oldest_wait_ms = snapshot.oldest_queued_age_ms;
+    return result;
+  };
+  if (WorkloadScheduler *scheduler =
+          compatibility_request_flow_instance.load(std::memory_order_acquire))
+    return make_snapshot("legacy_request_flow", scheduler);
+  if (WorkloadScheduler *scheduler =
+          conversion_scheduler_instance.load(std::memory_order_acquire))
+    return make_snapshot("conversion_scheduler", scheduler);
+  return {};
+}
+
+CpuPermitSnapshot conversionCpuPermitSnapshot() {
+  if (CpuPermitGate *gate =
+          conversion_cpu_gate_instance.load(std::memory_order_acquire))
+    return gate->snapshot();
+  return {std::max<uint64_t>(
+              1, desired_cpu_permits.load(std::memory_order_acquire)),
+          0, 0};
+}
+
+void setConversionCpuPermitLimit(uint64_t limit) noexcept {
+  const uint64_t normalized = std::max<uint64_t>(1, limit);
+  desired_cpu_permits.store(normalized, std::memory_order_release);
+  if (CpuPermitGate *gate =
+          conversion_cpu_gate_instance.load(std::memory_order_acquire))
+    gate->setLimit(static_cast<std::size_t>(std::min<uint64_t>(
+        normalized, std::numeric_limits<std::size_t>::max())));
+}
+
+ResponseMicroCacheSnapshot responseMicroCacheSnapshot() {
+  std::lock_guard<std::mutex> lock(g_sub_response_cache_mutex);
+  pruneExpiredSubResponseCache(std::chrono::steady_clock::now());
+  return {static_cast<uint64_t>(g_sub_response_cache.size()),
+          g_sub_response_cache_bytes, subResponseCacheMaxBytes()};
+}
+
+void shutdownConversionScheduler() noexcept {
+  requestConversionSchedulerShutdown();
+  if (WorkloadScheduler *scheduler =
+          conversion_scheduler_instance.load(std::memory_order_acquire))
+    scheduler->shutdown(true);
+  if (WorkloadScheduler *scheduler =
+          compatibility_request_flow_instance.load(std::memory_order_acquire))
+    scheduler->shutdown(true);
+}
+
+void requestConversionSchedulerShutdown() noexcept {
+  conversion_shutdown_requested.store(true, std::memory_order_release);
+  if (WorkloadScheduler *scheduler =
+          conversion_scheduler_instance.load(std::memory_order_acquire))
+    scheduler->requestShutdown(true);
+  if (WorkloadScheduler *scheduler =
+          compatibility_request_flow_instance.load(std::memory_order_acquire))
+    scheduler->requestShutdown(true);
+  if (CpuPermitGate *gate =
+          conversion_cpu_gate_instance.load(std::memory_order_acquire))
+    gate->requestShutdown();
+}
+
+static std::string applyConversionResult(ConversionResult result,
+                                         Response &response) {
+  response.status_code = result.statusCode();
+  response.content_type = std::move(result).releaseContentType();
+  response.headers = std::move(result).releaseHeaders();
+  response.shared_body = std::move(result).releaseSharedBody();
+  return std::move(result).releaseBody();
+}
+
 std::string subconverter(RESPONSE_CALLBACK_ARGS) {
-  return subconverterEntry(request, response, false);
+  return applyConversionResult(
+      defaultConversionService().convertSubscription(request, false), response);
 }
 
 std::string subconverterTracked(RESPONSE_CALLBACK_ARGS) {
-  return subconverterEntry(request, response, true);
+  return applyConversionResult(
+      defaultConversionService().convertSubscription(request, true), response);
 }
 
-static std::string subconverter_impl(Request &request, Response &response,
-                                     RuleConversionStats *rule_stats) {
+SubscriptionSingleflightSnapshot subscriptionSingleflightSnapshot() noexcept {
+  return {
+      g_async_singleflight_active_owners.load(std::memory_order_relaxed),
+      g_async_singleflight_waiting_followers.load(std::memory_order_relaxed),
+      g_async_singleflight_owners_created.load(std::memory_order_relaxed),
+      g_async_singleflight_followers_attached.load(std::memory_order_relaxed),
+      g_async_singleflight_followers_cancelled.load(std::memory_order_relaxed),
+      g_async_singleflight_no_consumer_cancellations.load(
+          std::memory_order_relaxed),
+      g_async_singleflight_owner_flow_rejections.load(
+          std::memory_order_relaxed),
+  };
+}
+
+static void applyAsyncConversionResult(
+    ConversionResult result, async_response_completion completion) {
+  Response response;
+  response.status_code = result.statusCode();
+  response.content_type = std::move(result).releaseContentType();
+  response.headers = std::move(result).releaseHeaders();
+  response.shared_body = std::move(result).releaseSharedBody();
+  std::string body = std::move(result).releaseBody();
+  completion(std::move(response), std::move(body));
+}
+
+void subconverterAsync(Request request, async_response_completion completion) {
+  defaultConversionService().convertSubscriptionAsync(
+      std::move(request), false,
+      [completion = std::move(completion)](ConversionResult result) mutable {
+        applyAsyncConversionResult(std::move(result), std::move(completion));
+      });
+}
+
+void subconverterTrackedAsync(Request request,
+                              async_response_completion completion) {
+  defaultConversionService().convertSubscriptionAsync(
+      std::move(request), true,
+      [completion = std::move(completion)](ConversionResult result) mutable {
+        applyAsyncConversionResult(std::move(result), std::move(completion));
+      });
+}
+
+namespace {
+
+struct ParsedSubRequest {
+  std::string target;
+  std::string surge_version_text;
+  bool target_was_auto = false;
+  UserAgentMatch user_agent_match;
+  bool explain_mode = false;
+  SubExplainReport explain;
+  tribool clash_new_field;
+  int surge_version = 3;
+  const TargetDescriptor *target_descriptor = nullptr;
+  bool simple_subscription = false;
+
+  std::string url;
+  std::string group_name;
+  std::string upload_path;
+  std::string include_remark;
+  std::string exclude_remark;
+  std::string external_config;
+  std::string device_id;
+  std::string filename;
+  std::string update_interval;
+  std::string update_strict;
+  std::string renames;
+  std::string provider_headers;
+
+  tribool upload;
+  tribool emoji;
+  tribool add_emoji;
+  tribool remove_emoji;
+  tribool append_type;
+  tribool tfo;
+  tribool udp;
+  tribool generate_node_list;
+  tribool sort;
+  tribool use_sort_script;
+  tribool generate_clash_script;
+  tribool enable_insert;
+  tribool skip_cert_verify;
+  tribool filter_deprecated;
+  tribool expand_rulesets;
+  tribool append_userinfo;
+  tribool prepend_insert;
+  tribool generate_classical_rule_provider;
+  tribool tls13;
+  tribool provider_proxy_direct;
+};
+
+static std::string parseSubRequestArguments(Request &request,
+                                            Response &response,
+                                            const Settings &settings,
+                                            ParsedSubRequest &parsed) {
   auto &argument = request.argument;
   parsed.target = getUrlArg(argument, "target");
   parsed.surge_version_text = getUrlArg(argument, "ver");
@@ -1752,33 +3767,16 @@ static std::string subconverter_impl(Request &request, Response &response,
                   " url_length=" + std::to_string(rawUrlForLog.size()));
   }
 
-  std::string argTarget = getUrlArg(argument, "target"),
-              argSurgeVer = getUrlArg(argument, "ver");
-  bool explainMode = isTruthyRequestValue(getUrlArg(argument, "explain"));
-  SubExplainReport explain;
-  explain.enabled = explainMode;
-  explain.proxy_config = parseProxy(global.proxyConfig).describe();
-  explain.proxy_ruleset = parseProxy(global.proxyRuleset).describe();
-  explain.proxy_subscription = parseProxy(global.proxySubscription).describe();
-  explain.requested_target = argTarget;
-  if (explainMode) {
-    std::string rawUrlForLog = getUrlArg(argument, "url");
-    writeLog(0,
-             "收到 /sub explain JSON 诊断请求：target=" +
-                 (argTarget.empty() ? std::string("<empty>") : argTarget) +
-                 ", 参数数量=" + std::to_string(argument.size()) +
-                 ", url_hash=" +
-                 (rawUrlForLog.empty() ? std::string("-")
-                                       : shortHash(urlDecode(rawUrlForLog))) +
-                 "。",
-             LOG_LEVEL_INFO);
-  }
-  tribool argClashNewField = getUrlArg(argument, "new_name");
-  int intSurgeVer = !argSurgeVer.empty() ? to_int(argSurgeVer, 3) : 3;
-  if (argTarget == "auto")
-    matchUserAgent(request.headers["User-Agent"], argTarget, argClashNewField,
-                   intSurgeVer);
-  explain.target = argTarget;
+  parsed.clash_new_field = getUrlArg(argument, "new_name");
+  parsed.surge_version = !parsed.surge_version_text.empty()
+                             ? to_int(parsed.surge_version_text, 3)
+                             : 3;
+  parsed.target_was_auto = parsed.target == "auto";
+  if (parsed.target_was_auto)
+    parsed.user_agent_match =
+        matchUserAgent(request.headers["User-Agent"], parsed.target,
+                       parsed.clash_new_field, parsed.surge_version);
+  parsed.explain.target = parsed.target;
 
   parsed.target_descriptor = findTargetDescriptor(parsed.target);
   if (!parsed.target_descriptor) {
@@ -1803,69 +3801,122 @@ static std::string subconverter_impl(Request &request, Response &response,
                  " ua_family=" + parsed.user_agent_match.family);
   }
 
-  /// string values
-  std::string argUrl = getUrlArg(argument, "url");
-  std::string argGroupName = getUrlArg(argument, "group"),
-              argUploadPath = getUrlArg(argument, "upload_path");
-  std::string argIncludeRemark = getUrlArg(argument, "include"),
-              argExcludeRemark = getUrlArg(argument, "exclude");
-  std::string argCustomGroups =
-                  urlSafeBase64Decode(getUrlArg(argument, "groups")),
-              argCustomRulesets =
-                  urlSafeBase64Decode(getUrlArg(argument, "ruleset")),
-              argExternalConfig = getUrlArg(argument, "config");
-  std::string argDeviceID = getUrlArg(argument, "dev_id"),
-              argFilename = getUrlArg(argument, "filename"),
-              argUpdateInterval = getUrlArg(argument, "interval"),
-              argUpdateStrict = getUrlArg(argument, "strict");
-  std::string argRenames = getUrlArg(argument, "rename"),
-              argFilterScript = getUrlArg(argument, "filter_script"),
-              argProviderHeaders = getUrlArg(argument, "provider_headers");
+  parsed.url = getUrlArg(argument, "url");
+  if (parsed.url.find("node:") != std::string::npos ||
+      parsed.url.find("node%3A") != std::string::npos ||
+      parsed.url.find("node%3a") != std::string::npos) {
+    const string_array request_sources = split(parsed.url, "|");
+    for (size_t index = 0; index < request_sources.size(); ++index) {
+      const TaggedLink tagged = parseTaggedLink(regTrim(request_sources[index]));
+      if (!tagged.has_node && tagged.error != TaggedLink::Error::InvalidNode)
+        continue;
+      if (tagged.error != TaggedLink::Error::None) {
+        response.status_code = 400;
+        return providerLinkPrefixError(index, tagged.error);
+      }
+      if (parsed.target != "clash" && parsed.target != "clashr") {
+        response.status_code = 400;
+        return "Invalid request: node: is supported only for Clash/ClashR.\n"
+               "无效请求：node: 仅支持 Clash/ClashR。";
+      }
+    }
+  }
+  parsed.group_name = getUrlArg(argument, "group");
+  parsed.upload_path = getUrlArg(argument, "upload_path");
+  parsed.include_remark = getUrlArg(argument, "include");
+  parsed.exclude_remark = getUrlArg(argument, "exclude");
+  parsed.external_config = getUrlArg(argument, "config");
+  parsed.device_id = getUrlArg(argument, "dev_id");
+  parsed.filename = getUrlArg(argument, "filename");
+  parsed.update_interval = getUrlArg(argument, "interval");
+  parsed.update_strict = getUrlArg(argument, "strict");
+  parsed.renames = getUrlArg(argument, "rename");
+  parsed.provider_headers = getUrlArg(argument, "provider_headers");
 
-  /// switches with default value
-  tribool argUpload = getUrlArg(argument, "upload"),
-          argEmoji = getUrlArg(argument, "emoji"),
-          argAddEmoji = getUrlArg(argument, "add_emoji"),
-          argRemoveEmoji = getUrlArg(argument, "remove_emoji");
-  tribool argAppendType = getUrlArg(argument, "append_type"),
-          argTFO = getUrlArg(argument, "tfo"),
-          argUDP = getUrlArg(argument, "udp"),
-          argGenNodeList = getUrlArg(argument, "list");
-  tribool argSort = getUrlArg(argument, "sort"),
-          argUseSortScript = getUrlArg(argument, "sort_script");
-  tribool argGenClashScript = getUrlArg(argument, "script"),
-          argEnableInsert = getUrlArg(argument, "insert");
-  tribool argSkipCertVerify = getUrlArg(argument, "scv"),
-          argFilterDeprecated = getUrlArg(argument, "fdn"),
-          argExpandRulesets = getUrlArg(argument, "expand"),
-          argAppendUserinfo = getUrlArg(argument, "append_info");
-  tribool argPrependInsert = getUrlArg(argument, "prepend"),
-          argGenClassicalRuleProvider = getUrlArg(argument, "classic"),
-          argTLS13 = getUrlArg(argument, "tls13"),
-          argProviderProxyDirect = getUrlArg(argument, "provider_proxy_direct");
-  explain.upload_requested = argUpload.get(false);
-  if (explainMode && argUpload) {
-    argUpload = false;
-    explain.upload_suppressed = true;
+  parsed.upload = getUrlArg(argument, "upload");
+  parsed.emoji = getUrlArg(argument, "emoji");
+  parsed.add_emoji = getUrlArg(argument, "add_emoji");
+  parsed.remove_emoji = getUrlArg(argument, "remove_emoji");
+  parsed.append_type = getUrlArg(argument, "append_type");
+  parsed.tfo = getUrlArg(argument, "tfo");
+  parsed.udp = getUrlArg(argument, "udp");
+  parsed.generate_node_list = getUrlArg(argument, "list");
+  parsed.sort = getUrlArg(argument, "sort");
+  parsed.use_sort_script = getUrlArg(argument, "sort_script");
+  parsed.generate_clash_script = getUrlArg(argument, "script");
+  parsed.enable_insert = getUrlArg(argument, "insert");
+  parsed.skip_cert_verify = getUrlArg(argument, "scv");
+  parsed.filter_deprecated = getUrlArg(argument, "fdn");
+  parsed.expand_rulesets = getUrlArg(argument, "expand");
+  parsed.append_userinfo = getUrlArg(argument, "append_info");
+  parsed.prepend_insert = getUrlArg(argument, "prepend");
+  parsed.generate_classical_rule_provider = getUrlArg(argument, "classic");
+  parsed.tls13 = getUrlArg(argument, "tls13");
+  parsed.provider_proxy_direct =
+      getUrlArg(argument, "provider_proxy_direct");
+  parsed.explain.upload_requested = parsed.upload.get(false);
+  if (parsed.explain_mode && parsed.upload) {
+    parsed.upload = false;
+    parsed.explain.upload_suppressed = true;
   }
 
-  std::string base_content, output_content;
-  ProxyGroupConfigs lCustomProxyGroups = global.customProxyGroups;
-  RulesetConfigs lCustomRulesets = global.customRulesets;
-  string_array lIncludeRemarks = global.includeRemarks,
-               lExcludeRemarks = global.excludeRemarks;
-  std::vector<RulesetContent> lRulesetContent;
-  extra_settings ext;
-  ext.rule_stats = rule_stats;
-  std::string subInfo, dummy;
-  int interval = !argUpdateInterval.empty()
-                     ? to_int(argUpdateInterval, global.updateInterval)
-                     : global.updateInterval;
-  // Token authentication is permanently disabled for security
-  bool authorized = false, strict = !argUpdateStrict.empty()
-                                        ? argUpdateStrict == "true"
-                                        : global.updateStrict;
-  explain.simple_subscription = lSimpleSubscription;
+  return "";
+}
+
+struct EffectiveSubPolicy {
+  ProxyGroupConfigs custom_proxy_groups;
+  RulesetConfigs custom_rulesets;
+  string_array include_remarks;
+  string_array exclude_remarks;
+  extra_settings generator;
+  int update_interval = 0;
+  bool update_strict = false;
+
+  std::string clash_base;
+  std::string surge_base;
+  std::string mellow_base;
+  std::string surfboard_base;
+  std::string stash_base;
+  std::string quan_base;
+  std::string quanx_base;
+  std::string loon_base;
+  std::string sssub_base;
+  std::string singbox_base;
+
+  std::map<std::string, std::string> provider_headers;
+  template_args template_arguments;
+  ProxyPolicy subscription_proxy;
+
+  // Client-managed remote resources cannot consume server-side node
+  // transformations. Preserve explicit request semantics by selecting the
+  // Legacy route, while configured defaults remain applicable to direct
+  // nodes without disabling native remote subscriptions for existing
+  // deployments.
+  bool requested_remote_node_filter = false;
+  bool requested_remote_node_rename = false;
+  bool requested_remote_node_transform = false;
+  bool requested_remote_node_option_override = false;
+};
+
+static std::string buildEffectiveSubPolicy(Request &request,
+                                           Response &response,
+                                           const Settings &settings,
+                                           RuleConversionStats *rule_stats,
+                                           ParsedSubRequest &parsed,
+                                           EffectiveSubPolicy &policy) {
+  policy.custom_proxy_groups = settings.customProxyGroups;
+  policy.custom_rulesets = settings.customRulesets;
+  policy.include_remarks = settings.includeRemarks;
+  policy.exclude_remarks = settings.excludeRemarks;
+  policy.generator.rule_stats = rule_stats;
+  policy.update_interval =
+      !parsed.update_interval.empty()
+          ? to_int(parsed.update_interval, settings.updateInterval)
+          : settings.updateInterval;
+  policy.update_strict = !parsed.update_strict.empty()
+                             ? parsed.update_strict == "true"
+                             : settings.updateStrict;
+  parsed.explain.simple_subscription = parsed.simple_subscription;
 
   if (std::find(gRegexBlacklist.cbegin(), gRegexBlacklist.cend(),
                 parsed.include_remark) != gRegexBlacklist.cend() ||
@@ -1901,54 +3952,55 @@ static std::string subconverter_impl(Request &request, Response &response,
            "请提供 target 和 url；只有启用已配置的插入节点时才能省略 url。";
   }
 
-  std::map<std::string, std::string> provider_headers;
   std::string provider_headers_error;
-  if (!argProviderHeaders.empty() && argTarget != "clash") {
-    *status_code = 400;
-    return "Invalid request: provider_headers is supported only for target=clash.\n"
-           "无效请求：provider_headers 仅支持 target=clash。";
+  if (!parsed.provider_headers.empty() && parsed.target != "clash" &&
+      parsed.target != "stash") {
+    response.status_code = 400;
+    return "Invalid request: provider_headers is supported only for "
+           "target=clash or target=stash.\n"
+           "无效请求：provider_headers 仅支持 target=clash 或 "
+           "target=stash。";
   }
-  if (!providerHeadersFromRequest(request, argProviderHeaders,
-                                  provider_headers,
+  if (parsed.target == "stash" && !parsed.provider_proxy_direct.is_undef()) {
+    response.status_code = 400;
+    return "Invalid request: provider_proxy_direct is a Mihomo-only option "
+           "and cannot be applied to Stash proxy-providers.\n"
+           "无效请求：provider_proxy_direct 是 Mihomo 专用选项，不能应用于 "
+           "Stash proxy-provider。";
+  }
+  if (!providerHeadersFromRequest(request, parsed.provider_headers,
+                                  policy.provider_headers,
                                   provider_headers_error)) {
-    *status_code = 400;
+    response.status_code = 400;
     return "Invalid request: " + provider_headers_error + ".\n"
            "无效请求：proxy-provider 请求头选择失败。";
   }
 
-  /// load request arguments as template variables
-  //    string_array req_args = split(argument, "&");
-  //    string_map req_arg_map;
-  //    for(std::string &x : req_args)
-  //    {
-  //        string_size pos = x.find("=");
-  //        if(pos == x.npos)
-  //        {
-  //            req_arg_map[x] = "";
-  //            continue;
-  //        }
-  //        if(x.substr(0, pos) == "token")
-  //            continue;
-  //        req_arg_map[x.substr(0, pos)] = x.substr(pos + 1);
-  //    }
   string_map req_arg_map;
-  for (auto &x : argument) {
-    if (x.first == "token")
+  for (auto &argument : request.argument) {
+    if (argument.first == "token")
       continue;
-    req_arg_map[x.first] = x.second;
+    req_arg_map[argument.first] = argument.second;
   }
+  req_arg_map["target"] = parsed.target;
+  req_arg_map["ver"] = std::to_string(parsed.surge_version);
+  policy.template_arguments.global_vars = settings.templateVars;
+  policy.template_arguments.request_params = std::move(req_arg_map);
 
-  /// save template variables
-  template_args tpl_args;
-  tpl_args.global_vars = global.templateVars;
-  tpl_args.request_params = std::move(req_arg_map);
-
-  /// check for proxy settings
-  ProxyPolicy proxy = parseProxy(global.proxySubscription);
-
-  /// check other flags
-  ext.authorized = authorized;
-  ext.append_proxy_type = argAppendType.get(global.appendType);
+  policy.subscription_proxy =
+      parseProxy(settings.proxySubscription, settings.proxyBypass);
+  policy.requested_remote_node_filter =
+      !parsed.include_remark.empty() || !parsed.exclude_remark.empty();
+  policy.requested_remote_node_rename = !parsed.renames.empty();
+  policy.requested_remote_node_transform =
+      !parsed.emoji.is_undef() || parsed.add_emoji.get(false) ||
+      parsed.remove_emoji.get(false) || parsed.append_type.get(false) ||
+      parsed.sort.get(false) || parsed.filter_deprecated.get(false);
+  policy.requested_remote_node_option_override =
+      !parsed.tfo.is_undef() || !parsed.udp.is_undef() ||
+      !parsed.skip_cert_verify.is_undef() || !parsed.tls13.is_undef();
+  policy.generator.append_proxy_type =
+      parsed.append_type.get(settings.appendType);
   // 上游项目默认在 clash 目标下自动把 expand 设为 true
   // 本项目默认 expand=false（使用 rule-provider 模式不展开规则集）
   // 若用户主动传入 expand=true，则按照用户意愿内联展开规则集
@@ -1966,53 +4018,146 @@ static std::string subconverter_impl(Request &request, Response &response,
       .define(settings.skipCertVerify);
   policy.generator.tls13.define(parsed.tls13).define(settings.TLS13Flag);
 
-  /// read preference from argument, assign global var if not in argument
-  ext.tfo.define(argTFO).define(global.TFOFlag);
-  ext.udp.define(argUDP).define(global.UDPFlag);
-  ext.skip_cert_verify.define(argSkipCertVerify).define(global.skipCertVerify);
-  ext.tls13.define(argTLS13).define(global.TLS13Flag);
-
-  ext.sort_flag = argSort.get(global.enableSort);
-  argUseSortScript.define(!global.sortScript.empty());
-  if (ext.sort_flag && argUseSortScript)
-    ext.sort_script = global.sortScript;
-  ext.filter_deprecated = argFilterDeprecated.get(global.filterDeprecated);
-  ext.clash_new_field_name = argClashNewField.get(global.clashUseNewField);
-  ext.clash_script = argGenClashScript.get();
-  ext.clash_classical_ruleset = argGenClassicalRuleProvider.get();
-  ext.custom_openclash_rules_fallback =
-      global.customOpenClashRulesFallback;
-  ext.custom_openclash_rules_base_url = global.managedConfigPrefix;
-  ext.provider_proxy_direct = argProviderProxyDirect.get(true);
+  policy.generator.sort_flag = parsed.sort.get(settings.enableSort);
+  parsed.use_sort_script.define(!settings.sortScript.empty());
+  if (policy.generator.sort_flag && parsed.use_sort_script)
+    policy.generator.sort_script = settings.sortScript;
+  policy.generator.filter_deprecated =
+      parsed.filter_deprecated.get(settings.filterDeprecated);
+  policy.generator.clash_new_field_name =
+      parsed.clash_new_field.get(settings.clashUseNewField);
+  policy.generator.clash_script = parsed.generate_clash_script.get();
+  policy.generator.clash_classical_ruleset =
+      parsed.generate_classical_rule_provider.get();
+  policy.generator.provider_proxy_direct =
+      parsed.provider_proxy_direct.get(settings.proxyProviderDirect);
   // 无论 expand 取何值，均强制使用 Mihomo 新字段名（proxy-groups / rules）
   // 避免因全局配置为旧字段名而导致 Mihomo 无法识别
-  ext.clash_new_field_name = true;
-  if (argExpandRulesets)
-    ext.clash_script = false;
-  explain.expand_rulesets = argExpandRulesets.get(false);
+  policy.generator.clash_new_field_name = true;
+  if (parsed.expand_rulesets)
+    policy.generator.clash_script = false;
+  parsed.explain.expand_rulesets = parsed.expand_rulesets.get(false);
 
   // Clash defaults to proxy-provider mode, while an explicit list=true keeps
   // the traditional expanded-node behavior.
-  ext.nodelist = argGenNodeList.get(false);
-  explain.nodelist = ext.nodelist;
-  ext.surge_ssr_path = global.surgeSSRPath;
-  ext.quanx_dev_id = !argDeviceID.empty() ? argDeviceID : global.quanXDevID;
-  ext.enable_rule_generator = global.enableRuleGen;
-  ext.overwrite_original_rules = global.overwriteOriginalRules;
-  if (!argExpandRulesets)
-    ext.managed_config_prefix = global.managedConfigPrefix;
-  explain.rule_generator_enabled = ext.enable_rule_generator;
-  explain.managed_config = !ext.managed_config_prefix.empty();
+  policy.generator.nodelist = parsed.generate_node_list.get(false);
+  parsed.explain.nodelist = policy.generator.nodelist;
+  policy.generator.surge_ssr_path = settings.surgeSSRPath;
+  policy.generator.quanx_dev_id = !parsed.device_id.empty()
+                                        ? parsed.device_id
+                                        : settings.quanXDevID;
+  policy.generator.enable_rule_generator = settings.enableRuleGen;
+  policy.generator.overwrite_original_rules = settings.overwriteOriginalRules;
+  if (!parsed.expand_rulesets)
+    policy.generator.managed_config_prefix = settings.managedConfigPrefix;
+  parsed.explain.rule_generator_enabled =
+      policy.generator.enable_rule_generator;
+  parsed.explain.managed_config =
+      !policy.generator.managed_config_prefix.empty();
 
-  /// load external configuration
-  bool userProvidedExternalConfig = !argExternalConfig.empty();
-  FetchContext externalConfigContext =
-      userProvidedExternalConfig ? FetchContext::PublicRequest
-                                 : FetchContext::TrustedConfig;
+  return "";
+}
+
+struct ExternalConfigFetchPlan {
+  bool user_provided_external_config = false;
+  bool config_load_success = false;
+  FetchContext base_fetch_context = FetchContext::TrustedConfig;
+  std::vector<RulesetContent> ruleset_content;
+  std::string base_path;
+  std::string resolved_base_content;
+};
+
+struct ConversionDependencyResolution {
+  std::vector<AsyncConversionResourceRequest> *requests = nullptr;
+  const AsyncConversionResourceBatchResult *resolved = nullptr;
+};
+
+struct ResolvedExternalConfigSelection {
+  ExternalConfig config;
+  template_args template_arguments;
+  FetchContext context = FetchContext::TrustedConfig;
+  bool fallback = false;
+};
+
+static const std::string *selectedTargetBase(
+    const ParsedSubRequest &parsed, const EffectiveSubPolicy &policy) {
+  if (parsed.target == "sssub")
+    return &policy.sssub_base;
+  if (policy.generator.nodelist)
+    return nullptr;
+  switch (hash_(parsed.target)) {
+  case "clash"_hash:
+  case "clashr"_hash:
+    return &policy.clash_base;
+  case "surge"_hash:
+    return &policy.surge_base;
+  case "surfboard"_hash:
+    return &policy.surfboard_base;
+  case "stash"_hash:
+    return &policy.stash_base;
+  case "mellow"_hash:
+    return &policy.mellow_base;
+  case "quan"_hash:
+    return &policy.quan_base;
+  case "quanx"_hash:
+    return &policy.quanx_base;
+  case "loon"_hash:
+    return &policy.loon_base;
+  case "singbox"_hash:
+    return &policy.singbox_base;
+  default:
+    return nullptr;
+  }
+}
+
+static const ResolvedConversionResource *findResolvedDependency(
+    const ConversionDependencyResolution *resolution,
+    ConversionResourceKind kind, uint64_t source_index,
+    const std::string &url) {
+  if (!resolution || !resolution->resolved)
+    return nullptr;
+  for (const ResolvedConversionResource &resource :
+       resolution->resolved->resources) {
+    if (resource.kind == kind && resource.source_index == source_index &&
+        resource.url == url)
+      return &resource;
+  }
+  return nullptr;
+}
+
+static void prepareTargetTemplateArguments(
+    const ParsedSubRequest &parsed, EffectiveSubPolicy &policy) {
+  if (parsed.target == "clash" || parsed.target == "clashr") {
+    policy.template_arguments.local_vars["clash.new_field_name"] =
+        policy.generator.clash_new_field_name ? "true" : "false";
+  }
+}
+
+static const ResolvedConversionResource *resolveOrPlanDependency(
+    ConversionDependencyResolution *resolution,
+    AsyncConversionResourceRequest request) {
+  if (!resolution)
+    return nullptr;
+  const ResolvedConversionResource *resolved = findResolvedDependency(
+      resolution, request.kind, request.source_index, request.url);
+  if (!resolved && resolution->requests)
+    resolution->requests->emplace_back(std::move(request));
+  return resolved;
+}
+
+static std::string buildExternalConfigFetchPlan(
+    Response &response, const Settings &settings, ParsedSubRequest &parsed,
+    EffectiveSubPolicy &policy, ExternalConfigFetchPlan &plan,
+    const ResolvedExternalConfigSelection *resolved_config = nullptr,
+    ConversionDependencyResolution *dependency_resolution = nullptr) {
+  plan.user_provided_external_config = !parsed.external_config.empty();
   FetchContext rulesetFetchContext = FetchContext::TrustedConfig;
   bool configLoadSuccess = false;
-  string_map tpl_args_base = tpl_args.local_vars;
-  explain.external_config_provided = userProvidedExternalConfig;
+  string_array rulePrependSources, ruleAppendSources;
+  FetchContext externalRuleFetchContext = FetchContext::TrustedConfig;
+  string_map tpl_args_base = policy.template_arguments.local_vars;
+  parsed.explain.external_config_provided =
+      plan.user_provided_external_config;
 
   struct ExternalConfigCandidate {
     std::string path;
@@ -2034,47 +4179,29 @@ static std::string subconverter_impl(Request &request, Response &response,
         {settings.defaultExtConfig, FetchContext::TrustedConfig, false});
   }
 
-  if (!argExternalConfig.empty()) {
-    // std::cerr<<"External configuration file provided. Loading...\n";
-    writeLog(0, "已提供外部配置文件，正在加载...",
-             LOG_LEVEL_INFO);
-    ExternalConfig extconf;
-    extconf.tpl_args = &tpl_args;
-    int load_result =
-        loadExternalConfig(argExternalConfig, extconf, externalConfigContext);
-    if (load_result == 0 &&
-        hasEffectiveExternalConfig(extconf, tpl_args, tpl_args_base)) {
-      configLoadSuccess = true;
-      explain.external_config_loaded = true;
-      if (!ext.nodelist) {
-        if (checkExternalBase(extconf.sssub_rule_base, lSSSubBase,
-                              externalConfigContext))
-          baseFetchContext = externalConfigContext;
-        if (!lSimpleSubscription) {
-          if (checkExternalBase(extconf.clash_rule_base, lClashBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
-          if (checkExternalBase(extconf.surge_rule_base, lSurgeBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
-          if (checkExternalBase(extconf.surfboard_rule_base, lSurfboardBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
-          if (checkExternalBase(extconf.mellow_rule_base, lMellowBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
-          if (checkExternalBase(extconf.quan_rule_base, lQuanBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
-          if (checkExternalBase(extconf.quanx_rule_base, lQuanXBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
-          if (checkExternalBase(extconf.loon_rule_base, lLoonBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
-          if (checkExternalBase(extconf.singbox_rule_base, lSingBoxBase,
-                                externalConfigContext))
-            baseFetchContext = externalConfigContext;
+  auto loadStatusName = [](ExternalConfigLoadStatus status) {
+    switch (status) {
+    case ExternalConfigLoadStatus::Success:
+      return "success";
+    case ExternalConfigLoadStatus::FetchFailed:
+      return "fetch_failed";
+    case ExternalConfigLoadStatus::RenderFailed:
+      return "render_failed";
+    case ExternalConfigLoadStatus::ParseFailed:
+      return "parse_failed";
+    case ExternalConfigLoadStatus::ImportFailed:
+      return "import_failed";
+    case ExternalConfigLoadStatus::ResourceLimitExceeded:
+      return "resource_limit_exceeded";
+    case ExternalConfigLoadStatus::Cancelled:
+      return "cancelled";
+    case ExternalConfigLoadStatus::Deadline:
+      return "deadline";
+    case ExternalConfigLoadStatus::Shutdown:
+      return "shutdown";
+    }
+    return "unknown";
+  };
 
   auto applyExternalConfig = [&](const ExternalConfig &extconf,
                                  FetchContext context) {
@@ -2120,26 +4247,12 @@ static std::string subconverter_impl(Request &request, Response &response,
           policy.custom_rulesets = extconf.surge_ruleset;
           rulesetFetchContext = context;
         }
-      }
-      if (!extconf.rename.empty()) {
-        ext.rename_array = extconf.rename;
-        ext.rename_for_providers = true;
-      }
-      if (!extconf.emoji.empty())
-        ext.emoji_array = extconf.emoji;
-      if (!extconf.include.empty())
-        lIncludeRemarks = extconf.include;
-      if (!extconf.exclude.empty())
-        lExcludeRemarks = extconf.exclude;
-      argAddEmoji.define(extconf.add_emoji);
-      argRemoveEmoji.define(extconf.remove_old_emoji);
-    } else {
-      tpl_args.local_vars = tpl_args_base;
-      if (load_result == 0) {
-        writeLog(
-            0,
-            "外部配置已加载，但未包含有效设置，按加载失败处理。",
-            LOG_LEVEL_WARNING);
+        if (!extconf.custom_proxy_group.empty())
+          policy.custom_proxy_groups = extconf.custom_proxy_group;
+        policy.generator.enable_rule_generator =
+            extconf.enable_rule_generator;
+        policy.generator.overwrite_original_rules =
+            extconf.overwrite_original_rules;
       }
     }
     if (!extconf.rename.empty()) {
@@ -2168,102 +4281,55 @@ static std::string subconverter_impl(Request &request, Response &response,
     parsed.remove_emoji.define(extconf.remove_old_emoji);
   };
 
-    bool legacyRemoteFallback =
-        userProvidedExternalConfig && !global.defaultExtConfig.empty() &&
-        argExternalConfig != global.defaultExtConfig;
-    std::vector<std::string> fallbackConfigs =
-        buildExternalConfigFallbacks(
-            argExternalConfig, global.customOpenClashRulesFallback,
-            legacyRemoteFallback);
+  if (resolved_config) {
+    policy.template_arguments = resolved_config->template_arguments;
+    applyExternalConfig(resolved_config->config,
+                        resolved_config->context);
+    configLoadSuccess = true;
+    plan.config_load_success = true;
+    parsed.explain.external_config_loaded = true;
+    parsed.explain.fallback_config_used = resolved_config->fallback;
+  } else {
+    for (const ExternalConfigCandidate &candidate : config_candidates) {
+      policy.template_arguments.local_vars = tpl_args_base;
+      writeLog((candidate.fallback ? LOG_LEVEL_WARNING : LOG_LEVEL_INFO),
+               candidate.fallback
+                   ? "用户外部配置失败，显式尝试默认外部配置：" +
+                         summarizeUrlForLog(candidate.path)
+                   : "正在加载外部配置：" +
+                         summarizeUrlForLog(candidate.path));
 
-    if (!configLoadSuccess && !fallbackConfigs.empty()) {
-      writeLog(
-          0, global.customOpenClashRulesFallback
-                 ? "加载外部配置失败，正在尝试远程及内置回退配置..."
-                 : "加载用户提供的配置失败，正在尝试默认远程配置...",
-          LOG_LEVEL_WARNING);
-
-      for (std::string fallbackConfig : fallbackConfigs) {
-        writeLog(0, "正在尝试加载配置：" + fallbackConfig,
-                 LOG_LEVEL_INFO);
-
-        tpl_args.local_vars = tpl_args_base;
-        ExternalConfig extconf;
-        extconf.tpl_args = &tpl_args;
-        int fallback_result =
-            loadExternalConfig(fallbackConfig, extconf,
-                               FetchContext::TrustedConfig);
-        if (fallback_result == 0 &&
-            hasEffectiveExternalConfig(extconf, tpl_args, tpl_args_base)) {
-          writeLog(0, "已成功加载配置：" + fallbackConfig,
-                   LOG_LEVEL_INFO);
-          configLoadSuccess = true;
-          explain.external_config_loaded = true;
-          explain.fallback_config_used = true;
-          if (!ext.nodelist) {
-            checkExternalBase(extconf.sssub_rule_base, lSSSubBase,
-                              FetchContext::TrustedConfig);
-            if (!lSimpleSubscription) {
-              checkExternalBase(extconf.clash_rule_base, lClashBase,
-                                FetchContext::TrustedConfig);
-              checkExternalBase(extconf.surge_rule_base, lSurgeBase,
-                                FetchContext::TrustedConfig);
-              checkExternalBase(extconf.surfboard_rule_base, lSurfboardBase,
-                                FetchContext::TrustedConfig);
-              checkExternalBase(extconf.mellow_rule_base, lMellowBase,
-                                FetchContext::TrustedConfig);
-              checkExternalBase(extconf.quan_rule_base, lQuanBase,
-                                FetchContext::TrustedConfig);
-              checkExternalBase(extconf.quanx_rule_base, lQuanXBase,
-                                FetchContext::TrustedConfig);
-              checkExternalBase(extconf.loon_rule_base, lLoonBase,
-                                FetchContext::TrustedConfig);
-              checkExternalBase(extconf.singbox_rule_base, lSingBoxBase,
-                                FetchContext::TrustedConfig);
-
-              if (!extconf.surge_ruleset.empty())
-                lCustomRulesets = extconf.surge_ruleset;
-              if (!extconf.custom_proxy_group.empty())
-                lCustomProxyGroups = extconf.custom_proxy_group;
-              ext.enable_rule_generator = extconf.enable_rule_generator;
-              ext.overwrite_original_rules = extconf.overwrite_original_rules;
-            }
-          }
-          if (!extconf.rename.empty()) {
-            ext.rename_array = extconf.rename;
-            ext.rename_for_providers = true;
-          }
-          if (!extconf.emoji.empty())
-            ext.emoji_array = extconf.emoji;
-          if (!extconf.include.empty())
-            lIncludeRemarks = extconf.include;
-          if (!extconf.exclude.empty())
-            lExcludeRemarks = extconf.exclude;
-          argAddEmoji.define(extconf.add_emoji);
-          argRemoveEmoji.define(extconf.remove_old_emoji);
-          break; // Success, stop trying other configs
-        } else {
-          tpl_args.local_vars = tpl_args_base;
-          if (fallback_result == 0) {
-            writeLog(
-                0,
-                "已从 " + fallbackConfig +
-                    " 加载配置，但未发现有效设置，跳过。",
-                LOG_LEVEL_WARNING);
-          } else {
-            writeLog(0, "加载配置失败：" + fallbackConfig,
-                     LOG_LEVEL_WARNING);
-          }
-        }
+      ExternalConfig extconf;
+      extconf.tpl_args = &policy.template_arguments;
+      ExternalConfigLoadResult loaded =
+          loadExternalConfig(candidate.path, extconf, candidate.context);
+      bool effective =
+          loaded.ok() && hasEffectiveExternalConfig(
+                             extconf, policy.template_arguments,
+                             tpl_args_base, parsed.target);
+      bool selected_base_valid =
+          effective && validateSelectedExternalBase(
+                           extconf, parsed.target,
+                           parsed.simple_subscription,
+                           policy.generator.nodelist,
+                           candidate.context);
+      if (loaded.ok() && effective && selected_base_valid) {
+        applyExternalConfig(extconf, candidate.context);
+        configLoadSuccess = true;
+        plan.config_load_success = true;
+        parsed.explain.external_config_loaded = true;
+        parsed.explain.fallback_config_used = candidate.fallback;
+        break;
       }
 
-      if (!configLoadSuccess) {
-        writeLog(0,
-                 global.customOpenClashRulesFallback
-                     ? "所有远程及内置回退配置均加载失败。"
-                     : "所有默认远程回退配置均加载失败。",
-                 LOG_LEVEL_ERROR);
-      }
+      policy.template_arguments.local_vars = tpl_args_base;
+      std::string reason = !loaded.ok()
+                               ? loadStatusName(loaded.status)
+                               : (!effective ? "no_effective_settings"
+                                             : "selected_base_invalid");
+      writeLog(LOG_LEVEL_WARNING,
+               "外部配置不可用，原因：" + reason + "，来源：" +
+                   summarizeUrlForLog(candidate.path));
     }
   }
 
@@ -2404,22 +4470,142 @@ static std::string subconverter_impl(Request &request, Response &response,
       }
     }
   }
-  if (ext.enable_rule_generator && !ext.nodelist && !lSimpleSubscription) {
-    if (lCustomRulesets != global.customRulesets)
-      refreshRulesets(lCustomRulesets, lRulesetContent, rulesetFetchContext);
-    else {
-      if (global.updateRulesetOnRequest)
-        refreshRulesets(lCustomRulesets, lRulesetContent,
+
+  if (policy.generator.enable_rule_generator &&
+      !policy.generator.nodelist && !parsed.simple_subscription) {
+    if (!dependency_resolution) {
+      const bool stash_native_rulesets = parsed.target == "stash";
+      if (stash_native_rulesets) {
+        const bool reuse_cached_rulesets =
+            policy.custom_rulesets == settings.customRulesets &&
+            !settings.updateRulesetOnRequest &&
+            settings.rulesetsContent.size() == policy.custom_rulesets.size();
+        refreshRulesets(policy.custom_rulesets, plan.ruleset_content,
+                        rulesetFetchContext,
+                        RulesetRefreshMode::PreferNativeStashProviders,
+                        reuse_cached_rulesets ? &settings.rulesetsContent
+                                              : nullptr);
+      } else if (policy.custom_rulesets != settings.customRulesets) {
+        refreshRulesets(policy.custom_rulesets, plan.ruleset_content,
                         rulesetFetchContext);
-      else
-        lRulesetContent = global.rulesetsContent;
+      } else if (settings.updateRulesetOnRequest) {
+        refreshRulesets(policy.custom_rulesets, plan.ruleset_content,
+                        rulesetFetchContext);
+      } else {
+        plan.ruleset_content = settings.rulesetsContent;
+      }
+    } else {
+      plan.ruleset_content.clear();
+      plan.ruleset_content.reserve(policy.custom_rulesets.size());
+      const ProxyPolicy ruleset_proxy =
+          parseProxy(settings.proxyRuleset, settings.proxyBypass);
+      const bool reuse_cached_rulesets =
+          policy.custom_rulesets == settings.customRulesets &&
+          !settings.updateRulesetOnRequest &&
+          settings.rulesetsContent.size() == policy.custom_rulesets.size();
+      for (size_t index = 0; index < policy.custom_rulesets.size(); ++index) {
+        if (reuse_cached_rulesets) {
+          RulesetContent content = settings.rulesetsContent[index];
+          if (content.delivery == RulesetDelivery::NativeStashProvider) {
+            content.resolved_content =
+                std::make_shared<const std::string>();
+          } else if (!content.resolved_content) {
+            AsyncConversionResourceRequest request;
+            request.kind = ConversionResourceKind::Ruleset;
+            request.source_index = index;
+            request.url = content.rule_path;
+            request.proxy = ruleset_proxy;
+            request.cache_ttl = static_cast<unsigned int>(
+                std::max(0, settings.cacheRuleset));
+            request.context = rulesetFetchContext;
+            request.preloaded_content = content.rule_content;
+            const ResolvedConversionResource *resource =
+                resolveOrPlanDependency(dependency_resolution,
+                                        std::move(request));
+            content.resolved_content = std::make_shared<const std::string>(
+                resource && resource->payload &&
+                        resource->failure == AsyncFetchFailure::None
+                    ? resource->payload->content
+                    : std::string());
+          }
+          plan.ruleset_content.emplace_back(std::move(content));
+          continue;
+        }
+        const RulesetConfig &configured = policy.custom_rulesets[index];
+        RulesetContent content;
+        content.rule_group = configured.Group;
+        content.rule_path_typed = configured.Url;
+        content.update_interval = configured.Interval;
+        content.options = configured.Options;
+
+        const size_t inline_position = configured.Url.find("[]");
+        if (inline_position != std::string::npos) {
+          content.rule_type = RULESET_SURGE;
+          content.resolved_content = std::make_shared<const std::string>(
+              configured.Url.substr(inline_position));
+          plan.ruleset_content.emplace_back(std::move(content));
+          continue;
+        }
+
+        content.rule_path = configured.Url;
+        auto type = std::find_if(
+            RulesetTypes.begin(), RulesetTypes.end(),
+            [&](const auto &entry) {
+              return startsWith(content.rule_path, entry.first);
+            });
+        if (type != RulesetTypes.end()) {
+          content.rule_path.erase(0, type->first.size());
+          content.rule_type = type->second;
+        } else {
+          content.rule_type = RULESET_SURGE;
+        }
+        if (content.options.no_resolve &&
+            content.rule_type != RULESET_CLASH_IPCIDR) {
+          writeLog(LOG_LEVEL_WARNING,
+                   "规则集选项 no-resolve 仅适用于 clash-ipcidr，已对策略组 '" +
+                       content.rule_group + "' 安全忽略。");
+        }
+        std::string native_path = toLower(content.rule_path);
+        const size_t query = native_path.find_first_of("?#");
+        if (query != std::string::npos)
+          native_path.erase(query);
+        const bool native_stash_provider =
+            parsed.target == "stash" &&
+            (startsWith(content.rule_path, "https://") ||
+             startsWith(content.rule_path, "http://")) &&
+            (content.rule_type == RULESET_CLASH_DOMAIN ||
+             content.rule_type == RULESET_CLASH_IPCIDR ||
+             content.rule_type == RULESET_CLASH_CLASSICAL) &&
+            (!content.options.stash_format.empty() ||
+             endsWith(native_path, ".mrs") ||
+             endsWith(native_path, ".yaml") ||
+             endsWith(native_path, ".yml"));
+        if (native_stash_provider) {
+          content.delivery = RulesetDelivery::NativeStashProvider;
+          content.resolved_content =
+              std::make_shared<const std::string>();
+        } else {
+          AsyncConversionResourceRequest request;
+          request.kind = ConversionResourceKind::Ruleset;
+          request.source_index = index;
+          request.url = content.rule_path;
+          request.proxy = ruleset_proxy;
+          request.cache_ttl = static_cast<unsigned int>(
+              std::max(0, settings.cacheRuleset));
+          request.context = rulesetFetchContext;
+          const ResolvedConversionResource *resource =
+              resolveOrPlanDependency(dependency_resolution,
+                                      std::move(request));
+          content.resolved_content = std::make_shared<const std::string>(
+              resource && resource->payload &&
+                      resource->failure == AsyncFetchFailure::None
+                  ? resource->payload->content
+                  : std::string());
+        }
+        plan.ruleset_content.emplace_back(std::move(content));
+      }
     }
   }
-  explain.rule_generator_enabled = ext.enable_rule_generator;
-  explain.base_fetch_context = fetchContextName(baseFetchContext);
-  explain.ruleset_fetch_context = fetchContextName(rulesetFetchContext);
-  explain.ruleset_count = lRulesetContent.size();
-  explain.custom_group_count = lCustomProxyGroups.size();
 
   if (dependency_resolution) {
     const std::string *base = selectedTargetBase(parsed, policy);
@@ -3095,8 +5281,10 @@ static SubStageResponse processSubscriptionNodes(
   parse_set.stream_rules = &stream_temp;
   parse_set.time_rules = &time_temp;
   parse_set.sub_info = &subInfo;
-  parse_set.authorized = authorized;
-  parse_set.mihomo_only = argTarget == "clash" || argTarget == "clashr";
+  parse_set.parser_mode = parsed.target_descriptor->parser_mode;
+  parse_set.explicit_http_skip_cert_verify =
+      ext.skip_cert_verify.get(false);
+  parse_set.parser_stats = &parser_stats;
   string_icase_map subscription_headers = buildSubscriptionRequestHeaders();
   std::string selected_user_agent = providerUserAgentFromRequest(request);
   if (!selected_user_agent.empty())
@@ -3166,17 +5354,19 @@ static SubStageResponse processSubscriptionNodes(
 
   if (!settings.insertUrls.empty() && argEnableInsert) {
     groupID = -1;
-    urls = split(global.insertUrls, "|");
+    urls = split(settings.insertUrls, "|");
     explain.insert_url_count = urls.size();
     importItems(urls, true);
     for (std::string &x : urls) {
       x = regTrim(x);
-      writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
+      writeLog(LOG_LEVEL_INFO, "正在从 URL 获取节点数据：" + summarizeUrlForLog(x) + "。");
+      source_calls++;
       if (addNodes(x, insert_nodes, groupID, parse_set) == -1) {
-        if (global.skipFailedLinks)
-          writeLog(
-              0, "以下链接不包含任何有效节点信息：" + x,
-              LOG_LEVEL_WARNING);
+        source_failures++;
+        if (settings.skipFailedLinks)
+          writeLog(LOG_LEVEL_WARNING,
+                   "以下链接不包含任何有效节点信息：" +
+                       summarizeUrlForLog(x));
         else {
           logRouteSelection();
           *status_code = 400;
@@ -3269,10 +5459,8 @@ static SubStageResponse processSubscriptionNodes(
         return {true, providerLinkPrefixError(index, tagged.error)};
       }
       std::string link = tagged.link.empty() ? x : tagged.link;
-
-      // Keep HTTP(S)/data links available for proxy-provider mode. Other
-      // Mihomo-supported schemes are direct node links.
-      bool isNodeLink = mihomo::isSupportedNonHttpSchemeLink(link);
+      bool isNodeLink = tagged.has_node ||
+                        mihomo::isSupportedNonHttpSchemeLink(link);
 
       if (isNodeLink) {
         if (tagged.has_interval) {
@@ -3285,18 +5473,18 @@ static SubStageResponse processSubscriptionNodes(
         }
         std::string node_link = tagged.has_node ? "node:" + link : link;
         if (tagged.has_tag)
-          node_link = "tag:" + tagged.tag + "," + link;
-        writeLog(0, "检测到节点链接：'" + link + "'，将直接解析。",
-                 LOG_LEVEL_INFO);
+          node_link = "tag:" + tagged.tag + "," + node_link;
+        writeLog(LOG_LEVEL_INFO, "检测到节点链接：" + summarizeUrlForLog(link) +
+                        "，将直接解析。");
         node_urls.push_back(node_link);
         explain.node_link_count++;
       } else if (isLink(link) || mihomo::isHttpSchemeLink(link)) {
-        // HTTP/HTTPS 订阅链接
-        writeLog(
-            0, "检测到订阅链接：'" + link + "'，将创建 provider。",
-            LOG_LEVEL_INFO);
+        writeLog(LOG_LEVEL_INFO, "检测到订阅链接：" + summarizeUrlForLog(link) +
+                        "，将创建 provider。");
         subscription_urls.push_back(
-            {link, tagged.tag, tagged.provider, tagged.link_decoded});
+            {link, tagged.tag, tagged.provider, tagged.interval,
+             tagged.proxy_direct, tagged.has_interval, tagged.has_proxy_direct,
+             tagged.link_decoded});
         explain.subscription_url_count++;
       } else {
         if (tagged.has_interval) {
@@ -3310,8 +5498,8 @@ static SubStageResponse processSubscriptionNodes(
         std::string node_link = link;
         if (tagged.has_tag)
           node_link = "tag:" + tagged.tag + "," + link;
-        writeLog(0, "未知 URL 类型：'" + link + "'，按节点链接处理。",
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING, "未知 URL 类型：" + summarizeUrlForLog(link) +
+                        "，按节点链接处理。");
         node_urls.push_back(node_link);
         explain.node_link_count++;
         explain.unknown_node_link_count++;
@@ -3319,8 +5507,7 @@ static SubStageResponse processSubscriptionNodes(
     }
 
     if (!subscription_urls.empty()) {
-      writeLog(0, "检测到订阅 URL，启用 proxy-provider 模式。",
-               LOG_LEVEL_INFO);
+      writeLog(LOG_LEVEL_INFO, "检测到订阅 URL，启用 proxy-provider 模式。");
       ext.use_proxy_provider = true;
       std::string provider_user_agent =
           argTarget == "clash" ? providerUserAgentFromRequest(request) : "";
@@ -3367,57 +5554,69 @@ static SubStageResponse processSubscriptionNodes(
           base_name = default_name;
         provider.name = reserve_provider_name(base_name);
         provider.tag = item.tag;
-        writeLog(0,
-                 "已生成 provider：" + provider.name + "，URL：" +
-                     item.url,
-                 LOG_LEVEL_INFO);
-        provider.url = item.url_decoded ? item.url
-                                        : urlDecode(item.url); // 解码 URL
-        provider.interval = 0;    // 禁止自动周期更新订阅
+        provider.url = item.url_decoded ? item.url : urlDecode(item.url);
+        provider.interval = static_cast<uint32_t>(
+            item.has_interval ? item.interval : settings.proxyProviderInterval);
+        provider.proxy_direct =
+            item.has_proxy_direct ? item.proxy_direct
+                                  : ext.provider_proxy_direct;
         provider.groupId = groupID;
         provider.path = "./providers/" + provider.name + ".yaml";
         provider.user_agent = provider_user_agent;
         provider.headers = provider_headers;
-
-        // Provider mode cannot filter expanded nodes locally, so pass the
-        // final effective remark filters through to Mihomo.
         provider.filter = buildProviderRemarkFilter(lIncludeRemarks);
         provider.exclude_filter =
             buildProviderRemarkFilter(lExcludeRemarks);
+        writeLog(LOG_LEVEL_INFO,
+                 "PROXY_PROVIDER_CREATED group_id=" +
+                     std::to_string(provider.groupId) + " interval=" +
+                     std::to_string(provider.interval) + " proxy_direct=" +
+                     boolString(provider.proxy_direct) + " source=" +
+                     summarizeUrlForLog(provider.url));
 
         ext.providers.push_back(provider);
         SubExplainProvider explain_provider;
-        explain_provider.name = provider.name;
+        explain_provider.name_generated = generated_provider_name;
+        if (generated_provider_name) {
+          const std::string safe_name =
+              "Provider_Auto_" +
+              std::to_string(++generated_explain_provider_index);
+          explain_provider.name = safe_name;
+          explain_provider.path = "./providers/" + safe_name + ".yaml";
+        } else {
+          explain_provider.name = provider.name;
+          explain_provider.path = provider.path;
+        }
         explain_provider.tag = provider.tag;
-        explain_provider.source_hash = shortHash(provider.url);
-        explain_provider.path = provider.path;
-        explain_provider.filter = provider.filter;
-        explain_provider.exclude_filter = provider.exclude_filter;
+        explain_provider.source_summary = summarizeUrlForLog(provider.url);
+        explain_provider.filter_present = !provider.filter.empty();
+        explain_provider.exclude_filter_present =
+            !provider.exclude_filter.empty();
         explain_provider.group_id = provider.groupId;
         explain_provider.interval = provider.interval;
+        explain_provider.proxy_direct = provider.proxy_direct;
         explain.providers.push_back(std::move(explain_provider));
         groupID++;
       }
     } else {
-      // 没有订阅链接，禁用 proxy-provider 模式
-      writeLog(0, "未检测到订阅 URL，禁用 proxy-provider 模式。",
-               LOG_LEVEL_INFO);
+      writeLog(LOG_LEVEL_INFO, "未检测到订阅 URL，禁用 proxy-provider 模式。");
       ext.use_proxy_provider = false;
     }
 
     if (!node_urls.empty()) {
-      writeLog(0,
+      writeLog(LOG_LEVEL_INFO,
                "正在直接解析 " + std::to_string(node_urls.size()) +
-                   " 个节点链接。",
-               LOG_LEVEL_INFO);
+                   " 个节点链接。");
       importItems(node_urls, true, FetchContext::PublicRequest);
       for (std::string &x : node_urls) {
-        writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
+        writeLog(LOG_LEVEL_INFO, "正在从 URL 获取节点数据：" + summarizeUrlForLog(x) +
+                        "。");
+        source_calls++;
         if (addNodes(x, nodes, groupID, parse_set) == -1) {
-          // 跳过无法解析的节点链接，记录警告后继续处理其他节点
-          writeLog(0,
-                   "已跳过无效节点链接：'" + x + "'，继续处理其他节点。",
-                   LOG_LEVEL_WARNING);
+          source_failures++;
+          writeLog(LOG_LEVEL_WARNING,
+                   "已跳过无效节点链接：" + summarizeUrlForLog(x) +
+                       "，继续处理其他节点。");
         }
         groupID++;
       }
@@ -3947,30 +6146,39 @@ static SubStageResponse processSubscriptionNodes(
     importItems(urls, true, FetchContext::PublicRequest);
     for (std::string &x : urls) {
       x = regTrim(x);
-      // std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-      writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
-      if (addNodes(x, nodes, groupID, parse_set) == -1) {
-        // 跳过无法解析的节点链接，记录警告后继续处理其他节点
-        writeLog(0,
-                 "已跳过无效节点链接：'" + x + "'，继续处理其他节点。",
-                 LOG_LEVEL_WARNING);
+      writeLog(LOG_LEVEL_INFO, "正在从 URL 获取节点数据：" + summarizeUrlForLog(x) + "。");
+      source_calls++;
+      parse_settings item_parse_set = parse_set;
+      if (native_remote_target) {
+        const TaggedLink tagged = parseTaggedLink(x);
+        item_parse_set.force_direct_link =
+            isLegacyHttpProxyUri(tagged.link.empty() ? x : tagged.link);
+      }
+      if (addNodes(x, nodes, groupID, item_parse_set) == -1) {
+        source_failures++;
+        writeLog(LOG_LEVEL_WARNING,
+                 "已跳过无效节点链接：" + summarizeUrlForLog(x) +
+                     "，继续处理其他节点。");
       }
       groupID++;
     }
   }
-  // exit if found nothing
-  // 对于 proxy-provider 模式，允许 nodes 为空（节点从 provider 获取）
-  explain.provider_count = ext.providers.size();
-  explain.proxy_provider_mode = ext.use_proxy_provider && !ext.providers.empty();
+
+  explain.provider_count =
+      ext.providers.size() + ext.stash_proxy_providers.size();
+  explain.remote_subscription_count = ext.quanx_server_remotes.size() +
+                                      ext.surge_policy_paths.size() +
+                                      ext.surfboard_policy_paths.size() +
+                                      ext.loon_remote_proxies.size() +
+                                      ext.stash_proxy_providers.size();
+  explain.proxy_provider_mode =
+      (ext.use_proxy_provider && !ext.providers.empty()) ||
+      !ext.stash_proxy_providers.empty();
   explain.insert_node_count = insert_nodes.size();
   explain.direct_node_count = nodes.size();
-  if (!argProviderHeaders.empty() && !ext.nodelist && ext.providers.empty()) {
-    *status_code = 400;
-    return "Invalid request: provider_headers was selected, but no "
-           "proxy-provider was generated.\n"
-           "无效请求：已选择 provider_headers，但没有生成 proxy-provider。";
-  }
-  if (nodes.empty() && insert_nodes.empty() && ext.providers.empty()) {
+  logRouteSelection();
+  if (!argProviderHeaders.empty() && !ext.nodelist && ext.providers.empty() &&
+      ext.stash_proxy_providers.empty()) {
     *status_code = 400;
     return {true,
             "Invalid request: provider_headers was selected, but no "
@@ -4020,30 +6228,6 @@ static SubStageResponse processSubscriptionNodes(
   if (!filterScript.empty()) {
     if (startsWith(filterScript, "path:"))
       filterScript = fileGet(filterScript.substr(5), false);
-    /*
-    duk_context *ctx = duktape_init();
-    if(ctx)
-    {
-        defer(duk_destroy_heap(ctx);)
-        if(duktape_peval(ctx, filterScript) == 0)
-        {
-            auto filter = [&](const Proxy &x)
-            {
-                duk_get_global_string(ctx, "filter");
-                duktape_push_Proxy(ctx, x);
-                duk_pcall(ctx, 1);
-                return !duktape_get_res_bool(ctx);
-            };
-            nodes.erase(std::remove_if(nodes.begin(), nodes.end(), filter),
-    nodes.end());
-        }
-        else
-        {
-            writeLog(0, "解析脚本时发生错误：\n" +
-    duktape_get_err_stack(ctx), LOG_LEVEL_ERROR); duk_pop(ctx); /// pop err
-        }
-    }
-    */
     script_safe_runner(
         ext.js_runtime, ext.js_context,
         [&](qjs::Context &ctx) {
@@ -4066,6 +6250,8 @@ static SubStageResponse processSubscriptionNodes(
 
   preprocessNodes(nodes, ext);
   explain.total_node_count = nodes.size();
+  return {};
+}
 
 struct TargetGenerationState {
   std::string output;
@@ -4303,11 +6489,7 @@ static SubStageResponse dispatchTargetGenerator(
   switch (hash_(target)) {
   case "clash"_hash:
   case "clashr"_hash:
-    writeLog(0,
-             argTarget == "clashr" ? "生成目标：ClashR" : "生成目标：Clash",
-             LOG_LEVEL_INFO);
-    tpl_args.local_vars["clash.new_field_name"] =
-        ext.clash_new_field_name ? "true" : "false";
+    writeLog(LOG_LEVEL_INFO, target == "clashr" ? "生成目标：ClashR" : "生成目标：Clash");
     response.headers["profile-update-interval"] =
         std::to_string(policy.update_interval / 3600);
     if (ext.nodelist) {
@@ -4332,10 +6514,7 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "surge"_hash:
-
-    writeLog(0, "生成目标：Surge " + std::to_string(intSurgeVer),
-             LOG_LEVEL_INFO);
-
+    writeLog(LOG_LEVEL_INFO, "生成目标：Surge " + std::to_string(parsed.surge_version));
     if (ext.nodelist) {
       output = proxyToSurge(nodes, base_content, dummy_ruleset, dummy_group,
                             parsed.surge_version, ext, max_output_bytes);
@@ -4411,12 +6590,8 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "surfboard"_hash:
-    writeLog(0, "生成目标：Surfboard", LOG_LEVEL_INFO);
-
-    if (render_template(fetchFile(lSurfboardBase, proxy, global.cacheConfig,
-                                  true, baseFetchContext),
-                        tpl_args, base_content, global.templatePath,
-                        baseFetchContext) != 0) {
+    writeLog(LOG_LEVEL_INFO, "生成目标：Surfboard");
+    if (renderBase(policy.surfboard_base) != 0) {
       *status_code = 400;
       return {true, base_content};
     }
@@ -4516,12 +6691,8 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "mellow"_hash:
-    writeLog(0, "生成目标：Mellow", LOG_LEVEL_INFO);
-
-    if (render_template(fetchFile(lMellowBase, proxy, global.cacheConfig, true,
-                                  baseFetchContext),
-                        tpl_args, base_content, global.templatePath,
-                        baseFetchContext) != 0) {
+    writeLog(LOG_LEVEL_INFO, "生成目标：Mellow");
+    if (renderBase(policy.mellow_base) != 0) {
       *status_code = 400;
       return {true, base_content};
     }
@@ -4532,12 +6703,8 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "sssub"_hash:
-    writeLog(0, "生成目标：SS Subscription", LOG_LEVEL_INFO);
-
-    if (render_template(fetchFile(lSSSubBase, proxy, global.cacheConfig, true,
-                                  baseFetchContext),
-                        tpl_args, base_content, global.templatePath,
-                        baseFetchContext) != 0) {
+    writeLog(LOG_LEVEL_INFO, "生成目标：SS Subscription");
+    if (renderBase(policy.sssub_base) != 0) {
       *status_code = 400;
       return {true, base_content};
     }
@@ -4547,50 +6714,80 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "ss"_hash:
-    writeLog(0, "生成目标：SS", LOG_LEVEL_INFO);
-    output_content = proxyToSingle(nodes, 1, ext);
-    if (argUpload)
-      uploadGist("ss", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：SS");
+    output = proxyToSingle(nodes, parsed.target_descriptor->single_link_types,
+                           ext, max_output_bytes);
+    if (upload)
+      recordUpload("ss", upload_path, output, false);
     break;
   case "ssr"_hash:
-    writeLog(0, "生成目标：SSR", LOG_LEVEL_INFO);
-    output_content = proxyToSingle(nodes, 2, ext);
-    if (argUpload)
-      uploadGist("ssr", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：SSR");
+    output = proxyToSingle(nodes, parsed.target_descriptor->single_link_types,
+                           ext, max_output_bytes);
+    if (upload)
+      recordUpload("ssr", upload_path, output, false);
     break;
   case "v2ray"_hash:
-    writeLog(0, "生成目标：v2rayN", LOG_LEVEL_INFO);
-    output_content = proxyToSingle(nodes, 4, ext);
-    if (argUpload)
-      uploadGist("v2ray", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：Legacy VMess Subscription");
+    output = proxyToSingle(nodes, parsed.target_descriptor->single_link_types,
+                           ext, max_output_bytes);
+    if (upload)
+      recordUpload("v2ray", upload_path, output, false);
+    break;
+  case "v2rayn"_hash:
+    writeLog(LOG_LEVEL_INFO, "生成目标：v2rayN");
+    output = proxyToV2RayClient(nodes, V2RayClientTarget::V2RayN, ext,
+                                max_output_bytes);
+    if (upload)
+      recordUpload("v2rayn", upload_path, output, false);
+    break;
+  case "v2rayng"_hash:
+    writeLog(LOG_LEVEL_INFO, "生成目标：v2rayNG");
+    output = proxyToV2RayClient(nodes, V2RayClientTarget::V2RayNG, ext,
+                                max_output_bytes);
+    if (upload)
+      recordUpload("v2rayng", upload_path, output, false);
+    break;
+  case "shadowrocket"_hash:
+    writeLog(LOG_LEVEL_INFO, "生成目标：Shadowrocket");
+    output = proxyToShadowrocket(nodes, ext, max_output_bytes);
+    if (upload)
+      // Shadowrocket UA requests historically resolved to mixed and updated
+      // the default Gist path "sub". Preserve that path for smooth upgrades.
+      recordUpload(parsed.target_was_auto ? "sub" : "shadowrocket", upload_path,
+                   output, false);
     break;
   case "trojan"_hash:
-    writeLog(0, "生成目标：Trojan", LOG_LEVEL_INFO);
-    output_content = proxyToSingle(nodes, 8, ext);
-    if (argUpload)
-      uploadGist("trojan", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：Trojan");
+    output = proxyToSingle(nodes, parsed.target_descriptor->single_link_types,
+                           ext, max_output_bytes);
+    if (upload)
+      recordUpload("trojan", upload_path, output, false);
     break;
   case "vless"_hash:
-    writeLog(0, "生成目标：vless", LOG_LEVEL_INFO);
-    output_content = proxyToSingle(nodes, 16, ext);
-    if (argUpload)
-      uploadGist("vless", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：vless");
+    output = proxyToSingle(nodes, parsed.target_descriptor->single_link_types,
+                           ext, max_output_bytes);
+    if (upload)
+      recordUpload("vless", upload_path, output, false);
     break;
   case "hysteria2"_hash:
-    writeLog(0, "生成目标：hysteria2", LOG_LEVEL_INFO);
-    output_content = proxyToSingle(nodes, 32, ext);
-    if (argUpload)
-      uploadGist("hysteria2", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：hysteria2");
+    output = proxyToSingle(nodes, parsed.target_descriptor->single_link_types,
+                           ext, max_output_bytes);
+    if (upload)
+      recordUpload("hysteria2", upload_path, output, false);
     break;
   case "mixed"_hash:
-    writeLog(0, "生成目标：Standard Subscription", LOG_LEVEL_INFO);
-    output_content = proxyToSingle(nodes, 63, ext);
-    if (argUpload)
-      uploadGist("sub", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：Standard Subscription");
+    output = proxyToSingle(nodes, parsed.target_descriptor->single_link_types,
+                           ext, max_output_bytes);
+    if (upload)
+      recordUpload("sub", upload_path, output, false);
     break;
 
   case "quan"_hash:
-    writeLog(0, "生成目标：Quantumult", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "生成目标：Quantumult");
     if (!ext.nodelist) {
       if (renderBase(policy.quan_base) != 0) {
         *status_code = 400;
@@ -4604,7 +6801,7 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "quanx"_hash:
-    writeLog(0, "生成目标：Quantumult X", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "生成目标：Quantumult X");
     if (!ext.nodelist) {
       if (renderBase(policy.quanx_base) != 0) {
         *status_code = 400;
@@ -4618,7 +6815,7 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "loon"_hash:
-    writeLog(0, "生成目标：Loon", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "生成目标：Loon");
     if (!ext.nodelist) {
       if (renderBase(policy.loon_base) != 0) {
         *status_code = 400;
@@ -4664,14 +6861,15 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   case "ssd"_hash:
-    writeLog(0, "生成目标：SSD", LOG_LEVEL_INFO);
-    output_content = proxyToSSD(nodes, argGroupName, subInfo, ext);
-    if (argUpload)
-      uploadGist("ssd", argUploadPath, output_content, false);
+    writeLog(LOG_LEVEL_INFO, "生成目标：SSD");
+    output = proxyToSSD(nodes, group_name, subscription_info, ext,
+                        max_output_bytes);
+    if (upload)
+      recordUpload("ssd", upload_path, output, false);
     break;
 
   case "singbox"_hash:
-    writeLog(0, "生成目标：sing-box", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "生成目标：sing-box");
     if (!ext.nodelist) {
       if (renderBase(policy.singbox_base) != 0) {
         *status_code = 400;
@@ -4686,7 +6884,7 @@ static SubStageResponse dispatchTargetGenerator(
     break;
 
   default:
-    writeLog(0, "生成目标：未指定", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "生成目标：未指定");
     *status_code = 500;
     return {true,
             "Internal error: target passed validation but no generator handled "
@@ -5147,291 +7345,6 @@ static std::string assembleSubResponse(
     std::string().swap(output_content);
     response.content_type = "application/json; charset=utf-8";
     return serializeSubExplainReport(explain, response, max_output_bytes);
-  }
-  writeLog(0, "生成完成。", LOG_LEVEL_INFO);
-  if (argTarget == "clash" && explain.proxy_provider_mode)
-    appendVaryHeader(response, "User-Agent");
-  for (const auto &[name, value] : provider_headers) {
-    (void)value;
-    appendVaryHeader(response, name);
-  }
-
-  if (explainMode) {
-    auto hasArg = [&](const std::string &name) {
-      return argument.find(name) != argument.end();
-    };
-    auto rawArg = [&](const std::string &name) {
-      return getUrlArg(argument, name);
-    };
-    auto addParameter = [&](const std::string &name,
-                            const std::string &effective_value,
-                            const std::string &status,
-                            const std::string &note,
-                            bool sensitive = false,
-                            const std::string &source = "request") {
-      if (!hasArg(name))
-        return;
-      std::string raw_value = rawArg(name);
-      std::string decoded_value = urlDecode(raw_value);
-      SubExplainParameter parameter;
-      parameter.name = name;
-      parameter.present = true;
-      parameter.source = source;
-      parameter.status = status;
-      parameter.value_preview = previewExplainValue(raw_value, sensitive);
-      parameter.value_hash = shortHash(decoded_value);
-      parameter.raw_length = raw_value.size();
-      parameter.value_length = decoded_value.size();
-      parameter.effective_value = effective_value;
-      parameter.note = note;
-      parameter.sensitive = sensitive;
-      explain.recognized_parameters.push_back(std::move(parameter));
-    };
-    auto addSwitchParameter = [&](const std::string &name, bool effective_value,
-                                  const tribool &arg_value,
-                                  const std::string &note = "") {
-      addParameter(name, boolString(effective_value),
-                   arg_value.is_undef() ? "defaulted" : "applied", note);
-    };
-    auto addConfigSection = [&](const std::string &name,
-                                const std::string &source,
-                                const std::string &status,
-                                const std::string &detail) {
-      SubExplainConfigSection section;
-      section.name = name;
-      section.source = source;
-      section.status = status;
-      section.detail = detail;
-      explain.effective_config_sections.push_back(std::move(section));
-    };
-
-    addParameter("target", argTarget,
-                 explain.requested_target != argTarget ? "resolved" : "applied",
-                 explain.requested_target != argTarget
-                     ? "target=auto was resolved from the User-Agent"
-                     : "");
-    addParameter("url",
-                 std::to_string(explain.raw_url_count) +
-                     " source item(s), " +
-                     std::to_string(explain.subscription_url_count) +
-                     " subscription(s), " +
-                     std::to_string(explain.node_link_count) + " node link(s)",
-                 "applied",
-                 "Sensitive values are redacted; use hash and length to "
-                 "compare inputs.",
-                 true);
-    addParameter("explain", "true", "applied",
-                 "The request returned a JSON diagnostic report.");
-    addParameter("ver", std::to_string(intSurgeVer), "applied",
-                 "Surge-compatible target version.");
-    addParameter("new_name", boolString(ext.clash_new_field_name),
-                 argClashNewField.is_undef() ||
-                         argClashNewField.get(false) == ext.clash_new_field_name
-                     ? "applied"
-                     : "overridden",
-                 "Mihomo-compatible field names are forced for Clash output.");
-    addParameter("group", argGroupName,
-                 argGroupName.empty() ? "ignored" : "applied",
-                 "Overrides the group name on direct nodes.");
-    addParameter("upload_path", argUploadPath,
-                 argUpload ? "applied" : "ignored",
-                 "Only used when upload is effective.", true);
-    addParameter("include", argIncludeRemark,
-                 !argIncludeRemark.empty() && regValid(argIncludeRemark)
-                     ? "applied"
-                     : "ignored",
-                 "Used as node/provider include filter when valid.");
-    addParameter("exclude", argExcludeRemark,
-                 !argExcludeRemark.empty() && regValid(argExcludeRemark)
-                     ? "applied"
-                     : "ignored",
-                 "Used as node/provider exclude filter when valid.");
-    addParameter("groups", std::to_string(lCustomProxyGroups.size()) +
-                              " custom group(s)",
-                 configLoadSuccess ? "ignored" : "applied",
-                 configLoadSuccess
-                     ? "External config loaded; request groups were not used."
-                     : "Decoded from URL-safe base64.");
-    addParameter("ruleset", std::to_string(lRulesetContent.size()) +
-                                " loaded ruleset(s)",
-                 configLoadSuccess ? "ignored" : "applied",
-                 configLoadSuccess
-                     ? "External config loaded; request rulesets were not used."
-                     : "Decoded from URL-safe base64.");
-    std::string config_effective = explain.external_config_loaded
-                                       ? "loaded"
-                                       : "not loaded";
-    if (explain.fallback_config_used)
-      config_effective = "fallback loaded";
-    addParameter("config", config_effective,
-                 explain.external_config_loaded ? "applied" : "ignored",
-                 explain.fallback_config_used
-                     ? "User config failed and a fallback config was loaded."
-                     : "External config URL or data source.",
-                 true);
-    addParameter("dev_id", ext.quanx_dev_id,
-                 ext.quanx_dev_id.empty() ? "ignored" : "applied",
-                 "Quantumult X device id.");
-    addParameter("filename", argFilename, "ignored",
-                 "Content-Disposition is not emitted for explain JSON.");
-    addParameter("interval", std::to_string(interval), "applied",
-                 "Effective update interval in seconds.");
-    addParameter("strict", boolString(strict), "applied",
-                 "Managed config strict flag.");
-    addParameter("rename", std::to_string(ext.rename_array.size()) +
-                               " rename rule(s)",
-                 argRenames.empty() ? "ignored" : "applied",
-                 "Request rename rules override configured rename rules.");
-    addParameter("filter_script",
-                 authorized && !argFilterScript.empty() ? "script accepted"
-                                                        : "not used",
-                 authorized ? "applied" : "ignored",
-                  "Public requests cannot provide executable filter scripts.",
-                  true);
-    addParameter("provider_headers",
-                 std::to_string(provider_headers.size()) +
-                     " explicitly selected header(s)",
-                 provider_headers.empty() ? "ignored" : "applied",
-                 "Only named, present, non-reserved request headers are "
-                 "copied into generated proxy-providers.");
-    addParameter("upload", boolString(argUpload), explain.upload_suppressed
-                                                    ? "suppressed"
-                                                    : "applied",
-                 explain.upload_suppressed
-                     ? "Uploads are disabled in explain mode."
-                     : "");
-    addParameter("emoji", boolString(ext.add_emoji), "applied",
-                 "Sets add_emoji and remove_emoji together.");
-    addSwitchParameter("add_emoji", ext.add_emoji, argAddEmoji);
-    addSwitchParameter("remove_emoji", ext.remove_emoji, argRemoveEmoji);
-    addSwitchParameter("append_type", ext.append_proxy_type, argAppendType);
-    addSwitchParameter("tfo", ext.tfo.get(false), ext.tfo);
-    addSwitchParameter("udp", ext.udp.get(false), ext.udp);
-    addParameter("list", boolString(ext.nodelist), "applied",
-                 ext.nodelist
-                     ? "Explicit node-list mode expands subscription sources."
-                     : "Clash-compatible output defaults to provider mode.");
-    addSwitchParameter("sort", ext.sort_flag, argSort);
-    addParameter("sort_script",
-                 argUseSortScript ? "enabled" : "disabled",
-                 argUseSortScript ? "applied" : "ignored",
-                 "Uses configured sort script when sorting is enabled.");
-    addSwitchParameter("script", ext.clash_script, argGenClashScript);
-    addSwitchParameter("insert", argEnableInsert.get(global.enableInsert),
-                       argEnableInsert);
-    addSwitchParameter("scv", ext.skip_cert_verify.get(false),
-                       ext.skip_cert_verify);
-    addSwitchParameter("fdn", ext.filter_deprecated, argFilterDeprecated);
-    addSwitchParameter("expand", explain.expand_rulesets, argExpandRulesets);
-    addSwitchParameter("append_info",
-                       argAppendUserinfo.get(global.appendUserinfo),
-                       argAppendUserinfo);
-    addSwitchParameter("prepend", argPrependInsert.get(global.prependInsert),
-                       argPrependInsert);
-    addSwitchParameter("classic", ext.clash_classical_ruleset,
-                       argGenClassicalRuleProvider);
-    addSwitchParameter("tls13", ext.tls13.get(false), ext.tls13);
-    addSwitchParameter("provider_proxy_direct", ext.provider_proxy_direct,
-                       argProviderProxyDirect);
-    addParameter("profile_data", managed_url.empty() ? "not used" : "provided",
-                 managed_url.empty() ? "ignored" : "applied",
-                 "Managed config URL override.", true);
-
-    const std::unordered_set<std::string> known_parameters = {
-        "target", "url", "ver", "new_name", "group", "upload_path",
-        "include", "exclude", "groups", "ruleset", "config", "dev_id",
-        "filename", "interval", "strict", "rename", "filter_script",
-        "upload", "emoji", "add_emoji", "remove_emoji", "append_type",
-        "tfo", "udp", "list", "sort", "sort_script", "script", "insert",
-        "scv", "fdn", "expand", "append_info", "prepend", "classic",
-        "tls13", "provider_proxy_direct", "provider_headers", "explain",
-        "profile_data", "token"};
-    for (const auto &arg : argument) {
-      if (known_parameters.find(arg.first) != known_parameters.end())
-        continue;
-      std::string decoded_value = urlDecode(arg.second);
-      SubExplainParameter parameter;
-      parameter.name = arg.first;
-      parameter.present = true;
-      parameter.source = "request";
-      parameter.status = "ignored";
-      parameter.value_preview = previewExplainValue(arg.second, false);
-      parameter.value_hash = shortHash(decoded_value);
-      parameter.raw_length = arg.second.size();
-      parameter.value_length = decoded_value.size();
-      parameter.effective_value = "";
-      parameter.note = "This parameter is not recognized by /sub.";
-      parameter.sensitive = false;
-      explain.unrecognized_parameters.push_back(std::move(parameter));
-    }
-
-    if (explain.fallback_config_used)
-      explain.effective_config_source = "fallback";
-    else if (explain.external_config_loaded && userProvidedExternalConfig)
-      explain.effective_config_source = "request";
-    else if (explain.external_config_loaded && !global.defaultExtConfig.empty())
-      explain.effective_config_source = "default";
-    else if (userProvidedExternalConfig)
-      explain.effective_config_source = "request_failed";
-    else
-      explain.effective_config_source = "none";
-
-    if (explain.external_config_provided || explain.external_config_loaded) {
-      addConfigSection("external_config", explain.effective_config_source,
-                       explain.external_config_loaded ? "loaded" : "not_loaded",
-                       explain.fallback_config_used
-                           ? "Fallback config was used."
-                           : (userProvidedExternalConfig
-                                  ? "User-provided config was evaluated."
-                                  : "Default external config was evaluated."));
-    }
-    addConfigSection("base_template", explain.base_fetch_context, "selected",
-                     "Base template fetch context for target " + argTarget +
-                         ".");
-    if (explain.rule_generator_enabled)
-      addConfigSection("rulesets", explain.ruleset_fetch_context, "loaded",
-                       std::to_string(explain.ruleset_count) +
-                           " ruleset(s).");
-    if (explain.custom_group_count)
-      addConfigSection("custom_groups", "effective", "loaded",
-                       std::to_string(explain.custom_group_count) +
-                           " custom group(s).");
-    if (!ext.rename_array.empty())
-      addConfigSection("rename", argRenames.empty() ? "configured" : "request",
-                       "loaded",
-                       std::to_string(ext.rename_array.size()) +
-                           " rename rule(s).");
-    if (!ext.emoji_array.empty())
-      addConfigSection("emoji", "configured", "loaded",
-                       std::to_string(ext.emoji_array.size()) +
-                           " emoji rule(s).");
-    if (!lIncludeRemarks.empty() || !lExcludeRemarks.empty())
-      addConfigSection("filters", "effective", "loaded",
-                       std::to_string(lIncludeRemarks.size()) +
-                           " include filter(s), " +
-                           std::to_string(lExcludeRemarks.size()) +
-                           " exclude filter(s).");
-    if (explain.provider_count)
-      addConfigSection("proxy_providers", "request", "generated",
-                       std::to_string(explain.provider_count) +
-                           " provider(s).");
-    if (explain.managed_config)
-      addConfigSection("managed_config", "global", "enabled",
-                       "Managed config prefix is available.");
-
-    explain.output_bytes = output_content.size();
-    writeLog(0,
-             "已生成 /sub explain JSON 诊断结果：target=" + argTarget +
-                 ", status=" + std::to_string(response.status_code) +
-                 ", providers=" + std::to_string(explain.provider_count) +
-                 ", nodes=" + std::to_string(explain.total_node_count) +
-                 ", recognized_params=" +
-                 std::to_string(explain.recognized_parameters.size()) +
-                 ", unrecognized_params=" +
-                 std::to_string(explain.unrecognized_parameters.size()) + "。",
-             LOG_LEVEL_INFO);
-    response.content_type = "application/json; charset=utf-8";
-    return serializeSubExplainReport(explain, response);
   }
   if (!argFilename.empty())
     response.headers.emplace("Content-Disposition",
@@ -7120,10 +9033,9 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
            "parameter.\n"
            "请在 link 参数中提供真实 Surge 配置链接。";
   }
-  writeLog(0, "SurgeConfToClash 调用，URL：'" + url + "'。",
-           LOG_LEVEL_INFO);
+  writeLog(LOG_LEVEL_INFO, "SurgeConfToClash 调用，URL：" + summarizeUrlForLog(url) + "。");
 
-  ProxyPolicy proxy = parseProxy(global.proxyConfig);
+  ProxyPolicy proxy = parseProxy(global.proxyConfig, global.proxyBypass);
   YAML::Node clash;
   template_args tpl_args;
   tpl_args.global_vars = global.templateVars;
@@ -7147,8 +9059,8 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
                                "configuration.\n"
                                "无效请求：Surge 配置解析失败。";
     // std::cerr<<errmsg<<"\n";
-    writeLog(0, "Surge 配置解析失败。原因：" + ini.get_last_error(),
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "SURGE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(parser_detail));
     *status_code = 400;
     return errmsg;
   }
@@ -7160,8 +9072,7 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
         "Required sections: [Proxy], [Proxy Group], and [Rule].\n"
         "必须包含以下配置段：[Proxy]、[Proxy Group] 和 [Rule]。";
     // std::cerr<<errmsg<<"\n";
-    writeLog(0, "Surge 配置不完整，缺少必需配置段。",
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "Surge 配置不完整，缺少必需配置段。");
     *status_code = 400;
     return errmsg;
   }
@@ -7216,12 +9127,11 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
   parse_set.sub_info = &subInfo;
   for (std::string &x : links) {
     // std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-    writeLog(0, "正在从 URL 获取节点数据：'" + x + "'。", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "正在从 URL 获取节点数据：" + summarizeUrlForLog(x) + "。");
     if (addNodes(x, nodes, 0, parse_set) == -1) {
       if (global.skipFailedLinks)
-        writeLog(0,
-                 "以下链接不包含任何有效节点信息：" + x,
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING,
+                 "以下链接不包含任何有效节点信息：" + x);
       else {
         *status_code = 400;
         return "Invalid request: this link does not contain any supported "
@@ -7336,8 +9246,8 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
 
   response.headers["profile-update-interval"] =
       std::to_string(global.updateInterval / 3600);
-  writeLog(0, "转换完成。", LOG_LEVEL_INFO);
-  return YAML::Dump(clash);
+  writeLog(LOG_LEVEL_INFO, "转换完成。");
+  return dumpCanonicalClashYaml(clash);
 }
 
 std::string getProfile(RESPONSE_CALLBACK_ARGS) {
@@ -7369,25 +9279,25 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
            name;
   }
   // std::cerr<<"Trying to load profile '" + name + "'.\n";
-  writeLog(0, "正在加载配置档：'" + name + "'。", LOG_LEVEL_INFO);
+  writeLog(LOG_LEVEL_INFO, "正在加载配置档：'" + name + "'。");
   INIReader ini;
   if (ini.parse(profile_content) != INIREADER_EXCEPTION_NONE &&
       !ini.section_exist("Profile")) {
     // std::cerr<<"Load profile failed! Reason: "<<ini.get_last_error()<<"\n";
-    writeLog(0, "加载配置档失败！原因：" + ini.get_last_error(),
-             LOG_LEVEL_ERROR);
+    const std::string parser_detail = ini.get_last_error();
+    writeLog(LOG_LEVEL_ERROR, "PROFILE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(parser_detail));
     *status_code = 500;
     return "Invalid profile: failed to parse profile content.\n"
            "无效配置：profile 内容解析失败。";
   }
   // std::cerr<<"Trying to parse profile '" + name + "'.\n";
-  writeLog(0, "正在解析配置档：'" + name + "'。", LOG_LEVEL_INFO);
+  writeLog(LOG_LEVEL_INFO, "正在解析配置档：'" + name + "'。");
   string_multimap contents;
   ini.get_items("Profile", contents);
   if (contents.empty()) {
     // std::cerr<<"Load profile failed! Reason: Empty Profile section\n";
-    writeLog(0, "加载配置档失败！原因：[Profile] 配置段为空。",
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "加载配置档失败！原因：[Profile] 配置段为空。");
     *status_code = 500;
     return "Invalid profile: [Profile] section is empty.\n"
            "无效配置：[Profile] 配置段为空。\n"
@@ -7401,8 +9311,7 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
   // }
   /// check if more than one profile is provided
   if (profiles.size() > 1) {
-    writeLog(0, "检测到多个配置档，正在合并...",
-             LOG_TYPE_INFO);
+    writeLog(LOG_LEVEL_INFO, "检测到多个配置档，正在合并...");
     std::string all_urls, url;
     auto iter = contents.find("url");
     if (iter != contents.end())
@@ -7410,23 +9319,20 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
     for (size_t i = 1; i < profiles.size(); i++) {
       name = profiles[i];
       if (!fileExist(name)) {
-        writeLog(0, "忽略不存在的配置档：'" + name + "'。",
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING, "忽略不存在的配置档：'" + name + "'。");
         continue;
       }
       if (ini.parse_file(name) != INIREADER_EXCEPTION_NONE &&
           !ini.section_exist("Profile")) {
-        writeLog(0, "忽略损坏的配置档：'" + name + "'。",
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING, "忽略损坏的配置档：'" + name + "'。");
         continue;
       }
       url = ini.get("Profile", "url");
       if (!url.empty()) {
         all_urls += "|" + url;
-        writeLog(0, "已添加来自配置档 '" + name + "' 的 URL。", LOG_LEVEL_INFO);
+        writeLog(LOG_LEVEL_INFO, "已添加来自配置档 '" + name + "' 的 URL。");
       } else {
-        writeLog(0, "配置档 '" + name + "' 没有 url 字段，跳过。",
-                 LOG_LEVEL_INFO);
+        writeLog(LOG_LEVEL_INFO, "配置档 '" + name + "' 没有 url 字段，跳过。");
       }
     }
     iter->second = all_urls;
@@ -7445,9 +9351,9 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
 /*
 std::string jinja2_webGet(const std::string &url)
 {
-    ProxyPolicy proxy = parseProxy(global.proxyConfig);
-    writeLog(0, "模板调用 fetch，URL：'" + url + "'。",
-LOG_LEVEL_INFO); return webGet(url, proxy, global.cacheConfig);
+    ProxyPolicy proxy = parseProxy(global.proxyConfig, global.proxyBypass);
+    writeLog(LOG_LEVEL_INFO, "模板调用 fetch，URL：'" + url + "'。");
+    return webGet(url, proxy, global.cacheConfig);
 }*/
 
 inline std::string intToStream(unsigned long long stream) {
@@ -7496,11 +9402,11 @@ std::string subInfoToMessage(std::string subinfo) {
 
 int simpleGenerator() {
   // std::cerr<<"\nReading generator configuration...\n";
-  writeLog(0, "正在读取生成器配置...", LOG_LEVEL_INFO);
+  writeLog(LOG_LEVEL_INFO, "正在读取生成器配置...");
   std::string config = fileGet("generate.ini"), path, profile, content;
   if (config.empty()) {
     // std::cerr<<"Generator configuration not found or empty!\n";
-    writeLog(0, "未找到生成器配置，或配置为空！", LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "未找到生成器配置，或配置为空！");
     return -1;
   }
 
@@ -7508,21 +9414,19 @@ int simpleGenerator() {
   if (ini.parse(config) != INIREADER_EXCEPTION_NONE) {
     // std::cerr<<"Generator configuration broken!
     // Reason:"<<ini.get_last_error()<<"\n";
-    writeLog(0,
-             "生成器配置损坏！原因：" + ini.get_last_error(),
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "GENERATOR_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(ini.get_last_error()));
     return -2;
   }
   // std::cerr<<"Read generator configuration completed.\n\n";
-  writeLog(0, "生成器配置读取完成。\n", LOG_LEVEL_INFO);
+  writeLog(LOG_LEVEL_INFO, "生成器配置读取完成。\n");
 
   string_array sections = ini.get_section_names();
   if (!global.generateProfiles.empty()) {
     // std::cerr<<"Generating with specific artifacts:
     // \""<<gen_profile<<"\"...\n";
-    writeLog(0,
-             "正在按指定生成项生成：\"" + global.generateProfiles + "\"...",
-             LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO,
+             "正在按指定生成项生成：\"" + global.generateProfiles + "\"...");
     string_array targets = split(global.generateProfiles, ","), new_targets;
     for (std::string &x : targets) {
       x = trim(x);
@@ -7530,8 +9434,7 @@ int simpleGenerator() {
         new_targets.emplace_back(std::move(x));
       else {
         // std::cerr<<"Artifact \""<<x<<"\" not found in generator settings!\n";
-        writeLog(0, "生成器设置中未找到生成项：\"" + x + "\"！",
-                 LOG_LEVEL_ERROR);
+        writeLog(LOG_LEVEL_ERROR, "生成器设置中未找到生成项：\"" + x + "\"！");
         return -3;
       }
     }
@@ -7539,24 +9442,23 @@ int simpleGenerator() {
     sections.shrink_to_fit();
   } else
     // std::cerr<<"Generating all artifacts...\n";
-    writeLog(0, "正在生成所有生成项...", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "正在生成所有生成项...");
 
   string_multimap allItems;
-  ProxyPolicy proxy = parseProxy(global.proxySubscription);
+  ProxyPolicy proxy = parseProxy(global.proxySubscription, global.proxyBypass);
   Request request;
   Response response;
   bool write_failed = false;
   for (std::string &x : sections) {
     response.status_code = 200;
     // std::cerr<<"Generating artifact '"<<x<<"'...\n";
-    writeLog(0, "正在生成生成项：'" + x + "'。", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "正在生成生成项：'" + x + "'。");
     ini.enter_section(x);
     if (ini.item_exist("path"))
       path = ini.get("path");
     else {
       // std::cerr<<"Artifact '"<<x<<"' output path missing! Skipping...\n\n";
-      writeLog(0, "生成项 '" + x + "' 缺少输出路径，跳过。\n",
-               LOG_LEVEL_ERROR);
+      writeLog(LOG_LEVEL_ERROR, "生成项 '" + x + "' 缺少输出路径，跳过。\n");
       continue;
     }
     if (ini.item_exist("profile")) {
@@ -7572,9 +9474,8 @@ int simpleGenerator() {
         if (content.empty()) {
           // std::cerr<<"Artifact '"<<x<<"' generate ERROR! Please check your
           // link.\n\n";
-          writeLog(0,
-                   "生成项 '" + x + "' 生成失败！请检查链接。\n",
-                   LOG_LEVEL_ERROR);
+          writeLog(LOG_LEVEL_ERROR,
+                   "生成项 '" + x + "' 生成失败！请检查链接。\n");
           if (sections.size() == 1)
             return -1;
         }
@@ -7610,9 +9511,8 @@ int simpleGenerator() {
     if (response.status_code != 200) {
       // std::cerr<<"Artifact '"<<x<<"' generate ERROR! Reason:
       // "<<content<<"\n\n";
-      writeLog(0,
-               "生成项 '" + x + "' 生成失败！原因：" + content + "\n",
-               LOG_LEVEL_ERROR);
+      writeLog(LOG_LEVEL_ERROR,
+               "生成项 '" + x + "' 生成失败！原因：" + content + "\n");
       if (sections.size() == 1)
         return -1;
       continue;
@@ -7639,15 +9539,18 @@ int simpleGenerator() {
         std::find_if(response.headers.begin(), response.headers.end(),
                      [](auto y) { return y.first == "Subscription-UserInfo"; });
     if (iter != response.headers.end())
-      writeLog(0,
-               "生成项 '" + x + "' 的用户信息：" + subInfoToMessage(iter->second),
-               LOG_LEVEL_INFO);
+      writeLog(LOG_LEVEL_INFO,
+               "生成项 '" + x + "' 的用户信息：" + subInfoToMessage(iter->second));
     // std::cerr<<"Artifact '"<<x<<"' generate SUCCESS!\n\n";
-    writeLog(0, "生成项 '" + x + "' 生成成功！\n", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "生成项 '" + x + "' 生成成功！\n");
     eraseElements(response.headers);
   }
   // std::cerr<<"All artifact generated. Exiting...\n";
-  writeLog(0, "所有生成项已生成，正在退出...", LOG_LEVEL_INFO);
+  if (write_failed) {
+    writeLog(LOG_LEVEL_ERROR, "部分生成项写入失败，正在以失败状态退出...");
+    return -1;
+  }
+  writeLog(LOG_LEVEL_INFO, "所有生成项已生成，正在退出...");
   return 0;
 }
 
@@ -7656,7 +9559,7 @@ std::string renderTemplate(RESPONSE_CALLBACK_ARGS) {
   int *status_code = &response.status_code;
 
   std::string path = getUrlArg(argument, "path");
-  writeLog(0, "正在渲染模板：'" + path + "'。", LOG_LEVEL_INFO);
+  writeLog(LOG_LEVEL_INFO, "正在渲染模板：'" + path + "'。");
 
   if (!startsWith(path, global.templatePath) || !fileExist(path)) {
     *status_code = 404;
@@ -7690,9 +9593,9 @@ std::string renderTemplate(RESPONSE_CALLBACK_ARGS) {
   if (render_template(template_content, tpl_args, output_content,
                       global.templatePath) != 0) {
     *status_code = 400;
-    writeLog(0, "渲染失败。", LOG_LEVEL_WARNING);
+    writeLog(LOG_LEVEL_WARNING, "渲染失败。");
   } else
-    writeLog(0, "渲染完成。", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "渲染完成。");
 
   return output_content;
 }

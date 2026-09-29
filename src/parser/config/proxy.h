@@ -205,10 +205,16 @@ struct Proxy {
   String MieruTrafficPattern;
   tribool V2rayHttpUpgrade;
 
-  // Store raw params from mihomo parser for generic pass-through
-  std::map<String, String> RawParams;
-  // JSON-encoded values preserve Mihomo scalar and nested YAML types.
-  std::map<String, String> RawParamJson;
+  // Recognized Xray share-link options that do not yet have a portable field
+  // in every legacy target generator. They are kept as decoded key/value
+  // pairs so single-link targets can round-trip the official URI without
+  // coupling the generic proxy model to every Xray release.
+  std::vector<std::pair<String, String>> XrayLinkOptions;
+
+  // Complete type-preserving mapping returned by Mihomo. Clash output treats
+  // this JSON document as the canonical representation; the fields above are
+  // a compatibility projection for legacy target generators and scripts.
+  String CanonicalProxyJson;
 };
 
 #define SS_DEFAULT_GROUP "SSProvider"

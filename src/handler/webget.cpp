@@ -18,6 +18,8 @@
 #include <vector>
 #include <atomic>
 #include <cctype>
+#include <climits>
+#include <cstdio>
 #include <cstdint>
 
 #include <curl/curl.h>
@@ -39,6 +41,8 @@
 #include "utils/lock.h"
 #include "utils/logger.h"
 #include "utils/network.h"
+#include "utils/redact.h"
+#include "utils/resource_control.h"
 #include "utils/system.h"
 #include "utils/urlencode.h"
 #include "version.h"
@@ -853,14 +857,16 @@ static CURLcode curl_init()
     return init_result;
 }
 
-static std::string build_cache_key(const std::string &url, const ProxyPolicy &proxy,
+static std::string build_cache_key(const std::string &url,
+                                   const ResolvedProxyRoute &route,
                                    const string_icase_map *request_headers)
 {
-    if(proxy.mode == ProxyMode::Direct && (!request_headers || request_headers->empty()))
+    if(route.proxy.mode == ProxyMode::Direct &&
+       (!request_headers || request_headers->empty()))
         return getMD5(url);
 
     std::string identity = "url:" + std::to_string(url.size()) + ":" + url;
-    const std::string proxy_identity = proxy.cacheIdentity();
+    const std::string proxy_identity = route.cacheIdentity();
     identity += "\nproxy:" + std::to_string(proxy_identity.size()) + ":" + proxy_identity;
     identity += "\nheaders:";
     if(request_headers)
@@ -1114,45 +1120,15 @@ static bool is_blocked_hostname(const std::string &host)
     return false;
 }
 
-static std::string escape_log_value(const std::string &value)
-{
-    std::string escaped;
-    escaped.reserve(value.size());
-    static const char hex[] = "0123456789ABCDEF";
-    for(unsigned char ch : value)
-    {
-        if(ch < 0x20 || ch == 0x7F)
-        {
-            escaped += "\\x";
-            escaped += hex[ch >> 4];
-            escaped += hex[ch & 0x0F];
-        }
-        else
-            escaped.push_back(static_cast<char>(ch));
-    }
-    return escaped;
-}
-
-static bool has_control_character(const std::string &value)
-{
-    for(unsigned char ch : value)
-    {
-        if(std::iscntrl(ch))
-            return true;
-    }
-    return false;
-}
-
 bool isFetchUrlAllowed(const std::string &url, FetchContext context)
 {
     if(!isPublicFetchRestricted(context))
         return true;
     std::string checked_url = trimWhitespace(url, true, true);
-    std::string log_url = escape_log_value(checked_url);
+    std::string log_url = summarizeUrlForLog(checked_url);
     if(checked_url.empty() || checked_url != url || has_control_character(checked_url))
     {
-        writeLog(0, "已阻止公开请求获取格式异常的 URL：" + log_url,
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING, "已阻止公开请求获取格式异常的 URL：" + log_url);
         return false;
     }
 
@@ -1161,29 +1137,32 @@ bool isFetchUrlAllowed(const std::string &url, FetchContext context)
         return true;
     if(!startsWith(lower_url, "http://") && !startsWith(lower_url, "https://"))
     {
-        writeLog(0, "已阻止公开请求获取不支持协议的 URL：" + log_url,
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING, "已阻止公开请求获取不支持协议的 URL：" + log_url);
         return false;
     }
 
-    std::string parsed_url = checked_url, host, path;
-    int port = 0;
-    bool is_tls = false;
-    urlParse(parsed_url, host, path, port, is_tls);
-    host = normalize_fetch_host(host);
-    if(host.empty() || is_blocked_hostname(host) || is_blocked_ip_address(host))
+    const HttpUrlTarget target = parse_http_url_target(checked_url);
+    if(!target.valid)
     {
-        writeLog(0, "已阻止公开请求访问本地或私有主机：" + log_url,
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING,
+                 "已阻止公开请求获取格式异常的 HTTP(S) URL：" + log_url);
+        return false;
+    }
+
+    const std::string &host = target.host;
+    if(classify_loopback_host(host) != LoopbackKind::None ||
+       is_blocked_hostname(host) ||
+       is_blocked_ip_address(host))
+    {
+        writeLog(LOG_LEVEL_WARNING, "已阻止公开请求访问本地或私有主机：" + log_url);
         return false;
     }
 
     std::string resolved = hostnameToIPAddr(host);
     if(!resolved.empty() && is_blocked_ip_address(resolved, true))
     {
-        writeLog(0,
-                 "已阻止公开请求：目标主机解析到本地或私有地址：" + log_url,
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING,
+                 "已阻止公开请求：目标主机解析到本地或私有地址：" + log_url);
         return false;
     }
     return true;
@@ -1200,14 +1179,13 @@ static int public_fetch_prereq_callback(void *clientp, char *conn_primary_ip,
                                         int conn_primary_port,
                                         int conn_local_port)
 {
-    FetchContext *context = static_cast<FetchContext *>(clientp);
-    if(context && isPublicFetchRestricted(*context) && conn_primary_ip &&
+    auto *context = static_cast<curl_prereq_data *>(clientp);
+    if(context && context->restricted && conn_primary_ip &&
        is_blocked_ip_address(conn_primary_ip, true))
     {
-        writeLog(0,
+        writeLog(LOG_LEVEL_WARNING,
                  "已阻止公开请求连接本地或私有地址：" +
-                     std::string(conn_primary_ip),
-                 LOG_LEVEL_WARNING);
+                     std::string(conn_primary_ip));
         return CURL_PREREQFUNC_ABORT;
     }
     return CURL_PREREQFUNC_OK;
@@ -1438,11 +1416,28 @@ static inline void curl_set_common_options(CURL *curl_handle, const char *url,
     curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 20L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS,
+                     static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER,
-                     global.allowInsecureTls ? 0L : 1L);
+                     allow_insecure_tls ? 0L : 1L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST,
-                     global.allowInsecureTls ? 0L : 2L);
-    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 15L);
+                     allow_insecure_tls ? 0L : 2L);
+    long timeout_ms = 15000L;
+    if(data && data->deadline !=
+                   std::chrono::steady_clock::time_point::max())
+    {
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(data->deadline -
+                                      std::chrono::steady_clock::now());
+        timeout_ms = static_cast<long>(
+            std::clamp<int64_t>(remaining.count(), 1,
+                                static_cast<int64_t>(LONG_MAX)));
+    }
+    curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT_MS, timeout_ms);
     curl_easy_setopt(curl_handle, CURLOPT_COOKIEFILE, "");
     if(data)
     {
@@ -1454,15 +1449,13 @@ static inline void curl_set_common_options(CURL *curl_handle, const char *url,
 }
 
 static CURLcode apply_curl_proxy_policy(CURL *curl_handle,
-                                        const ProxyPolicy &requested,
-                                        std::string &url,
-                                        ProxyPolicy &effective)
+                                         const ResolvedProxyRoute &route,
+                                         std::string &url)
 {
-    effective = requested.resolved();
+    const ResolvedProxyPolicy &effective = route.proxy;
     if(!effective.valid)
     {
-        writeLog(0, "出站代理配置无效：" + effective.describe() + "。",
-                 LOG_LEVEL_ERROR);
+        writeLog(LOG_LEVEL_ERROR, "出站代理配置无效：" + effective.describe() + "。");
         return CURLE_URL_MALFORMAT;
     }
 
@@ -1479,14 +1472,23 @@ static CURLcode apply_curl_proxy_policy(CURL *curl_handle,
         else
             curl_easy_setopt(curl_handle, CURLOPT_PROXY,
                              effective.endpoint.c_str());
-        // Do not set CURLOPT_NOPROXY here: System intentionally preserves the
-        // platform's NO_PROXY/no_proxy behaviour.
+        if(route.no_proxy == NoProxyDirective::ForceProxy)
+            curl_easy_setopt(curl_handle, CURLOPT_NOPROXY, "");
+        else if(route.no_proxy == NoProxyDirective::InheritEnvironment)
+            // Apply the value captured with the proxy snapshot so the cache
+            // identity and actual transfer cannot observe different state.
+            curl_easy_setopt(curl_handle, CURLOPT_NOPROXY,
+                             route.inherited_no_proxy.c_str());
         break;
     case ProxyMode::Explicit:
         curl_easy_setopt(curl_handle, CURLOPT_PROXY, effective.endpoint.c_str());
-        // An explicitly configured proxy is fail-closed and must not be
-        // bypassed by an inherited NO_PROXY/no_proxy environment variable.
-        curl_easy_setopt(curl_handle, CURLOPT_NOPROXY, "");
+        if(route.no_proxy == NoProxyDirective::InitialBypass)
+            curl_easy_setopt(curl_handle, CURLOPT_NOPROXY,
+                             route.no_proxy_pattern.c_str());
+        else
+            // An explicitly configured proxy is fail-closed and must not be
+            // bypassed by an inherited NO_PROXY/no_proxy environment variable.
+            curl_easy_setopt(curl_handle, CURLOPT_NOPROXY, "");
         break;
     case ProxyMode::Cors:
         // cors: names an HTTP relay URL, not a libcurl network proxy.  Its
@@ -1497,8 +1499,17 @@ static CURLcode apply_curl_proxy_policy(CURL *curl_handle,
     }
 
     if(shouldLog(LOG_LEVEL_VERBOSE))
-        writeLog(0, "出站代理策略：" + effective.describe() + "。",
-                 LOG_LEVEL_VERBOSE);
+    {
+        std::string description = "出站代理策略：" + effective.describe();
+        if(effective.mode == ProxyMode::Explicit)
+            description += "；proxy_bypass：" +
+                           effective.bypass.describe();
+        if(route.no_proxy == NoProxyDirective::InitialBypass)
+            description += "；初始主机按 proxy_bypass 直连：" +
+                           route.bypass_host + "；匹配规则：" +
+                           route.bypass_rule;
+        writeLog(LOG_LEVEL_VERBOSE, description + "。");
+    }
     return CURLE_OK;
 }
 
@@ -1517,6 +1528,8 @@ static const char *classify_curl_error(CURLcode code)
     case CURLE_SSL_CONNECT_ERROR:
     case CURLE_PEER_FAILED_VERIFICATION:
         return "tls";
+    case CURLE_SSL_CACERT_BADFILE:
+        return "tls_trust_store";
     case CURLE_LOGIN_DENIED:
         return "authentication";
     default:
@@ -1543,6 +1556,1610 @@ static bool is_recoverable_curl_error(CURLcode code)
     default:
         return false;
     }
+}
+
+static bool performanceFetchMode(const ResourceControlSnapshot &resources)
+{
+    return (resources.effective_mode == "force_max" &&
+            resources.startup_budget_applied) ||
+           resources.effective_mode == "adaptive";
+}
+
+static std::chrono::milliseconds recoverableRetryDelay(
+    const std::string &url, uint8_t retry_attempt, uint64_t unique_seed,
+    bool performance_mode) noexcept
+{
+    if(!performance_mode)
+        return std::chrono::milliseconds(200);
+    static constexpr std::array<uint64_t, 3> base_delays{200, 500, 1000};
+    const size_t index = std::min<size_t>(
+        retry_attempt, base_delays.size() - 1);
+    const uint64_t base = base_delays[index];
+    const uint64_t spread = std::max<uint64_t>(1, base / 2);
+    const uint64_t mixed =
+        std::hash<std::string>{}(url) ^
+        (unique_seed + UINT64_C(0x9e3779b97f4a7c15) +
+         (unique_seed << 6) + (unique_seed >> 2));
+    return std::chrono::milliseconds(base + mixed % spread);
+}
+
+static void resetAttemptRetention(curl_progress_data &progress) noexcept
+{
+    if(progress.request_context && progress.context_retained_bytes != 0)
+        progress.request_context->releaseResponseBytes(
+            std::exchange(progress.context_retained_bytes, 0));
+    progress.retained_bytes.reset();
+    progress.abort_reason = AsyncFetchFailure::None;
+}
+
+static bool waitForRecoverableRetry(
+    std::chrono::milliseconds delay,
+    std::chrono::steady_clock::time_point deadline,
+    const RequestCancellationToken &cancellation) noexcept
+{
+    const auto retry_at = std::chrono::steady_clock::now() + delay;
+    for(;;)
+    {
+        if(outbound_fetch_shutdown_requested.load(std::memory_order_relaxed) ||
+           cancellation.isCancellationRequested())
+            return false;
+        const auto now = std::chrono::steady_clock::now();
+        if(now >= retry_at)
+            return deadline == std::chrono::steady_clock::time_point::max() ||
+                   now < deadline;
+        if(deadline != std::chrono::steady_clock::time_point::max() &&
+           now >= deadline)
+            return false;
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(retry_at - now);
+        sleepMs(static_cast<int>(std::clamp<int64_t>(
+            remaining.count(), 1, 25)));
+    }
+}
+
+static AsyncFetchFailure classify_async_failure(
+    CURLcode code, const curl_progress_data &progress)
+{
+    if(progress.abort_reason != AsyncFetchFailure::None)
+        return progress.abort_reason;
+    switch(code)
+    {
+    case CURLE_OK:
+        return AsyncFetchFailure::None;
+    case CURLE_ABORTED_BY_CALLBACK:
+        return AsyncFetchFailure::Cancelled;
+    case CURLE_OPERATION_TIMEDOUT:
+        return AsyncFetchFailure::Deadline;
+    case CURLE_FILESIZE_EXCEEDED:
+        return AsyncFetchFailure::SizeLimit;
+    case CURLE_WRITE_ERROR:
+        return progress.abort_reason == AsyncFetchFailure::None
+                   ? AsyncFetchFailure::Transport
+                   : progress.abort_reason;
+    case CURLE_COULDNT_RESOLVE_HOST:
+    case CURLE_COULDNT_RESOLVE_PROXY:
+        return AsyncFetchFailure::Dns;
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_PEER_FAILED_VERIFICATION:
+    case CURLE_SSL_CACERT_BADFILE:
+        return AsyncFetchFailure::Tls;
+#if LIBCURL_VERSION_NUM >= 0x074900
+    case CURLE_PROXY:
+#endif
+    case CURLE_LOGIN_DENIED:
+        return AsyncFetchFailure::Proxy;
+    default:
+        return AsyncFetchFailure::Transport;
+    }
+}
+
+namespace {
+
+class CurlMultiEngine;
+std::atomic<CurlMultiEngine *> multi_engine_instance{nullptr};
+
+class CurlMultiEngine
+{
+    struct Transfer
+    {
+        AsyncFetchRequest request;
+        ResolvedProxyRoute route;
+        bool allow_insecure_tls = false;
+        long size_limit = 0;
+        CURL *easy = nullptr;
+        curl_slist *header_list = nullptr;
+        std::string effective_url;
+        curl_prereq_data prereq_context;
+        curl_progress_data progress;
+        RequestCancellationRegistration cancellation_registration;
+        SharedAsyncFetchResult result =
+            std::make_shared<AsyncFetchResult>();
+        AsyncFetchCompletion completion;
+        std::atomic<bool> completed{false};
+        uint8_t retry_attempts = 0;
+        uint64_t retry_jitter_seed = 0;
+        std::chrono::steady_clock::time_point retry_at =
+            std::chrono::steady_clock::time_point::max();
+        uint64_t fetch_reservation_bytes = 0;
+        bool fetch_memory_waiting = false;
+    };
+
+public:
+    CurlMultiEngine()
+    {
+        if(curl_init() != CURLE_OK)
+            return;
+        const curl_version_info_data *version =
+            curl_version_info(CURLVERSION_NOW);
+        if(version == nullptr ||
+           (version->features & CURL_VERSION_ASYNCHDNS) == 0)
+        {
+            writeLog(LOG_LEVEL_ERROR,
+                     "OUTBOUND_MULTI_DISABLED reason=blocking-resolver");
+            return;
+        }
+        multi_ = curl_multi_init();
+        if(multi_ == nullptr)
+            return;
+        const ResourceControlSnapshot resources = resourceControlSnapshot();
+        performance_mode_ = performanceFetchMode(resources);
+        const ForceMaxBudget &force_max =
+            resources.calculated_force_max_budget;
+        const bool deterministic_force_max =
+            resources.effective_mode == "force_max" && force_max.valid;
+        deterministic_force_max_ = deterministic_force_max;
+        const long total_connections = deterministic_force_max
+            ? static_cast<long>(std::min<uint64_t>(
+                  force_max.outbound_active, LONG_MAX))
+            : (performance_mode_
+                   ? static_cast<long>(std::clamp<uint64_t>(
+                         resources.suggested_outbound_connections,
+                         1, 1024))
+                   : 64L);
+        const long host_connections = deterministic_force_max
+            ? static_cast<long>(std::min<uint64_t>(
+                  force_max.outbound_per_host, LONG_MAX))
+            : (performance_mode_ ? total_connections
+                                 : std::min(16L, total_connections));
+        const uint64_t active_limit = static_cast<uint64_t>(total_connections);
+        uint64_t cached_connections = deterministic_force_max
+                                          ? force_max.outbound_idle_cache
+                                          : active_limit;
+        uint64_t open_connections = deterministic_force_max
+                                        ? force_max.outbound_open
+                                        : active_limit;
+        if(performance_mode_ && !deterministic_force_max)
+        {
+            const RequestAdmissionSnapshot admission =
+                requestAdmissionSnapshot();
+            const uint64_t scaled = active_limit > UINT64_MAX / 16
+                                        ? UINT64_MAX
+                                        : active_limit * 16;
+            const uint64_t desired = std::max<uint64_t>(
+                active_limit,
+                std::min<uint64_t>(
+                    scaled, std::max<uint64_t>(1, admission.max_entries)));
+            cached_connections = std::min<uint64_t>(1024, desired);
+            if(resources.nofile_soft != 0)
+                cached_connections = std::min<uint64_t>(
+                    cached_connections,
+                    std::max<uint64_t>(active_limit,
+                                       resources.nofile_soft / 4));
+            uint64_t memory_boundary = 0;
+            for(const uint64_t candidate : {
+                    resources.memory_high_bytes,
+                    resources.memory_max_bytes,
+                    resources.host_total_memory_bytes})
+            {
+                if(candidate != 0)
+                    memory_boundary = memory_boundary == 0
+                                          ? candidate
+                                          : std::min(memory_boundary,
+                                                     candidate);
+            }
+            if(memory_boundary != 0)
+                cached_connections = std::min<uint64_t>(
+                    cached_connections,
+                    std::max<uint64_t>(
+                        std::min<uint64_t>(active_limit, 1024),
+                        memory_boundary / (UINT64_C(512) * 1024)));
+            handle_window_ = static_cast<size_t>(std::min<uint64_t>(
+                active_limit, std::numeric_limits<size_t>::max()));
+        }
+        else if(deterministic_force_max)
+            handle_window_ = static_cast<size_t>(std::min<uint64_t>(
+                active_limit, std::numeric_limits<size_t>::max()));
+        const long max_cached_connections = static_cast<long>(
+            std::min<uint64_t>(cached_connections,
+                               static_cast<uint64_t>(LONG_MAX)));
+        const long max_open_connections = static_cast<long>(
+            std::min<uint64_t>(
+                deterministic_force_max
+                    ? open_connections
+                    : std::max<uint64_t>(active_limit,
+                                         cached_connections),
+                static_cast<uint64_t>(LONG_MAX)));
+        active_connection_limit_ = active_limit;
+        per_host_connection_limit_ =
+            static_cast<uint64_t>(std::max(1L, host_connections));
+        open_connection_limit_ = static_cast<uint64_t>(max_open_connections);
+        connection_cache_limit_ =
+            static_cast<uint64_t>(max_cached_connections);
+        max_retries_ = performance_mode_ ? 3 : 1;
+        runtime_limit_generation_ = 1;
+        last_fetch_capacity_generation_ =
+            globalFetchMemoryCapacityGeneration();
+        curl_multi_setopt(multi_, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                          max_open_connections);
+        curl_multi_setopt(multi_, CURLMOPT_MAX_HOST_CONNECTIONS,
+                          host_connections);
+        curl_multi_setopt(multi_, CURLMOPT_MAXCONNECTS,
+                          max_cached_connections);
+#ifdef CURLPIPE_MULTIPLEX
+        curl_multi_setopt(multi_, CURLMOPT_PIPELINING,
+                          static_cast<long>(CURLPIPE_MULTIPLEX));
+#endif
+        available_.store(true, std::memory_order_release);
+        worker_ = std::thread([this]() { run(); });
+        if(outbound_fetch_shutdown_requested.load(std::memory_order_seq_cst))
+        {
+            shutdown();
+            return;
+        }
+        writeLog(LOG_LEVEL_INFO,
+                 "OUTBOUND_MULTI_ENGINE resolver=asynchronous "
+                  "active_total=" + std::to_string(total_connections) +
+                  " active_host=" + std::to_string(host_connections) +
+                  " open_connection_limit=" +
+                  std::to_string(max_open_connections) +
+                  " connection_cache=" +
+                  std::to_string(max_cached_connections) +
+                  " recoverable_retries=" +
+                  std::to_string(max_retries_) +
+                  " handle_window=" +
+                  (handle_window_ == 0 ? std::string("unbounded")
+                                       : std::to_string(handle_window_)) +
+                  " wakeup=" +
+                 (wakeupAvailable() ? "enabled" : "legacy-poll"));
+    }
+
+    ~CurlMultiEngine()
+    {
+        shutdown();
+        if(multi_)
+            curl_multi_cleanup(multi_);
+    }
+
+    CurlMultiEngine(const CurlMultiEngine &) = delete;
+    CurlMultiEngine &operator=(const CurlMultiEngine &) = delete;
+
+    bool available() const noexcept
+    {
+        return available_.load(std::memory_order_acquire);
+    }
+
+    void submit(
+        AsyncFetchRequest request, ResolvedProxyRoute route,
+        bool allow_insecure_tls, long size_limit,
+        AsyncFetchCompletion completion)
+    {
+        auto transfer = std::make_shared<Transfer>();
+        transfer->request = std::move(request);
+        transfer->route = std::move(route);
+        transfer->allow_insecure_tls = allow_insecure_tls;
+        transfer->size_limit = size_limit;
+        if(transfer->request.capture_content)
+        {
+            const FetchMemoryBudgetSnapshot fetch_budget =
+                globalFetchMemoryBudgetSnapshot();
+            transfer->fetch_reservation_bytes =
+                size_limit > 0
+                    ? static_cast<uint64_t>(size_limit)
+                    : (fetch_budget.enabled ? fetch_budget.limit : 0);
+        }
+        transfer->completion = std::move(completion);
+        transfer->retry_jitter_seed =
+            next_retry_jitter_seed_.fetch_add(1, std::memory_order_relaxed);
+        transfer->cancellation_registration =
+            transfer->request.cancellation.registerCallback(
+                [this] {
+                    pending_prune_requested_.store(
+                        true, std::memory_order_release);
+                    wakeWorker();
+                });
+        bool rejected = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(stopping_ || !available())
+            {
+                transfer->result->transport_code = CURLE_ABORTED_BY_CALLBACK;
+                transfer->result->failure = stopping_
+                    ? AsyncFetchFailure::Shutdown
+                    : AsyncFetchFailure::Transport;
+                rejected = true;
+            }
+            else
+            {
+                pending_.emplace_back(transfer);
+                pending_count_.fetch_add(1, std::memory_order_relaxed);
+                notePendingDeadline(transfer->request.deadline);
+            }
+        }
+        if(rejected)
+        {
+            complete(transfer);
+            return;
+        }
+        wakeWorker();
+    }
+
+    AsyncFetchFuture submit(
+        AsyncFetchRequest request, ResolvedProxyRoute route,
+        bool allow_insecure_tls, long size_limit)
+    {
+        auto promise =
+            std::make_shared<std::promise<SharedAsyncFetchResult>>();
+        AsyncFetchFuture future = promise->get_future().share();
+        submit(std::move(request), std::move(route), allow_insecure_tls,
+               size_limit,
+               [promise](SharedAsyncFetchResult result) noexcept {
+                   try
+                   {
+                       promise->set_value(std::move(result));
+                   }
+                   catch(...)
+                   {
+                   }
+               });
+        return future;
+    }
+
+    void requestShutdown() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        wakeWorker();
+    }
+
+    bool join() noexcept
+    {
+        bool join_worker = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if(joined_)
+                return true;
+            stopping_ = true;
+            if(worker_.joinable() &&
+               worker_.get_id() == std::this_thread::get_id())
+            {
+                lock.unlock();
+                wakeWorker();
+                return false;
+            }
+            if(joining_)
+            {
+                condition_.wait(lock, [this] { return joined_; });
+                return true;
+            }
+            joining_ = true;
+            join_worker = worker_.joinable();
+        }
+        wakeWorker();
+        if(join_worker)
+            worker_.join();
+        running_handles_snapshot_.store(0, std::memory_order_relaxed);
+        available_.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            joined_ = true;
+            joining_ = false;
+        }
+        condition_.notify_all();
+        return true;
+    }
+
+    void shutdown() noexcept
+    {
+        requestShutdown();
+        (void)join();
+    }
+
+    void publish() noexcept
+    {
+        if(deterministic_force_max_)
+        {
+            const ResourceControlSnapshot resources =
+                resourceControlSnapshot();
+            if(resources.calculated_force_max_budget.valid)
+                configureGlobalFetchMemoryBudget(
+                    resources.calculated_force_max_budget.fetch_bytes);
+        }
+    }
+
+    AsyncFetchEngineSnapshot snapshot() const noexcept
+    {
+        const RetainedResponseByteSnapshot retained =
+            retainedResponseByteSnapshot();
+        return AsyncFetchEngineSnapshot{
+            available(), wakeupAvailable(),
+            pending_count_.load(std::memory_order_relaxed),
+            active_count_.load(std::memory_order_relaxed),
+            running_handles_snapshot_.load(std::memory_order_relaxed),
+            static_cast<uint64_t>(handle_window_),
+            active_connection_limit_, open_connection_limit_,
+            connection_cache_limit_, max_retries_,
+            retained.used, per_host_connection_limit_,
+            runtime_limit_generation_, runtime_limit_updates_};
+    }
+
+    bool requestRuntimeLimits(AsyncFetchRuntimeLimits limits) noexcept
+    {
+        if(!deterministic_force_max_ || limits.active == 0 ||
+           limits.per_host == 0 || limits.open < limits.active ||
+           limits.per_host > limits.active ||
+           limits.idle_cache > limits.open)
+            return false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(stopping_)
+                return false;
+            if(limits.generation == 0)
+                limits.generation =
+                    runtime_limit_generation_.load(
+                        std::memory_order_acquire) + 1;
+            requested_limits_ = limits;
+            requested_limits_available_ = true;
+        }
+        wakeWorker();
+        return true;
+    }
+
+private:
+    static constexpr bool wakeupAvailable() noexcept
+    {
+#if LIBCURL_VERSION_NUM >= 0x074400
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void wakeWorker() noexcept
+    {
+        wake_generation_.fetch_add(1, std::memory_order_release);
+        condition_.notify_all();
+#if LIBCURL_VERSION_NUM >= 0x074400
+        if(multi_)
+            (void)curl_multi_wakeup(multi_);
+#endif
+    }
+
+    static size_t bodyWriter(char *data, size_t size, size_t nmemb,
+                             void *user_data)
+    {
+        auto *transfer = static_cast<Transfer *>(user_data);
+        const size_t bytes = size * nmemb;
+        if(!transfer->request.capture_content)
+            return bytes;
+        if(transfer->size_limit > 0 &&
+           bytes > static_cast<size_t>(transfer->size_limit) -
+                       std::min<size_t>(
+                           transfer->result->content.size(),
+                           static_cast<size_t>(transfer->size_limit)))
+        {
+            transfer->progress.abort_reason = AsyncFetchFailure::SizeLimit;
+            return 0;
+        }
+        const bool retained = transfer->progress.request_context
+                                  ? transfer->progress.request_context
+                                        ->retainResponseBytes(bytes)
+                                  : transfer->result->retained_bytes.retain(
+                                        bytes);
+        if(!retained)
+        {
+            transfer->progress.abort_reason = AsyncFetchFailure::Capacity;
+            return 0;
+        }
+        if(transfer->progress.request_context)
+            transfer->progress.context_retained_bytes += bytes;
+        transfer->result->content.append(data, bytes);
+        return bytes;
+    }
+
+    static size_t headerWriter(char *data, size_t size, size_t nmemb,
+                               void *user_data)
+    {
+        auto *transfer = static_cast<Transfer *>(user_data);
+        const size_t bytes = size * nmemb;
+        if(transfer->request.capture_response_headers)
+        {
+            const bool retained = transfer->progress.request_context
+                                      ? transfer->progress.request_context
+                                            ->retainResponseBytes(bytes)
+                                      : transfer->result->retained_bytes.retain(
+                                            bytes);
+            if(!retained)
+            {
+                transfer->progress.abort_reason = AsyncFetchFailure::Capacity;
+                return 0;
+            }
+            if(transfer->progress.request_context)
+                transfer->progress.context_retained_bytes += bytes;
+            transfer->result->response_headers.append(data, bytes);
+        }
+        return bytes;
+    }
+
+    CURLcode configure(const std::shared_ptr<Transfer> &transfer)
+    {
+        transfer->easy = curl_easy_init();
+        if(transfer->easy == nullptr)
+            return CURLE_FAILED_INIT;
+        transfer->effective_url = transfer->request.url;
+        CURLcode code = apply_curl_proxy_policy(
+            transfer->easy, transfer->route, transfer->effective_url);
+        if(code != CURLE_OK)
+            return code;
+
+        transfer->progress.size_limit = transfer->size_limit;
+        transfer->progress.deadline = transfer->request.deadline;
+        transfer->progress.cancellation = transfer->request.cancellation;
+        if(transfer->request.request_context &&
+           !transfer->request.retain_result_bytes)
+            transfer->progress.request_context =
+                transfer->request.request_context;
+        curl_set_common_options(transfer->easy,
+                                transfer->effective_url.c_str(),
+                                &transfer->progress,
+                                transfer->allow_insecure_tls);
+        code = curl_set_platform_tls_trust(transfer->easy);
+        if(code != CURLE_OK)
+            return code;
+
+        if(transfer->route.proxy.mode == ProxyMode::Cors)
+            transfer->header_list = curl_slist_append(
+                transfer->header_list,
+                "X-Requested-With: SubConverter-Extended " VERSION);
+        transfer->header_list = curl_slist_append(
+            transfer->header_list,
+            "Content-Type: application/json;charset=utf-8");
+        for(const auto &header : transfer->request.request_headers)
+        {
+            const std::string value = header.first + ": " + header.second;
+            transfer->header_list = curl_slist_append(
+                transfer->header_list, value.c_str());
+        }
+        if(!transfer->request.request_headers.contains("User-Agent"))
+            curl_easy_setopt(transfer->easy, CURLOPT_USERAGENT,
+                             user_agent_str);
+        if(transfer->header_list)
+            curl_easy_setopt(transfer->easy, CURLOPT_HTTPHEADER,
+                             transfer->header_list);
+
+        curl_easy_setopt(transfer->easy, CURLOPT_WRITEFUNCTION, bodyWriter);
+        curl_easy_setopt(transfer->easy, CURLOPT_WRITEDATA, transfer.get());
+        curl_easy_setopt(transfer->easy, CURLOPT_HEADERFUNCTION, headerWriter);
+        curl_easy_setopt(transfer->easy, CURLOPT_HEADERDATA, transfer.get());
+
+        if(!transfer->request.cookies.empty())
+        {
+            for(const std::string &cookie :
+                split(transfer->request.cookies, "\r\n"))
+                curl_easy_setopt(transfer->easy, CURLOPT_COOKIELIST,
+                                 cookie.c_str());
+        }
+
+#if LIBCURL_VERSION_NUM >= 0x075000
+        transfer->prereq_context.restricted =
+            transfer->request.public_fetch_restricted;
+        if(transfer->request.public_fetch_restricted &&
+           (transfer->route.proxy.mode == ProxyMode::Direct ||
+            (transfer->route.proxy.mode == ProxyMode::System &&
+             transfer->route.proxy.endpoint.empty())))
+        {
+            curl_easy_setopt(transfer->easy, CURLOPT_PREREQFUNCTION,
+                             public_fetch_prereq_callback);
+            curl_easy_setopt(transfer->easy, CURLOPT_PREREQDATA,
+                             &transfer->prereq_context);
+        }
+#endif
+
+        switch(transfer->request.method)
+        {
+        case HTTP_POST:
+            curl_easy_setopt(transfer->easy, CURLOPT_POST, 1L);
+            if(transfer->request.has_post_data)
+            {
+                curl_easy_setopt(transfer->easy, CURLOPT_POSTFIELDS,
+                                 transfer->request.post_data.data());
+                curl_easy_setopt(transfer->easy, CURLOPT_POSTFIELDSIZE,
+                                 transfer->request.post_data.size());
+            }
+            break;
+        case HTTP_PATCH:
+            curl_easy_setopt(transfer->easy, CURLOPT_CUSTOMREQUEST, "PATCH");
+            if(transfer->request.has_post_data)
+            {
+                curl_easy_setopt(transfer->easy, CURLOPT_POSTFIELDS,
+                                 transfer->request.post_data.data());
+                curl_easy_setopt(transfer->easy, CURLOPT_POSTFIELDSIZE,
+                                 transfer->request.post_data.size());
+            }
+            break;
+        case HTTP_HEAD:
+            curl_easy_setopt(transfer->easy, CURLOPT_NOBODY, 1L);
+            break;
+        case HTTP_GET:
+            break;
+        }
+        return CURLE_OK;
+    }
+
+    static void clearFetchMemoryWaiter(
+        const std::shared_ptr<Transfer> &transfer, bool resumed) noexcept
+    {
+        if(transfer && transfer->fetch_memory_waiting)
+        {
+            transfer->fetch_memory_waiting = false;
+            noteGlobalFetchMemoryWaiterRemoved(resumed);
+        }
+    }
+
+    void finish(std::shared_ptr<Transfer> transfer, CURLcode code,
+                bool added)
+    {
+        clearFetchMemoryWaiter(transfer, false);
+        transfer->cancellation_registration.reset();
+        if(added)
+            active_count_.fetch_sub(1, std::memory_order_relaxed);
+        if(added && multi_ && transfer->easy)
+            curl_multi_remove_handle(multi_, transfer->easy);
+        if(transfer->easy)
+        {
+            long status = 0;
+            curl_easy_getinfo(transfer->easy, CURLINFO_HTTP_CODE, &status);
+            transfer->result->status_code = static_cast<int>(status);
+#if LIBCURL_VERSION_NUM >= 0x080700
+            long used_proxy = 0;
+            if(curl_easy_getinfo(transfer->easy, CURLINFO_USED_PROXY,
+                                 &used_proxy) == CURLE_OK)
+                transfer->result->used_proxy = used_proxy != 0;
+#endif
+#if LIBCURL_VERSION_NUM >= 0x074900
+            curl_easy_getinfo(transfer->easy, CURLINFO_PROXY_ERROR,
+                              &transfer->result->proxy_error);
+#endif
+            if(transfer->request.capture_cookies)
+            {
+                curl_slist *cookies = nullptr;
+                curl_easy_getinfo(transfer->easy, CURLINFO_COOKIELIST,
+                                  &cookies);
+                for(curl_slist *item = cookies; item; item = item->next)
+                {
+                    transfer->result->cookies.append(item->data);
+                    transfer->result->cookies += "\r\n";
+                }
+                curl_slist_free_all(cookies);
+            }
+        }
+        transfer->result->transport_code = static_cast<int>(code);
+        transfer->result->failure = classify_async_failure(
+            code, transfer->progress);
+        const bool recoverable = code != CURLE_OK &&
+            (transfer->request.method == HTTP_GET ||
+             transfer->request.method == HTTP_HEAD) &&
+            is_recoverable_curl_error(code);
+        const bool performance_retry =
+            performance_mode_ && transfer->request.method == HTTP_GET;
+        const uint8_t retry_limit = performance_retry ? max_retries_ : 1;
+        const std::chrono::milliseconds retry_delay =
+            recoverable
+                ? recoverableRetryDelay(
+                      transfer->request.url, transfer->retry_attempts,
+                      transfer->retry_jitter_seed, performance_retry)
+                        : std::chrono::milliseconds(0);
+        const bool retry = recoverable &&
+            transfer->retry_attempts < retry_limit &&
+            !stopping_.load(std::memory_order_acquire) &&
+            !outbound_fetch_shutdown_requested.load(
+                std::memory_order_relaxed) &&
+            !transfer->request.cancellation.isCancellationRequested() &&
+            std::chrono::steady_clock::now() + retry_delay <
+                transfer->request.deadline;
+        if(!transfer->request.keep_resp_on_fail &&
+           (code != CURLE_OK || transfer->result->status_code != 200))
+            transfer->result->content.clear();
+        curl_slist_free_all(transfer->header_list);
+        transfer->header_list = nullptr;
+        if(transfer->easy)
+        {
+            active_.erase(transfer->easy);
+            curl_easy_cleanup(transfer->easy);
+            transfer->easy = nullptr;
+        }
+        if(retry)
+        {
+            SharedAsyncFetchResult next_result;
+            RequestCancellationRegistration next_registration;
+            try
+            {
+                next_result = std::make_shared<AsyncFetchResult>();
+                next_registration =
+                    transfer->request.cancellation.registerCallback(
+                        [this] {
+                            pending_prune_requested_.store(
+                                true, std::memory_order_release);
+                            wakeWorker();
+                        });
+            }
+            catch(...)
+            {
+                complete(transfer);
+                return;
+            }
+            writeLog(LOG_LEVEL_WARNING,
+                     "出站请求遇到可恢复网络错误，正在分散退避后重试："
+                     " attempt=" +
+                         std::to_string(transfer->retry_attempts + 1) +
+                         " delay_ms=" +
+                         std::to_string(retry_delay.count()) +
+                         " code=" + std::to_string(static_cast<int>(code)) +
+                         "。");
+            if(!transfer->result->cookies.empty())
+                transfer->request.cookies = transfer->result->cookies;
+            resetAttemptRetention(transfer->progress);
+            next_result->fetch_memory =
+                std::move(transfer->result->fetch_memory);
+            transfer->result = std::move(next_result);
+            transfer->progress = {};
+            transfer->prereq_context = {};
+            transfer->cancellation_registration =
+                std::move(next_registration);
+            ++transfer->retry_attempts;
+            transfer->retry_at = std::chrono::steady_clock::now() +
+                                 retry_delay;
+            delayed_.emplace_back(std::move(transfer));
+            pending_count_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        complete(transfer);
+    }
+
+    static void complete(const std::shared_ptr<Transfer> &transfer) noexcept
+    {
+        if(!transfer ||
+           transfer->completed.exchange(true, std::memory_order_acq_rel))
+            return;
+        AsyncFetchCompletion completion = std::move(transfer->completion);
+        if(!completion)
+            return;
+        try
+        {
+            completion(std::move(transfer->result));
+        }
+        catch(...)
+        {
+        }
+    }
+
+    static int64_t deadlineNanoseconds(
+        std::chrono::steady_clock::time_point deadline) noexcept
+    {
+        if(deadline == std::chrono::steady_clock::time_point::max())
+            return INT64_MAX;
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   deadline.time_since_epoch())
+            .count();
+    }
+
+    void notePendingDeadline(
+        std::chrono::steady_clock::time_point deadline) noexcept
+    {
+        const int64_t candidate = deadlineNanoseconds(deadline);
+        int64_t current = next_pending_deadline_ns_.load(
+            std::memory_order_acquire);
+        while(candidate < current &&
+              !next_pending_deadline_ns_.compare_exchange_weak(
+                  current, candidate, std::memory_order_release,
+                  std::memory_order_acquire))
+        {
+        }
+    }
+
+    void prunePending()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t now_ns = deadlineNanoseconds(now);
+        if(!pending_prune_requested_.exchange(false,
+                                              std::memory_order_acq_rel) &&
+           now_ns < next_pending_deadline_ns_.load(
+                        std::memory_order_acquire))
+            return;
+
+        std::list<std::shared_ptr<Transfer>> cancelled;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            int64_t next_deadline = INT64_MAX;
+            for(auto iter = pending_.begin(); iter != pending_.end();)
+            {
+                const std::shared_ptr<Transfer> &transfer = *iter;
+                const bool cancellation =
+                    transfer->request.cancellation.isCancellationRequested();
+                const bool deadline =
+                    transfer->request.deadline !=
+                        std::chrono::steady_clock::time_point::max() &&
+                    now >= transfer->request.deadline;
+                if(cancellation || deadline)
+                {
+                    auto current = iter++;
+                    cancelled.splice(cancelled.end(), pending_, current);
+                    pending_count_.fetch_sub(1,
+                                             std::memory_order_relaxed);
+                    continue;
+                }
+                next_deadline = std::min(
+                    next_deadline,
+                    deadlineNanoseconds(transfer->request.deadline));
+                ++iter;
+            }
+            next_pending_deadline_ns_.store(next_deadline,
+                                            std::memory_order_release);
+        }
+
+        for(auto &transfer : cancelled)
+        {
+            const RequestCancellationReason reason =
+                transfer->request.cancellation.reason();
+            if(reason == RequestCancellationReason::Shutdown)
+                transfer->progress.abort_reason =
+                    AsyncFetchFailure::Shutdown;
+            else if(reason == RequestCancellationReason::Deadline ||
+                    now >= transfer->request.deadline)
+                transfer->progress.abort_reason =
+                    AsyncFetchFailure::Deadline;
+            else
+                transfer->progress.abort_reason =
+                    AsyncFetchFailure::Cancelled;
+            finish(transfer,
+                   transfer->progress.abort_reason ==
+                           AsyncFetchFailure::Deadline
+                       ? CURLE_OPERATION_TIMEDOUT
+                       : CURLE_ABORTED_BY_CALLBACK,
+                   false);
+        }
+    }
+
+    bool hasDispatchableWork()
+    {
+        if(pending_prune_requested_.load(std::memory_order_acquire) ||
+           deadlineNanoseconds(std::chrono::steady_clock::now()) >=
+               next_pending_deadline_ns_.load(std::memory_order_acquire))
+            return true;
+        if(handle_window_ != 0 && active_.size() >= handle_window_)
+            return false;
+        if(fetch_admission_blocked_ &&
+           globalFetchMemoryCapacityGeneration() ==
+               last_fetch_capacity_generation_)
+            return false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(!pending_.empty())
+                return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        return std::any_of(
+            delayed_.begin(), delayed_.end(),
+            [now](const std::shared_ptr<Transfer> &transfer) {
+                return transfer->retry_at <= now;
+            });
+    }
+
+    void processPending()
+    {
+        for(;;)
+        {
+            std::shared_ptr<Transfer> transfer;
+            bool oversized = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if(pending_.empty() ||
+                   (handle_window_ != 0 &&
+                    active_.size() >= handle_window_))
+                    return;
+                transfer = pending_.front();
+                const FetchMemoryBudgetSnapshot fetch_budget =
+                    globalFetchMemoryBudgetSnapshot();
+                if(fetch_budget.enabled &&
+                   transfer->fetch_reservation_bytes > fetch_budget.limit)
+                {
+                    oversized = true;
+                }
+                else if(fetch_budget.enabled &&
+                        transfer->fetch_reservation_bytes != 0 &&
+                        !transfer->result->fetch_memory.acquire(
+                            transfer->fetch_reservation_bytes))
+                {
+                    if(!transfer->fetch_memory_waiting)
+                    {
+                        transfer->fetch_memory_waiting = true;
+                        noteGlobalFetchMemoryWaiterAdded();
+                    }
+                    fetch_admission_blocked_ = true;
+                    last_fetch_capacity_generation_ =
+                        globalFetchMemoryCapacityGeneration();
+                    return;
+                }
+                pending_.pop_front();
+                pending_count_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            clearFetchMemoryWaiter(transfer, !oversized);
+            fetch_admission_blocked_ = false;
+            if(oversized)
+            {
+                transfer->progress.abort_reason =
+                    AsyncFetchFailure::SizeLimit;
+                finish(transfer, CURLE_FILESIZE_EXCEEDED, false);
+                continue;
+            }
+            startTransfer(std::move(transfer));
+        }
+    }
+
+    void startTransfer(std::shared_ptr<Transfer> transfer)
+    {
+        if(!transfer)
+            return;
+        transfer->retry_at = std::chrono::steady_clock::time_point::max();
+        if(stopping_)
+        {
+            transfer->progress.abort_reason = AsyncFetchFailure::Shutdown;
+            finish(transfer, CURLE_ABORTED_BY_CALLBACK, false);
+            return;
+        }
+        if(transfer->request.cancellation.isCancellationRequested())
+        {
+            transfer->progress.abort_reason =
+                transfer->request.cancellation.reason() ==
+                        RequestCancellationReason::Shutdown
+                    ? AsyncFetchFailure::Shutdown
+                    : AsyncFetchFailure::Cancelled;
+            finish(transfer, CURLE_ABORTED_BY_CALLBACK, false);
+            return;
+        }
+        if(transfer->request.deadline !=
+               std::chrono::steady_clock::time_point::max() &&
+           std::chrono::steady_clock::now() >= transfer->request.deadline)
+        {
+            transfer->progress.abort_reason = AsyncFetchFailure::Deadline;
+            finish(transfer, CURLE_OPERATION_TIMEDOUT, false);
+            return;
+        }
+        const CURLcode code = configure(transfer);
+        if(code != CURLE_OK)
+        {
+            finish(transfer, code, false);
+            return;
+        }
+        const CURLMcode multi_code =
+            curl_multi_add_handle(multi_, transfer->easy);
+        if(multi_code != CURLM_OK)
+        {
+            finish(transfer, CURLE_FAILED_INIT, false);
+            return;
+        }
+        active_[transfer->easy] = transfer;
+        active_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void processDelayed()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        for(auto iter = delayed_.begin(); iter != delayed_.end();)
+        {
+            const std::shared_ptr<Transfer> transfer = *iter;
+            if(stopping_ ||
+               transfer->request.cancellation.isCancellationRequested() ||
+               (transfer->request.deadline !=
+                    std::chrono::steady_clock::time_point::max() &&
+                now >= transfer->request.deadline))
+            {
+                iter = delayed_.erase(iter);
+                pending_count_.fetch_sub(1, std::memory_order_relaxed);
+                if(stopping_ || transfer->request.cancellation.reason() ==
+                                     RequestCancellationReason::Shutdown)
+                    transfer->progress.abort_reason =
+                        AsyncFetchFailure::Shutdown;
+                else if(transfer->request.cancellation.reason() ==
+                            RequestCancellationReason::Deadline ||
+                        now >= transfer->request.deadline)
+                    transfer->progress.abort_reason =
+                        AsyncFetchFailure::Deadline;
+                else
+                    transfer->progress.abort_reason =
+                        AsyncFetchFailure::Cancelled;
+                finish(transfer,
+                       transfer->progress.abort_reason ==
+                               AsyncFetchFailure::Deadline
+                           ? CURLE_OPERATION_TIMEDOUT
+                           : CURLE_ABORTED_BY_CALLBACK,
+                       false);
+                continue;
+            }
+            if(now < transfer->retry_at)
+            {
+                ++iter;
+                continue;
+            }
+            if(handle_window_ != 0 && active_.size() >= handle_window_)
+            {
+                ++iter;
+                continue;
+            }
+            iter = delayed_.erase(iter);
+            pending_count_.fetch_sub(1, std::memory_order_relaxed);
+            startTransfer(transfer);
+        }
+    }
+
+    void performTransfers()
+    {
+        CURLMcode code;
+        do
+        {
+            code = curl_multi_perform(multi_, &running_handles_);
+            running_handles_snapshot_.store(
+                static_cast<uint64_t>(std::max(0, running_handles_)),
+                std::memory_order_relaxed);
+        }
+        while(code == CURLM_CALL_MULTI_PERFORM);
+        drainMessages();
+    }
+
+    void applyRequestedLimits()
+    {
+        AsyncFetchRuntimeLimits limits;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(!requested_limits_available_)
+                return;
+            limits = requested_limits_;
+            requested_limits_available_ = false;
+        }
+        const long open = static_cast<long>(std::min<uint64_t>(
+            limits.open, static_cast<uint64_t>(LONG_MAX)));
+        const long per_host = static_cast<long>(std::min<uint64_t>(
+            limits.per_host, static_cast<uint64_t>(LONG_MAX)));
+        const long cache = static_cast<long>(std::min<uint64_t>(
+            limits.idle_cache, static_cast<uint64_t>(LONG_MAX)));
+        if(curl_multi_setopt(multi_, CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                             open) != CURLM_OK ||
+           curl_multi_setopt(multi_, CURLMOPT_MAX_HOST_CONNECTIONS,
+                             per_host) != CURLM_OK ||
+           curl_multi_setopt(multi_, CURLMOPT_MAXCONNECTS,
+                             cache) != CURLM_OK)
+        {
+            writeLog(LOG_LEVEL_ERROR,
+                     "OUTBOUND_RUNTIME_LIMIT_UPDATE_FAILED generation=" +
+                         std::to_string(limits.generation));
+            return;
+        }
+        handle_window_.store(static_cast<size_t>(std::min<uint64_t>(
+                                 limits.active, SIZE_MAX)),
+                             std::memory_order_release);
+        active_connection_limit_.store(limits.active,
+                                       std::memory_order_release);
+        per_host_connection_limit_.store(limits.per_host,
+                                         std::memory_order_release);
+        open_connection_limit_.store(limits.open,
+                                     std::memory_order_release);
+        connection_cache_limit_.store(limits.idle_cache,
+                                      std::memory_order_release);
+        runtime_limit_generation_.store(limits.generation,
+                                        std::memory_order_release);
+        runtime_limit_updates_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void drainMessages()
+    {
+        int remaining = 0;
+        while(CURLMsg *message = curl_multi_info_read(multi_, &remaining))
+        {
+            if(message->msg != CURLMSG_DONE)
+                continue;
+            auto found = active_.find(message->easy_handle);
+            if(found != active_.end())
+                finish(found->second, message->data.result, true);
+        }
+    }
+
+    void waitForActivity()
+    {
+        if(active_.empty())
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            const uint64_t generation =
+                wake_generation_.load(std::memory_order_acquire);
+            const uint64_t fetch_generation =
+                globalFetchMemoryCapacityGeneration();
+            if(stopping_ ||
+               (!pending_.empty() && !fetch_admission_blocked_))
+                return;
+            for(const auto &transfer : delayed_)
+            {
+                if(transfer->request.cancellation.isCancellationRequested() ||
+                   (transfer->request.deadline !=
+                        std::chrono::steady_clock::time_point::max() &&
+                    std::chrono::steady_clock::now() >=
+                        transfer->request.deadline))
+                    return;
+            }
+            const auto awakened = [this, generation, fetch_generation]() {
+                return stopping_ ||
+                       (!pending_.empty() && !fetch_admission_blocked_) ||
+                       wake_generation_.load(std::memory_order_acquire) !=
+                           generation ||
+                       globalFetchMemoryCapacityGeneration() !=
+                           fetch_generation;
+            };
+            if(delayed_.empty() && !fetch_admission_blocked_)
+                condition_.wait(lock, awakened);
+            else if(delayed_.empty())
+                condition_.wait_for(lock, std::chrono::milliseconds(25),
+                                    awakened);
+            else
+            {
+                const auto next = std::min_element(
+                    delayed_.begin(), delayed_.end(),
+                    [](const auto &left, const auto &right) {
+                        return std::min(left->retry_at,
+                                        left->request.deadline) <
+                               std::min(right->retry_at,
+                                        right->request.deadline);
+                    });
+                condition_.wait_until(
+                    lock,
+                    std::min((*next)->retry_at, (*next)->request.deadline),
+                    awakened);
+            }
+            return;
+        }
+
+        int timeout_ms = 50;
+#if LIBCURL_VERSION_NUM >= 0x074400
+        timeout_ms = 1000;
+        long curl_timeout_ms = -1;
+        if(curl_multi_timeout(multi_, &curl_timeout_ms) == CURLM_OK &&
+           curl_timeout_ms >= 0)
+            timeout_ms = static_cast<int>(
+                std::clamp<long>(curl_timeout_ms, 0, timeout_ms));
+        if(fetch_admission_blocked_)
+            timeout_ms = std::min(timeout_ms, 25);
+        const auto now = std::chrono::steady_clock::now();
+        for(const auto &[easy, transfer] : active_)
+        {
+            (void)easy;
+            if(transfer->request.deadline ==
+               std::chrono::steady_clock::time_point::max())
+                continue;
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(transfer->request.deadline - now);
+            const int deadline_timeout = static_cast<int>(
+                std::clamp<int64_t>(remaining.count(), 0, timeout_ms));
+            timeout_ms = std::min(timeout_ms, deadline_timeout);
+        }
+        for(const auto &transfer : delayed_)
+        {
+            if(handle_window_ == 0 || active_.size() < handle_window_)
+            {
+                const auto remaining = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(transfer->retry_at - now);
+                timeout_ms = std::min(
+                    timeout_ms, static_cast<int>(std::clamp<int64_t>(
+                                    remaining.count(), 0, timeout_ms)));
+            }
+            if(transfer->request.deadline !=
+               std::chrono::steady_clock::time_point::max())
+            {
+                const auto remaining = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                        transfer->request.deadline - now);
+                timeout_ms = std::min(
+                    timeout_ms, static_cast<int>(std::clamp<int64_t>(
+                                    remaining.count(), 0, timeout_ms)));
+            }
+        }
+        const int64_t pending_deadline = next_pending_deadline_ns_.load(
+            std::memory_order_acquire);
+        if(pending_deadline != INT64_MAX)
+        {
+            const int64_t remaining_ns =
+                pending_deadline - deadlineNanoseconds(now);
+            const int64_t remaining_ms = remaining_ns <= 0
+                                             ? 0
+                                             : remaining_ns / 1000000;
+            timeout_ms = std::min(
+                timeout_ms, static_cast<int>(std::clamp<int64_t>(
+                                remaining_ms, 0, timeout_ms)));
+        }
+#endif
+        int ready = 0;
+        // Let libcurl use poll-capable primitives. The HTTP server may already
+        // hold thousands of client sockets, so outbound descriptors can exceed
+        // FD_SETSIZE even when the multi handle itself has few connections.
+#if LIBCURL_VERSION_NUM >= 0x074200
+        const CURLMcode code =
+            curl_multi_poll(multi_, nullptr, 0, timeout_ms, &ready);
+#else
+        const CURLMcode code =
+            curl_multi_wait(multi_, nullptr, 0, timeout_ms, &ready);
+#endif
+        if(code != CURLM_OK)
+            writeLog(LOG_LEVEL_ERROR,
+                     "OUTBOUND_MULTI_POLL_ERROR code=" +
+                         std::to_string(static_cast<int>(code)));
+    }
+
+    void cancelActive()
+    {
+        std::vector<std::shared_ptr<Transfer>> active;
+        active.reserve(active_.size());
+        for(const auto &[easy, transfer] : active_)
+        {
+            (void)easy;
+            active.emplace_back(transfer);
+        }
+        for(auto &transfer : active)
+        {
+            transfer->progress.abort_reason = AsyncFetchFailure::Shutdown;
+            finish(transfer, CURLE_ABORTED_BY_CALLBACK, true);
+        }
+    }
+
+    void cancelExpired()
+    {
+        std::vector<std::pair<std::shared_ptr<Transfer>, CURLcode>> cancelled;
+        const auto now = std::chrono::steady_clock::now();
+        for(const auto &[easy, transfer] : active_)
+        {
+            (void)easy;
+            if(transfer->request.cancellation.isCancellationRequested())
+            {
+                transfer->progress.abort_reason =
+                    transfer->request.cancellation.reason() ==
+                            RequestCancellationReason::Shutdown
+                        ? AsyncFetchFailure::Shutdown
+                        : AsyncFetchFailure::Cancelled;
+                cancelled.emplace_back(transfer, CURLE_ABORTED_BY_CALLBACK);
+            }
+            else if(transfer->request.deadline !=
+                        std::chrono::steady_clock::time_point::max() &&
+                    now >= transfer->request.deadline)
+            {
+                transfer->progress.abort_reason = AsyncFetchFailure::Deadline;
+                cancelled.emplace_back(transfer, CURLE_OPERATION_TIMEDOUT);
+            }
+        }
+        for(auto &[transfer, code] : cancelled)
+            finish(std::move(transfer), code, true);
+    }
+
+    void run()
+    {
+        for(;;)
+        {
+            applyRequestedLimits();
+            const uint64_t fetch_generation =
+                globalFetchMemoryCapacityGeneration();
+            if(fetch_generation != last_fetch_capacity_generation_)
+            {
+                last_fetch_capacity_generation_ = fetch_generation;
+                fetch_admission_blocked_ = false;
+            }
+            prunePending();
+            processDelayed();
+            processPending();
+            performTransfers();
+            cancelExpired();
+            bool stopping = false;
+            std::list<std::shared_ptr<Transfer>> pending;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping = stopping_;
+                if(stopping)
+                {
+                    pending.swap(pending_);
+                    pending_count_.fetch_sub(pending.size(),
+                                             std::memory_order_relaxed);
+                }
+            }
+            if(stopping)
+            {
+                cancelActive();
+                for(auto &transfer : pending)
+                {
+                    transfer->progress.abort_reason =
+                        AsyncFetchFailure::Shutdown;
+                    finish(transfer, CURLE_ABORTED_BY_CALLBACK, false);
+                }
+                while(!delayed_.empty())
+                {
+                    auto transfer = std::move(delayed_.front());
+                    delayed_.pop_front();
+                    pending_count_.fetch_sub(1, std::memory_order_relaxed);
+                    transfer->progress.abort_reason =
+                        AsyncFetchFailure::Shutdown;
+                    finish(transfer, CURLE_ABORTED_BY_CALLBACK, false);
+                }
+                break;
+            }
+            if(hasDispatchableWork())
+                continue;
+            waitForActivity();
+        }
+    }
+
+    CURLM *multi_ = nullptr;
+    std::atomic<bool> available_{false};
+    std::thread worker_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::list<std::shared_ptr<Transfer>> pending_;
+    std::deque<std::shared_ptr<Transfer>> delayed_;
+    std::unordered_map<CURL *, std::shared_ptr<Transfer>> active_;
+    std::atomic<uint64_t> pending_count_{0};
+    std::atomic<uint64_t> active_count_{0};
+    std::atomic<uint64_t> running_handles_snapshot_{0};
+    std::atomic<uint64_t> wake_generation_{0};
+    std::atomic<bool> stopping_{false};
+    std::atomic<bool> pending_prune_requested_{false};
+    std::atomic<int64_t> next_pending_deadline_ns_{INT64_MAX};
+    std::atomic<uint64_t> next_retry_jitter_seed_{1};
+    bool performance_mode_ = false;
+    bool deterministic_force_max_ = false;
+    bool joining_ = false;
+    bool joined_ = false;
+    uint8_t max_retries_ = 1;
+    std::atomic<size_t> handle_window_{0};
+    std::atomic<uint64_t> active_connection_limit_{0};
+    std::atomic<uint64_t> per_host_connection_limit_{0};
+    std::atomic<uint64_t> open_connection_limit_{0};
+    std::atomic<uint64_t> connection_cache_limit_{0};
+    AsyncFetchRuntimeLimits requested_limits_;
+    bool requested_limits_available_ = false;
+    std::atomic<uint64_t> runtime_limit_generation_{0};
+    std::atomic<uint64_t> runtime_limit_updates_{0};
+    uint64_t last_fetch_capacity_generation_ = 0;
+    bool fetch_admission_blocked_ = false;
+    int running_handles_ = 0;
+};
+
+struct AsyncFetchEngineRuntime
+{
+    std::mutex mutex;
+    std::unique_ptr<CurlMultiEngine> published;
+    std::unique_ptr<CurlMultiEngine> candidate;
+};
+
+AsyncFetchEngineRuntime &asyncFetchEngineRuntime()
+{
+    static AsyncFetchEngineRuntime runtime;
+    return runtime;
+}
+
+CurlMultiEngine &multiEngine()
+{
+    AsyncFetchEngineRuntime &runtime = asyncFetchEngineRuntime();
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    if(!runtime.published)
+    {
+        runtime.published = std::make_unique<CurlMultiEngine>();
+        runtime.published->publish();
+        multi_engine_instance.store(runtime.published.get(),
+                                    std::memory_order_release);
+    }
+    return *runtime.published;
+}
+
+} // namespace
+
+bool asyncFetchEngineAvailable() noexcept
+{
+    return multiEngine().available();
+}
+
+bool initializeAsyncFetchEngine() noexcept
+{
+    try
+    {
+        return multiEngine().available();
+    }
+    catch(...)
+    {
+        return false;
+    }
+}
+
+bool prepareAsyncFetchEngineCandidate() noexcept
+{
+    try
+    {
+        AsyncFetchEngineRuntime &runtime = asyncFetchEngineRuntime();
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        if(runtime.published)
+            return runtime.published->available();
+        if(!runtime.candidate)
+            runtime.candidate = std::make_unique<CurlMultiEngine>();
+        return runtime.candidate->available();
+    }
+    catch(...)
+    {
+        return false;
+    }
+}
+
+bool commitAsyncFetchEngineCandidate() noexcept
+{
+    AsyncFetchEngineRuntime &runtime = asyncFetchEngineRuntime();
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    if(runtime.published)
+        return runtime.published->available();
+    if(!runtime.candidate || !runtime.candidate->available())
+        return false;
+    runtime.published = std::move(runtime.candidate);
+    runtime.published->publish();
+    multi_engine_instance.store(runtime.published.get(),
+                                std::memory_order_release);
+    return true;
+}
+
+void rollbackAsyncFetchEngineCandidate() noexcept
+{
+    std::unique_ptr<CurlMultiEngine> candidate;
+    AsyncFetchEngineRuntime &runtime = asyncFetchEngineRuntime();
+    {
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        candidate = std::move(runtime.candidate);
+    }
+}
+
+bool resetAsyncFetchEngine() noexcept
+{
+    std::unique_ptr<CurlMultiEngine> retired;
+    AsyncFetchEngineRuntime &runtime = asyncFetchEngineRuntime();
+    {
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        if(runtime.candidate)
+            return false;
+        multi_engine_instance.store(nullptr, std::memory_order_release);
+        retired = std::move(runtime.published);
+    }
+    if(retired)
+    {
+        retired->requestShutdown();
+        if(!retired->join())
+            return false;
+    }
+    outbound_fetch_shutdown_requested.store(false,
+                                             std::memory_order_release);
+    return resetGlobalFetchMemoryBudget();
+}
+
+AsyncFetchEngineSnapshot asyncFetchEngineSnapshot() noexcept
+{
+    if(CurlMultiEngine *engine =
+           multi_engine_instance.load(std::memory_order_acquire))
+        return engine->snapshot();
+    const RetainedResponseByteSnapshot retained =
+        retainedResponseByteSnapshot();
+    return {false, false, 0, 0, 0, 0, 0, 0, 0, 0, retained.used,
+            0, 0, 0};
+}
+
+bool requestAsyncFetchRuntimeLimits(
+    AsyncFetchRuntimeLimits limits) noexcept
+{
+    if(CurlMultiEngine *engine =
+           multi_engine_instance.load(std::memory_order_acquire))
+        return engine->requestRuntimeLimits(limits);
+    return false;
+}
+
+void webGetAsync(AsyncFetchRequest request, AsyncFetchCompletion completion)
+{
+    if(!completion)
+        return;
+    if(!request.request_context && !request.retain_result_bytes)
+        request.request_context = captureCurrentRequestContext();
+    request.public_fetch_restricted =
+        isPublicFetchRestricted(request.context);
+    if(!isFetchUrlAllowed(request.url, request.context))
+    {
+        AsyncFetchResult result;
+        result.status_code = 403;
+        completion(std::make_shared<AsyncFetchResult>(std::move(result)));
+        return;
+    }
+    if(request.method == HTTP_GET)
+    {
+        const CocrSourceResolution source = resolveCocrSourceUrl(
+            request.url,
+            effectiveSettings().customOpenClashRulesSourceSwitch);
+        request.url = source.effective_url;
+    }
+    if(startsWith(request.url, "data:"))
+    {
+        AsyncFetchResult result;
+        if(request.capture_content)
+            result.content = dataGet(request.url);
+        if(!result.content.empty())
+        {
+            const bool retained =
+                request.request_context && !request.retain_result_bytes
+                    ? request.request_context->retainResponseBytes(
+                          result.content.size())
+                    : result.retained_bytes.retain(result.content.size());
+            if(!retained)
+            {
+                result.content.clear();
+                result.failure = AsyncFetchFailure::Capacity;
+            }
+        }
+        result.status_code = !request.capture_content || !result.content.empty()
+                                 ? 200
+                                 : 400;
+        completion(std::make_shared<AsyncFetchResult>(std::move(result)));
+        return;
+    }
+    if(request.deadline == std::chrono::steady_clock::time_point::max())
+        request.deadline = networkFetchDeadline(request.deadline);
+    if(!request.cancellation.valid())
+    {
+        if(auto context = captureCurrentRequestContext())
+            request.cancellation = context->cancellationToken();
+    }
+    const Settings &settings = effectiveSettings();
+    const ResolvedProxyPolicy snapshot = request.proxy.snapshot();
+    ResolvedProxyRoute route =
+        resolveProxyRoute(snapshot, request.url, request.context);
+    multiEngine().submit(std::move(request), std::move(route),
+                         settings.allowInsecureTls,
+                         settings.maxAllowedDownloadSize,
+                         std::move(completion));
+}
+
+AsyncFetchFuture webGetAsync(AsyncFetchRequest request)
+{
+    auto promise =
+        std::make_shared<std::promise<SharedAsyncFetchResult>>();
+    AsyncFetchFuture future = promise->get_future().share();
+    webGetAsync(std::move(request),
+                [promise](SharedAsyncFetchResult result) noexcept {
+                    try
+                    {
+                        promise->set_value(std::move(result));
+                    }
+                    catch(...)
+                    {
+                    }
+                });
+    return future;
+}
+
+static void shutdownAsyncFetchEngine() noexcept
+{
+    if(CurlMultiEngine *engine =
+           multi_engine_instance.load(std::memory_order_seq_cst))
+        engine->requestShutdown();
+}
+
+static bool joinAsyncFetchEngine() noexcept
+{
+    if(CurlMultiEngine *engine =
+           multi_engine_instance.load(std::memory_order_acquire))
+        return engine->join();
+    return true;
 }
 
 //static std::string curlGet(const std::string &url, const std::string &proxy, std::string &response_headers, CURLcode &return_code, const string_map &request_headers)
@@ -1574,7 +3191,12 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
         *result.status_code = 0;
         if(return_code)
             *return_code = retVal;
-        writeLog(0, "curl_global_init 失败：" + std::string(curl_easy_strerror(retVal)), LOG_LEVEL_ERROR);
+        if(return_failure)
+        {
+            curl_progress_data progress;
+            *return_failure = classify_async_failure(retVal, progress);
+        }
+        writeLog(LOG_LEVEL_ERROR, "curl_global_init 失败：" + std::string(curl_easy_strerror(retVal)));
         return 0;
     }
 
@@ -1590,21 +3212,28 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
         *result.status_code = 0;
         if(return_code)
             *return_code = retVal;
-        writeLog(0, "curl_easy_init 失败。", LOG_LEVEL_ERROR);
+        if(return_failure)
+        {
+            curl_progress_data progress;
+            *return_failure = classify_async_failure(retVal, progress);
+        }
+        writeLog(LOG_LEVEL_ERROR, "curl_easy_init 失败。");
         return 0;
     }
-    ProxyPolicy effective_proxy;
-    retVal = apply_curl_proxy_policy(curl_handle, argument.proxy, new_url,
-                                     effective_proxy);
+    retVal = apply_curl_proxy_policy(curl_handle, route, new_url);
     if(retVal != CURLE_OK)
     {
         *result.status_code = 0;
         if(return_code)
             *return_code = retVal;
-        curl_easy_cleanup(curl_handle);
+        if(return_failure)
+        {
+            curl_progress_data progress;
+            *return_failure = classify_async_failure(retVal, progress);
+        }
         return 0;
     }
-    if(effective_proxy.mode == ProxyMode::Cors)
+    if(route.proxy.mode == ProxyMode::Cors)
         header_list = curl_slist_append(header_list,
                                         "X-Requested-With: SubConverter-Extended " VERSION);
     curl_progress_data limit;
@@ -1633,11 +3262,12 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
         return 0;
     }
 #if LIBCURL_VERSION_NUM >= 0x075000
-    FetchContext prereq_context = argument.context;
-    if(isPublicFetchRestricted(argument.context) &&
-       (effective_proxy.mode == ProxyMode::Direct ||
-        (effective_proxy.mode == ProxyMode::System &&
-         effective_proxy.endpoint.empty())))
+    curl_prereq_data prereq_context {
+        isPublicFetchRestricted(argument.context)};
+    if(prereq_context.restricted &&
+       (route.proxy.mode == ProxyMode::Direct ||
+        (route.proxy.mode == ProxyMode::System &&
+         route.proxy.endpoint.empty())))
     {
         curl_easy_setopt(curl_handle, CURLOPT_PREREQFUNCTION,
                          public_fetch_prereq_callback);
@@ -1711,17 +3341,73 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
 
     retVal = curl_easy_perform(curl_handle);
     if(retVal != CURLE_OK &&
+       !outbound_fetch_shutdown_requested.load(std::memory_order_relaxed) &&
        (argument.method == HTTP_GET || argument.method == HTTP_HEAD) &&
        is_recoverable_curl_error(retVal))
     {
-        writeLog(0, "出站请求遇到可恢复网络错误，200ms 后重试一次。",
-                 LOG_LEVEL_WARNING);
-        if(result.content)
-            result.content->clear();
-        if(result.response_headers)
-            result.response_headers->clear();
-        sleepMs(200);
-        retVal = curl_easy_perform(curl_handle);
+        const ResourceControlSnapshot resources = resourceControlSnapshot();
+        const bool performance_mode = performanceFetchMode(resources);
+        const bool performance_retry =
+            performance_mode && argument.method == HTTP_GET;
+        const uint8_t retry_limit = performance_retry ? 3 : 1;
+        uint64_t unique_seed = 1;
+        if(limit.request_context)
+            unique_seed = std::hash<std::string>{}(
+                limit.request_context->requestId());
+        for(uint8_t retry_attempt = 0;
+            retVal != CURLE_OK && retry_attempt < retry_limit &&
+            is_recoverable_curl_error(retVal);
+            ++retry_attempt)
+        {
+            const std::chrono::milliseconds retry_delay =
+                recoverableRetryDelay(new_url, retry_attempt, unique_seed,
+                                      performance_retry);
+            const auto now = std::chrono::steady_clock::now();
+            if(limit.deadline !=
+                   std::chrono::steady_clock::time_point::max() &&
+               now + retry_delay >= limit.deadline)
+                break;
+            writeLog(LOG_LEVEL_WARNING,
+                     "出站请求遇到可恢复网络错误，正在分散退避后重试："
+                     " attempt=" + std::to_string(retry_attempt + 1) +
+                         " delay_ms=" +
+                         std::to_string(retry_delay.count()) +
+                         " code=" +
+                         std::to_string(static_cast<int>(retVal)) + "。");
+            if(result.content)
+                std::string().swap(*result.content);
+            if(result.response_headers)
+                std::string().swap(*result.response_headers);
+            resetAttemptRetention(limit);
+            if(!waitForRecoverableRetry(retry_delay, limit.deadline,
+                                        limit.cancellation))
+            {
+                retVal = limit.cancellation.isCancellationRequested() ||
+                                 outbound_fetch_shutdown_requested.load(
+                                     std::memory_order_relaxed)
+                             ? CURLE_ABORTED_BY_CALLBACK
+                             : CURLE_OPERATION_TIMEDOUT;
+                break;
+            }
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(limit.deadline -
+                                           std::chrono::steady_clock::now());
+            if(limit.deadline !=
+                   std::chrono::steady_clock::time_point::max() &&
+               remaining.count() <= 0)
+            {
+                retVal = CURLE_OPERATION_TIMEDOUT;
+                break;
+            }
+            curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT_MS,
+                             limit.deadline ==
+                                     std::chrono::steady_clock::time_point::max()
+                                 ? LONG_MAX
+                                 : static_cast<long>(std::clamp<int64_t>(
+                                       remaining.count(), 1,
+                                       static_cast<int64_t>(LONG_MAX))));
+            retVal = curl_easy_perform(curl_handle);
+        }
     }
 
     long code = 0;
@@ -1756,26 +3442,6 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
             writeLog(LOG_LEVEL_WARNING,
                      "TLS 信任源不可用，无法验证远程证书；请检查当前系统的受信任根证书配置。");
     }
-
-#if LIBCURL_VERSION_NUM >= 0x080700
-    long used_proxy = 0;
-    if(curl_easy_getinfo(curl_handle, CURLINFO_USED_PROXY, &used_proxy) == CURLE_OK &&
-       shouldLog(LOG_LEVEL_VERBOSE))
-        writeLog(0, std::string("出站代理实际使用：") +
-                        (used_proxy ? "是" : "否") + "。",
-                 LOG_LEVEL_VERBOSE);
-#endif
-#if LIBCURL_VERSION_NUM >= 0x074900
-    long proxy_error = 0;
-    if(curl_easy_getinfo(curl_handle, CURLINFO_PROXY_ERROR, &proxy_error) == CURLE_OK &&
-       proxy_error != 0 && shouldLog(LOG_LEVEL_VERBOSE))
-        writeLog(0, "出站代理错误代码：" + std::to_string(proxy_error) + "。",
-                 LOG_LEVEL_VERBOSE);
-#endif
-    if(retVal != CURLE_OK && shouldLog(LOG_LEVEL_VERBOSE))
-        writeLog(0, "出站请求错误类别：" +
-                        std::string(classify_curl_error(retVal)) + "。",
-                 LOG_LEVEL_VERBOSE);
 
     if(result.cookies)
     {
@@ -2021,10 +3687,9 @@ static int curlGetWithGitHubFallback(
     if(result.cookies)
         original_cookies = *result.cookies;
 
-    writeLog(0,
+    writeLog(LOG_LEVEL_WARNING,
              "GitHub Raw 获取失败，正在尝试 jsDelivr 回退源：" +
-                 fallback_url,
-             LOG_LEVEL_WARNING);
+                  summarizeUrlForLog(fallback_url));
     clear_fetch_output(result);
 
     FetchArgument fallback_argument {HTTP_GET, fallback_url, argument.proxy,
@@ -2040,16 +3705,17 @@ static int curlGetWithGitHubFallback(
         curlGet(fallback_argument, fallback_route, result, &fallback_code);
     if(fallback_code == CURLE_OK && fallback_status == 200)
     {
-        writeLog(0,
+        if(return_failure)
+            *return_failure = AsyncFetchFailure::None;
+        writeLog(LOG_LEVEL_INFO,
                  "GitHub Raw 已通过 jsDelivr 回退源获取成功：" +
-                     fallback_url,
-                 LOG_LEVEL_INFO);
+                      summarizeUrlForLog(fallback_url));
         return fallback_status;
     }
 
-    writeLog(0,
-             "GitHub Raw 通过 jsDelivr 回退源获取失败：" + fallback_url,
-             LOG_LEVEL_WARNING);
+    writeLog(LOG_LEVEL_WARNING,
+             "GitHub Raw 通过 jsDelivr 回退源获取失败：" +
+                 summarizeUrlForLog(fallback_url));
     clear_fetch_output(result);
     if(result.response_headers)
         *result.response_headers = original_headers;
@@ -2091,20 +3757,18 @@ static std::string dataGet(const std::string &url)
         return "";
 
     std::string data = urlDecode(url.substr(comma + 1));
-    if (global.maxAllowedDownloadSize > 0 &&
-        data.size() > static_cast<size_t>(global.maxAllowedDownloadSize)) {
-        writeLog(0, "已阻止 data URL：内容超过最大下载大小。",
-                 LOG_LEVEL_WARNING);
+    const long max_download_size = effectiveSettings().maxAllowedDownloadSize;
+    if (max_download_size > 0 &&
+        data.size() > static_cast<size_t>(max_download_size)) {
+        writeLog(LOG_LEVEL_WARNING, "已阻止 data URL：内容超过最大下载大小。");
         return "";
     }
     if (endsWith(url.substr(0, comma), ";base64")) {
         std::string decoded = urlSafeBase64Decode(data);
-        if (global.maxAllowedDownloadSize > 0 &&
-            decoded.size() >
-                static_cast<size_t>(global.maxAllowedDownloadSize)) {
-            writeLog(0,
-                     "已阻止解码后的 data URL：内容超过最大下载大小。",
-                     LOG_LEVEL_WARNING);
+        if (max_download_size > 0 &&
+            decoded.size() > static_cast<size_t>(max_download_size)) {
+            writeLog(LOG_LEVEL_WARNING,
+                     "已阻止解码后的 data URL：内容超过最大下载大小。");
             return "";
         }
         return decoded;
@@ -2127,7 +3791,7 @@ std::string buildSocks5ProxyString(const std::string &addr, int port, const std:
     return proxystr;
 }
 
-std::string webGet(const std::string &url, const ProxyPolicy &proxy, unsigned int cache_ttl, std::string *response_headers, string_icase_map *request_headers, FetchContext context)
+namespace
 {
 
 class OwnedWebGetState
@@ -2364,51 +4028,26 @@ public:
     void executeCached()
     {
         md("cache");
-        const std::string url_md5 = build_cache_key(url, proxy, request_headers);
-        const std::string path = "cache/" + url_md5, path_header = path + "_header";
-        struct stat result {};
-        if(stat(path.data(), &result) == 0) // cache exist
-        {
-            time_t mtime = result.st_mtime, now = time(nullptr); // get cache modified time and current time
-            if(difftime(now, mtime) <= cache_ttl) // within TTL
-            {
-                if(shouldLog(LOG_LEVEL_VERBOSE))
-                    writeLog(0, "缓存命中：'" + url + "'，使用本地缓存。");
-                //guarded_mutex guard(cache_rw_lock);
-                cache_rw_lock.readLock();
-                defer(cache_rw_lock.readUnlock();)
-                if(response_headers)
-                    *response_headers = fileGet(path_header, true);
-                return fileGet(path, true);
-            }
-            if(shouldLog(LOG_LEVEL_VERBOSE))
-                writeLog(0, "缓存过期：'" + url + "'，正在创建新缓存。"); // out of TTL
-        }
-        else
-        {
-            if(shouldLog(LOG_LEVEL_VERBOSE))
-                writeLog(0, "缓存不存在：'" + url + "'，正在创建新缓存。");
-        }
-        std::shared_future<CacheFetchResult> fetch_future;
-        bool owner = false;
-        {
-            std::lock_guard<std::mutex> lock(cache_fetch_mutex);
-            auto iter = cache_fetches.find(url_md5);
-            if(iter == cache_fetches.end())
-            {
-                fetch_future = std::async(std::launch::async, [argument]() {
-                    CacheFetchResult result;
-                    FetchResult fetch_result {&result.status_code, &result.content,
-                                               &result.response_headers, nullptr};
-                    curlGetWithGitHubFallback(argument, fetch_result);
-                    return result;
-                }).share();
-                cache_fetches.emplace(url_md5, fetch_future);
-                owner = true;
-            }
-            else
-                fetch_future = iter->second;
-        }
+        const std::string cache_key = build_cache_key(
+            effective_url_, initial_route_, requestHeaders());
+        const std::string path = "cache/" + cache_key;
+        const std::string header_path = path + "_header";
+        if(loadFreshCache(path, header_path))
+            return;
+        const bool cache_file_exists = fileExist(path);
+        if(!cache_file_exists && shouldLog(LOG_LEVEL_VERBOSE))
+            writeLog(LOG_LEVEL_VERBOSE,
+                     "缓存不存在：" + summarizeUrlForLog(effective_url_) +
+                         "，正在创建新缓存。");
+        const bool admission_cold_operation =
+            subscriptionCacheAdmissionEnabled() && !cache_file_exists;
+        const bool gated_cache_persistence =
+            admission_cold_operation &&
+            request_.high_cardinality_cache_admission;
+        bool persist_cache = true;
+        if(gated_cache_persistence)
+            persist_cache = subscriptionCacheDoorkeeper().admit(
+                cache_key, request_.cache_ttl);
 
         std::shared_ptr<CacheFetchOperation> operation;
         bool owner = false;
@@ -2419,31 +4058,20 @@ public:
         for(;;)
         {
             {
-                //guarded_mutex guard(cache_rw_lock);
-                cache_rw_lock.writeLock();
-                defer(cache_rw_lock.writeUnlock();)
-                fileWrite(path, content, true);
-                if(!fetched.response_headers.empty())
-                    fileWrite(path_header, fetched.response_headers, true);
-            }
-        }
-        else
-        {
-            if(fileExist(path) && global.serveCacheOnFetchFail) // failed, check if cache exist
-            {
-                if(shouldLog(LOG_LEVEL_VERBOSE))
-                    writeLog(0, "获取失败，返回缓存内容。"); // cache exist, serving cache
-                //guarded_mutex guard(cache_rw_lock);
-                cache_rw_lock.readLock();
-                defer(cache_rw_lock.readUnlock();)
-                content = fileGet(path, true);
-                if(response_headers)
-                    *response_headers = fileGet(path_header, true);
-            }
-            else
-            {
-                if(shouldLog(LOG_LEVEL_VERBOSE))
-                    writeLog(0, "获取失败，且没有可用的本地缓存。"); // cache not exist or not allow to serve cache, serving nothing
+                std::lock_guard<std::mutex> lock(cache_fetch_mutex);
+                auto iter = cache_fetches.find(registry_key);
+                if(iter == cache_fetches.end())
+                {
+                    operation = std::make_shared<CacheFetchOperation>(
+                        CacheFetchOwnerKind::Sync);
+                    cache_fetches.emplace(registry_key, operation);
+                    owner = true;
+                }
+                else
+                {
+                    operation = iter->second;
+                    owner = false;
+                }
             }
             attach_result = operation->attachConsumer();
             if(attach_result != CacheFetchOperation::AttachResult::Abandoned)

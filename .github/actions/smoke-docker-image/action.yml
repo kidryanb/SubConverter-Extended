@@ -8,13 +8,19 @@ inputs:
   platform:
     description: Docker platform to run, such as linux/amd64 or linux/arm/v7.
     required: true
-  custom-openclash-rules-revision:
-    description: Custom_OpenClash_Rules revision expected in the image.
-    required: true
   port:
     description: Container port exposed by SubConverter.
     required: false
     default: "25500"
+  expected-version:
+    description: Expected OCI and compiled version value.
+    required: true
+  expected-revision:
+    description: Expected full OCI revision; runtime BUILD_ID uses its seven-character prefix.
+    required: true
+  expected-build-date:
+    description: Expected OCI build timestamp.
+    required: true
 
 runs:
   using: composite
@@ -27,20 +33,17 @@ runs:
         IMAGE="${{ inputs.image }}"
         PLATFORM="${{ inputs.platform }}"
         CONTAINER_PORT="${{ inputs.port }}"
-        RULES_REVISION="${{ inputs.custom-openclash-rules-revision }}"
-
+        EXPECTED_VERSION="${{ inputs.expected-version }}"
+        EXPECTED_REVISION="${{ inputs.expected-revision }}"
+        EXPECTED_BUILD_DATE="${{ inputs.expected-build-date }}"
         CID=""
-        PUBLISH_CID=""
-        PUBLISH_CONFIG=""
+        POLICY_CID=""
         cleanup() {
-          if [ -n "$PUBLISH_CID" ]; then
-            docker rm -f "$PUBLISH_CID" >/dev/null 2>&1 || true
+          if [ -n "$POLICY_CID" ]; then
+            docker rm -f "$POLICY_CID" >/dev/null 2>&1 || true
           fi
           if [ -n "$CID" ]; then
             docker rm -f "$CID" >/dev/null 2>&1 || true
-          fi
-          if [ -n "$PUBLISH_CONFIG" ]; then
-            rm -f "$PUBLISH_CONFIG"
           fi
         }
         trap cleanup EXIT
@@ -55,73 +58,69 @@ runs:
           test "${TZ:-}" = "Asia/Shanghai"
           test -e /usr/share/zoneinfo/Asia/Shanghai
           test "$(date +%z)" = "+0800"
-          test -s /base/Custom_OpenClash_Rules/manifest.sha256
-          test -s /base/Custom_OpenClash_Rules/main/rule/Custom_Direct.list
+          test ! -e /base/Custom_OpenClash_Rules
         '
-
-        image_rules_revision="$(docker inspect --format '{{ index .Config.Labels "com.aethersailor.custom-openclash-rules.revision" }}' "$CID")"
-        if [ "$image_rules_revision" != "$RULES_REVISION" ]; then
-          echo "Image rules revision mismatch: expected $RULES_REVISION, got $image_rules_revision" >&2
+        if [ "$(docker inspect --format '{{ if index .Config.Labels "com.aethersailor.custom-openclash-rules.revision" }}present{{ end }}' "$CID")" = "present" ]; then
+          echo "Image still contains the removed Custom_OpenClash_Rules revision label." >&2
           exit 1
         fi
 
         for _ in $(seq 1 30); do
           if curl -fsS "$URL" >/tmp/subconverter-smoke.out; then
             head -c 200 /tmp/subconverter-smoke.out
+            python3 scripts/verify_container_image_identity.py \
+              --container "$CID" \
+              --url "$URL" \
+              --expected-version "$EXPECTED_VERSION" \
+              --expected-revision "$EXPECTED_REVISION" \
+              --expected-build-date "$EXPECTED_BUILD_DATE"
             python3 scripts/run-subconverter-smoke.py \
               --base-url "http://127.0.0.1:${HOST_PORT}" \
               --remote-subscription-url "${FIXTURE_BASE}/sample-subscription.txt" \
+              --mihomo-raw-subscription-url "${FIXTURE_BASE}/mihomo-raw-subscription.txt" \
               --mihomo-yaml-subscription-url "${FIXTURE_BASE}/mihomo-provider-subscription.yml" \
               --legacy-subscription-url "${FIXTURE_BASE}/legacy-surge-subscription.conf" \
               --verify-non-clash
             python3 scripts/run-no-resolve-smoke.py \
               --base-url "http://127.0.0.1:${HOST_PORT}" \
               --fixture-base-url "${FIXTURE_BASE}"
+            route_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              "http://127.0.0.1:${HOST_PORT}/Custom_OpenClash_Rules/main/rule/example.yaml")"
+            test "$route_status" = "404"
 
-            default_publish_status="$(
-              curl -sS -o /dev/null -w '%{http_code}' \
-                "http://127.0.0.1:${HOST_PORT}/Custom_OpenClash_Rules/main/rule/Custom_Direct.list"
-            )"
-            if [ "$default_publish_status" != "404" ]; then
-              echo "Expected bundled rule publication to default to 404, got ${default_publish_status}" >&2
-              exit 1
-            fi
+            docker logs "$CID" >/tmp/subconverter-security-default.log 2>&1
+            grep -F "SECURITY_PROFILE_EFFECTIVE profile=lan source=file:toml" \
+              /tmp/subconverter-security-default.log
+            grep -F "SECURITY_UPLOAD_EFFECTIVE profile=lan configured_allow_public_upload=false source=file:toml effective=allowed reason=lan-compatibility" \
+              /tmp/subconverter-security-default.log
+            grep -F "SECURITY_EXPOSURE_POSSIBLE profile=lan bind=0.0.0.0:${CONTAINER_PORT} public_reachability=unknown" \
+              /tmp/subconverter-security-default.log
 
-            PUBLISH_CONFIG="$(mktemp)"
-            sed 's/^publish_enabled = false$/publish_enabled = true/' \
-              base/pref.example.toml > "$PUBLISH_CONFIG"
-            grep -qx 'publish_enabled = true' "$PUBLISH_CONFIG"
-
-            PUBLISH_CID="$(
-              docker run -d --platform "$PLATFORM" \
-                -e PORT="$CONTAINER_PORT" \
-                -p "127.0.0.1::${CONTAINER_PORT}" \
-                -v "$PUBLISH_CONFIG:/base/pref.toml:ro" \
-                "$IMAGE"
-            )"
-            PUBLISH_HOST_PORT="$(
-              docker port "$PUBLISH_CID" "${CONTAINER_PORT}/tcp" |
-                awk -F: 'END {print $NF}'
-            )"
-            PUBLISH_URL="http://127.0.0.1:${PUBLISH_HOST_PORT}/version"
-            publish_ready=0
-            for _ in $(seq 1 30); do
-              if curl -fsS "$PUBLISH_URL" >/dev/null; then
-                publish_ready=1
+            POLICY_CID="$(docker run -d --platform "$PLATFORM" \
+              -e PORT=25501 \
+              -e SUBCONVERTER_SECURITY_PROFILE=publci \
+              -e SUBCONVERTER_ALLOW_PUBLIC_UPLOAD=truthy \
+              "$IMAGE")"
+            policy_ready=false
+            for _ in $(seq 1 20); do
+              docker logs "$POLICY_CID" >/tmp/subconverter-security-policy.log 2>&1 || true
+              if grep -Fq "SECURITY_PROFILE_INVALID_FALLBACK source=environment input='publci' effective=lan compatibility_fallback=true" \
+                  /tmp/subconverter-security-policy.log \
+                && grep -Fq "SECURITY_UPLOAD_VALUE_INVALID source=environment input='truthy' effective=false" \
+                  /tmp/subconverter-security-policy.log; then
+                policy_ready=true
                 break
               fi
-              sleep 2
+              if ! docker ps --filter "id=$POLICY_CID" --format '{{.ID}}' | grep -q .; then
+                cat /tmp/subconverter-security-policy.log
+                exit 1
+              fi
+              sleep 1
             done
-            if [ "$publish_ready" != "1" ]; then
-              docker logs "$PUBLISH_CID" || true
+            if [ "$policy_ready" != true ]; then
+              cat /tmp/subconverter-security-policy.log
               exit 1
             fi
-
-            curl -fsS \
-              "http://127.0.0.1:${PUBLISH_HOST_PORT}/Custom_OpenClash_Rules/main/rule/Custom_Direct.list" \
-              > /tmp/bundled-custom-direct.list
-            curl -fsS "https://raw.githubusercontent.com/Aethersailor/Custom_OpenClash_Rules/${RULES_REVISION}/rule/Custom_Direct.list" > /tmp/upstream-custom-direct.list
-            cmp /tmp/bundled-custom-direct.list /tmp/upstream-custom-direct.list
             exit 0
           fi
 

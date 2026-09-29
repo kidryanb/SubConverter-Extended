@@ -14,13 +14,15 @@
 
 #include "config/preference_file.h"
 #include "config/ruleset.h"
-#include "handler/custom_openclash_rules_endpoint.h"
+#include "handler/curl_handle_pool.h"
 #include "handler/dashboard_auth.h"
+#include "handler/conversion_service.h"
 #include "handler/dashboard_page.h"
 #include "handler/inspect_page.h"
 #include "handler/interfaces.h"
 #include "handler/multithread.h"
 #include "handler/settings.h"
+#include "handler/settings_view.h"
 #include "handler/statistics.h"
 #include "handler/version_page.h"
 #include "handler/webget.h"
@@ -116,9 +118,27 @@ void chkArg(int argc, char *argv[]) {
       if (i < argc - 1)
         global.generateProfiles.assign(argv[++i]);
     } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) {
-      if (i < argc - 1)
-        if (freopen(argv[++i], "a", stderr) == nullptr)
-          std::cerr << "无法将输出重定向到日志文件。\n";
+      if (i < argc - 1) {
+        const char *log_path = argv[++i];
+        // --log is an explicit local-operator destination, not a path derived
+        // from an HTTP request. Arbitrary absolute paths are part of the CLI
+        // contract and are opened without invoking a shell.
+        // codeql[cpp/path-injection]
+        const LogRedirectResult result = redirectStderrToAppendFile(log_path);
+        if (result.success) {
+          writeLog(LOG_LEVEL_INFO,
+                   "LOG_REDIRECT_ACTIVE mode=append rotation=external");
+        } else {
+          writeLog(LOG_LEVEL_ERROR,
+                   "LOG_REDIRECT_FAILED stage=" + std::string(result.stage) +
+                       " errno=" + std::to_string(result.error_number) +
+                       " action=continue-with-stderr");
+        }
+      } else {
+        writeLog(LOG_LEVEL_ERROR,
+                 "LOG_REDIRECT_FAILED reason=missing-path "
+                 "action=continue-with-stderr");
+      }
     }
   }
 }
@@ -157,9 +177,11 @@ void cron_tick_caller() {
   const std::sig_atomic_t signal = pendingShutdownSignal;
   if (signal != 0) {
     pendingShutdownSignal = 0;
-    writeLog(0,
-             "收到中断信号 " + std::to_string(signal) + "，正在退出...",
-             LOG_LEVEL_FATAL);
+    writeLog(LOG_LEVEL_INFO,
+             "SHUTDOWN_REQUESTED signal=" +
+                 std::string(shutdownSignalName(signal)) +
+                 " signal_code=" + std::to_string(signal) +
+                 " action=graceful-stop");
     webServer.stop_web_server();
     return;
   }
@@ -167,6 +189,56 @@ void cron_tick_caller() {
     cron_tick();
   if (global.statisticsEnabled)
     statistics::tick();
+}
+
+void begin_runtime_shutdown();
+void drain_runtime_shutdown();
+
+void shutdown_runtime() {
+  begin_runtime_shutdown();
+  drain_runtime_shutdown();
+  statistics::shutdown();
+  shutdownGlobalCurlHandlePool();
+  completeRuntimeCoordinatorShutdown();
+}
+
+void begin_runtime_shutdown() {
+  requestRuntimeCoordinatorShutdown();
+}
+
+void drain_runtime_shutdown() {
+  (void)joinRuntimeCoordinator();
+}
+
+std::string publishRuntimeState() {
+  const std::string path = getEnv("SUBCONVERTER_RUNTIME_STATE_FILE");
+  if (path.empty())
+    return "";
+
+  rapidjson::StringBuffer buffer;
+  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+  writer.StartObject();
+  writer.Key("schema");
+  writer.Int(1);
+  writer.Key("pid");
+  writer.Int64(static_cast<int64_t>(getpid()));
+  writer.Key("listen_address");
+  writer.String(global.listenAddress.c_str());
+  writer.Key("listen_port");
+  writer.Int(global.listenPort);
+  writer.Key("version");
+  writer.String(VERSION);
+  writer.Key("build_id");
+  writer.String(BUILD_ID);
+  writer.EndObject();
+
+  const int result = fileWrite(path, buffer.GetString(), true);
+  if (fileCommitFailed(result)) {
+    writeLog(LOG_LEVEL_WARNING,
+             "RUNTIME_STATE_WRITE_FAILED action=continue-without-state");
+    return "";
+  }
+  return path;
 }
 
 int main(int argc, char *argv[]) {
@@ -212,12 +284,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   setcd(global.prefPath); // then switch to pref directory
-  writeLog(0, "SubConverter-Extended " VERSION " 正在启动...", LOG_LEVEL_INFO);
+  writeLog(LOG_LEVEL_INFO, "SubConverter-Extended " VERSION " 正在启动...");
 #ifdef _WIN32
   WSADATA wsaData;
   if (WSAStartup(MAKEWORD(1, 1), &wsaData) != 0) {
     // std::cerr<<"WSAStartup failed.\n";
-    writeLog(0, "WSAStartup 初始化失败。", LOG_LEVEL_FATAL);
+    writeLog(LOG_LEVEL_FATAL, "WSAStartup 初始化失败。");
     return 1;
   }
   defer(WSACleanup();)
@@ -232,6 +304,30 @@ int main(int argc, char *argv[]) {
 
   SetConsoleTitle("SubConverter-Extended " VERSION);
   if (!readConf())
+    return 1;
+  writeLog(LOG_LEVEL_INFO,
+      "并发运行参数：HTTP base/max threads=" +
+          std::to_string(global.maxConcurThreads) + "/" +
+          std::to_string(global.maxServerThreads) +
+          ", ruleset executor workers/queue=" +
+          std::to_string(rulesetExecutorWorkerCount()) + "/" +
+          std::to_string(rulesetExecutorQueueCapacity()) +
+          ", curl pool cap=" +
+          std::to_string(curlHandlePoolCapacity(
+              static_cast<size_t>(global.maxConcurThreads))) +
+          ", ExternalConfig cache=" +
+          std::to_string(externalConfigCacheMaxEntries()) + " entries/" +
+          std::to_string(externalConfigCacheMaxBytes()) + " bytes" +
+          ", ruleset conversion cache=" +
+          std::to_string(rulesetConversionCacheMaxEntries()) + " entries/" +
+          std::to_string(rulesetConversionCacheMaxBytes()) + " bytes。");
+  // Register cleanup before any background refresh starts. The HTTP backend
+  // drains accepted requests before returning, so only then may the executor
+  // cancel unobserved work and release its curl leases before the pool stops.
+  defer(shutdown_runtime();)
+  if (!prepareRuntimeCoordinator())
+    return 1;
+  if (!commitRuntimeCoordinator())
     return 1;
   statistics::initialize();
   // vfs::vfs_read("vfs.ini");
@@ -252,10 +348,9 @@ int main(int argc, char *argv[]) {
       normalize_managed_prefix(getEnv("MANAGED_PREFIX"));
   if (!env_managed_config_prefix.empty() && !env_managed_prefix.empty() &&
       env_managed_config_prefix != env_managed_prefix) {
-    writeLog(0,
+    writeLog(LOG_LEVEL_WARNING,
              "同时设置了 MANAGED_CONFIG_PREFIX 和 MANAGED_PREFIX，使用 "
-             "MANAGED_CONFIG_PREFIX。",
-             LOG_LEVEL_WARNING);
+             "MANAGED_CONFIG_PREFIX。");
   }
   if (!env_managed_config_prefix.empty())
     global.managedConfigPrefix = env_managed_config_prefix;
@@ -266,14 +361,6 @@ int main(int argc, char *argv[]) {
 
   if (global.generatorMode)
     return simpleGenerator();
-
-  /*
-  webServer.append_response("GET", "/", "text/plain", [](RESPONSE_CALLBACK_ARGS)
-  -> std::string
-  {
-      return "SubConverter-Extended " VERSION " backend\n";
-  });
-  */
 
   webServer.append_response("GET", "/version/favicon-dark.svg",
                             "image/svg+xml; charset=utf-8",
@@ -289,12 +376,10 @@ int main(int argc, char *argv[]) {
   if (global.statisticsEnabled) {
     webServer.append_response(
         "GET", "/dashboard", "text/html; charset=utf-8",
-        global.dashboardAuthEnabled ? dashboard_auth::page
-                                    : dashboard_page::page);
+        dashboard_auth::page);
     webServer.append_response(
         "GET", "/dashboard/data", "application/json; charset=utf-8",
-        global.dashboardAuthEnabled ? dashboard_auth::data
-                                    : statistics::dashboardData);
+        dashboard_auth::data);
   }
 
   webServer.append_response(
@@ -312,109 +397,28 @@ int main(int argc, char *argv[]) {
                               return "ok\n";
                             });
 
-  /*
-  webServer.append_response("GET", "/refreshrules", "text/plain",
-                            [](RESPONSE_CALLBACK_ARGS) -> std::string {
-                              return "ok\n";
-                            });
-
-  /*
-  webServer.append_response("GET", "/readconf", "text/plain",
-                            [](RESPONSE_CALLBACK_ARGS) -> std::string {
-                              // Token authentication disabled - no
-                              // authorization required
-                              readConf();
-                              if (!global.updateRulesetOnRequest)
-                                refreshRulesets(global.customRulesets,
-                                                global.rulesetsContent);
-                              return "done\n";
-                            });
-  */
-
-  /*
-  webServer.append_response(
-      "POST", "/updateconf", "text/plain",
-      [](RESPONSE_CALLBACK_ARGS) -> std::string {
-        // Token authentication disabled - no authorization required
-        std::string type = getUrlArg(request.argument, "type");
-        if (type == "form" || type == "direct") {
-          fileWrite(global.prefPath, request.postdata, true);
-        } else {
-          response.status_code = 501;
-          return "Not Implemented\n";
-        }
-
-        readConf();
-        if (!global.updateRulesetOnRequest)
-          refreshRulesets(global.customRulesets, global.rulesetsContent);
-        return "done\n";
-      });
-  */
-
-  /*
-  webServer.append_response("GET", "/flushcache", "text/plain",
-                            [](RESPONSE_CALLBACK_ARGS) -> std::string {
-                              // Token authentication disabled - no
-                              // authorization required
-                              flushCache();
-                              return "done";
-                            });
-  */
-
-  webServer.append_response("GET", "/sub", "text/plain;charset=utf-8",
-                            global.statisticsEnabled ? subconverterTracked
-                                                     : subconverter);
-
-  webServer.append_response("HEAD", "/sub", "text/plain",
-                            global.statisticsEnabled ? subconverterTracked
-                                                     : subconverter);
-
-  if (global.customOpenClashRulesPublish) {
+  if (global.resourceControlEffective == "compat") {
     webServer.append_response(
-        "GET", R"(/Custom_OpenClash_Rules/main(/.*)?)",
-        "application/octet-stream",
-        custom_openclash_rules_endpoint::serve);
+        "GET", "/sub", "text/plain;charset=utf-8",
+        global.statisticsEnabled ? subconverterTracked : subconverter);
+    webServer.append_response(
+        "HEAD", "/sub", "text/plain",
+        global.statisticsEnabled ? subconverterTracked : subconverter);
+  } else {
+    webServer.append_async_response(
+        "GET", "/sub", "text/plain;charset=utf-8",
+        global.statisticsEnabled ? subconverterTracked : subconverter,
+        global.statisticsEnabled ? subconverterTrackedAsync
+                                 : subconverterAsync);
+    webServer.append_async_response(
+        "HEAD", "/sub", "text/plain",
+        global.statisticsEnabled ? subconverterTracked : subconverter,
+        global.statisticsEnabled ? subconverterTrackedAsync
+                                 : subconverterAsync);
   }
-
-  /*
-  webServer.append_response("GET", "/sub2clashr", "text/plain;charset=utf-8",
-                            simpleToClashR);
-
-  webServer.append_response("GET", "/surge2clash", "text/plain;charset=utf-8",
-                            surgeConfToClash);
-  */
 
   webServer.append_response("GET", "/getruleset", "text/plain;charset=utf-8",
                             getRuleset);
-
-  /*
-  webServer.append_response("GET", "/getprofile", "text/plain;charset=utf-8",
-                            getProfile);
-
-  webServer.append_response("GET", "/render", "text/plain;charset=utf-8",
-                            renderTemplate);
-  */
-
-  if (!global.APIMode) {
-    webServer.append_response("GET", "/get", "text/plain;charset=utf-8",
-                              [](RESPONSE_CALLBACK_ARGS) -> std::string {
-                                std::string url = urlDecode(
-                                    getUrlArg(request.argument, "url"));
-                                return webGet(url, parseProxy(global.proxyConfig));
-                              });
-
-    webServer.append_response(
-        "GET", "/getlocal", "text/plain;charset=utf-8",
-        [](RESPONSE_CALLBACK_ARGS) -> std::string {
-          return fileGet(urlDecode(getUrlArg(request.argument, "path")));
-        });
-  }
-
-  // webServer.append_response("POST", "/create-profile",
-  // "text/plain;charset=utf-8", createProfile);
-
-  // webServer.append_response("GET", "/list-profiles",
-  // "text/plain;charset=utf-8", listProfiles);
 
   std::string env_port = getEnv("PORT");
   if (getEnv("SUBCONVERTER_LISTEN_PORT").empty() && !env_port.empty())
@@ -425,22 +429,53 @@ int main(int argc, char *argv[]) {
             std::remove(runtime_state_path.c_str());)
   if (global.securityProfile == "lan" &&
       (global.listenAddress == "0.0.0.0" || global.listenAddress == "::")) {
-    writeLog(0,
+    writeLog(LOG_LEVEL_WARNING,
              "当前安全档位为 lan，但正在监听所有网络接口。面向公网部署请使用 "
-             "security.profile=public。",
-             LOG_LEVEL_WARNING);
+             "security.profile=public。");
+  }
+  logSecurityPosture();
+  int listen_backlog = global.maxPendingConns;
+  std::size_t request_body_limit = 100 * 1024 * 1024;
+  const ResourceControlSnapshot listener_resources =
+      resourceControlSnapshot();
+  if (listener_resources.effective_mode == "force_max" &&
+      listener_resources.calculated_force_max_budget.valid) {
+    listen_backlog = static_cast<int>(std::min<uint64_t>(
+        listener_resources.calculated_force_max_budget
+            .transport_queue_entries,
+        INT_MAX));
+    const ForceMaxBudget &budget =
+        listener_resources.calculated_force_max_budget;
+    request_body_limit = forceMaxRequestBodyLimit(
+        budget.transport_active_bytes,
+        1,
+        request_body_limit);
+  }
+  listener_args args = {
+      global.listenAddress,
+      global.listenPort,
+      global.maxPendingConns,
+      listen_backlog,
+      global.maxConcurThreads,
+      cron_tick_caller,
+      200,
+      static_cast<uint32_t>(global.requestDeadlineMs),
+      begin_runtime_shutdown,
+      drain_runtime_shutdown,
+      request_body_limit,
+      refreshResourceControlThreadBaseline};
+  if (listener_resources.effective_mode == "force_max" &&
+      listener_resources.calculated_force_max_budget.valid) {
+    args.accepted_conn = static_cast<int>(std::min<uint64_t>(
+        listener_resources.calculated_force_max_budget.accepted_connections,
+        INT_MAX));
+    args.wait_on_connection_capacity = true;
   }
   // std::cout<<"Serving HTTP @
   // http://"<<listen_address<<":"<<listen_port<<std::endl;
-  writeLog(0,
+  writeLog(LOG_LEVEL_INFO,
            "正在启动 HTTP 服务：http://" + global.listenAddress + ":" +
-               std::to_string(global.listenPort),
-           LOG_LEVEL_INFO);
+               std::to_string(global.listenPort));
   int ret = webServer.start_web_server_multi(&args);
-  statistics::shutdown();
-
-#ifdef _WIN32
-  WSACleanup();
-#endif // _WIN32
   return ret;
 }

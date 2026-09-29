@@ -32,7 +32,8 @@ static bool expectRejected(const std::string &input) {
 }
 
 int main() {
-  bool ok = kDefaultProxyProviderInterval == 3600;
+  // This fork disables periodic provider refresh by default.
+  bool ok = kDefaultProxyProviderInterval == 0;
   ok = expectAccepted("0", 0) && ok;
   ok = expectAccepted("3600", 3600) && ok;
   ok = expectAccepted(" 7200 ", 7200) && ok;

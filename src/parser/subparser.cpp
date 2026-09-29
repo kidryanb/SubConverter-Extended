@@ -70,6 +70,695 @@ void extractRemark(std::string &link, std::string &remark) {
     }
 }
 
+namespace {
+
+std::string nextMieruSourceId() {
+    static std::atomic<uint64_t> next_id{1};
+    return std::to_string(next_id.fetch_add(1, std::memory_order_relaxed));
+}
+
+struct ParsedShareUri {
+    std::string user;
+    std::string host;
+    std::string port;
+    std::string query;
+    std::string remark;
+};
+
+int shareUriHexValue(unsigned char ch) {
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+    return -1;
+}
+
+// Userinfo follows RFC 3986 percent-encoding, not HTML form encoding. A
+// literal '+' therefore remains '+'. Query values use the project's regular
+// form-style URL decoder below, matching url.Values-based Xray generators.
+std::string decodeShareUriUserInfo(const std::string &value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        unsigned char ch = static_cast<unsigned char>(value[i]);
+        if (ch == '%' && i + 2 < value.size()) {
+            const int high = shareUriHexValue(static_cast<unsigned char>(value[i + 1]));
+            const int low = shareUriHexValue(static_cast<unsigned char>(value[i + 2]));
+            if (high >= 0 && low >= 0) {
+                ch = static_cast<unsigned char>((high << 4) | low);
+                i += 2;
+            }
+        }
+        if (ch != '\r' && ch != '\n')
+            decoded.push_back(static_cast<char>(ch));
+    }
+    return decoded;
+}
+
+bool validSharePort(const std::string &port) {
+    if (port.empty() || port.size() > 5 ||
+        !std::all_of(port.begin(), port.end(), [](unsigned char ch) {
+            return std::isdigit(ch) != 0;
+        }))
+        return false;
+    const int value = to_int(port, 0);
+    return value >= 1 && value <= 65535;
+}
+
+bool validHysteriaUriMbps(const std::string &value) {
+    if (value.empty() ||
+        !std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+            return std::isdigit(ch) != 0;
+        }))
+        return false;
+    try {
+        const unsigned long long parsed = std::stoull(value);
+        return parsed > 0 &&
+               parsed <= static_cast<unsigned long long>(
+                             std::numeric_limits<int>::max());
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+bool decodeStrictBase64(const std::string &encoded, std::string &decoded) {
+    if (encoded.empty())
+        return false;
+
+    size_t padding_start = encoded.size();
+    for (size_t i = 0; i < encoded.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(encoded[i]);
+        if (ch == '=') {
+            padding_start = std::min(padding_start, i);
+            continue;
+        }
+        if (padding_start != encoded.size() ||
+            !(std::isalnum(ch) || ch == '-' || ch == '_' || ch == '+' || ch == '/'))
+            return false;
+    }
+    const size_t padding = encoded.size() - padding_start;
+    if (padding > 0) {
+        const size_t expected_padding =
+            padding_start % 4 == 2 ? 2 : (padding_start % 4 == 3 ? 1 : 0);
+        if (encoded.size() % 4 != 0 || padding != expected_padding)
+            return false;
+    } else if (padding_start % 4 == 1) {
+        return false;
+    }
+
+    std::string candidate = urlSafeBase64Decode(encoded);
+    std::string normalized = encoded.substr(0, padding_start);
+    normalized = replaceAllDistinct(replaceAllDistinct(normalized, "+", "-"), "/", "_");
+    if (urlSafeBase64Encode(candidate) != normalized)
+        return false;
+    decoded = std::move(candidate);
+    return true;
+}
+
+bool parseShareAuthority(const std::string &authority, std::string &host,
+                         std::string &port) {
+    if (authority.empty())
+        return false;
+    if (authority.front() == '[') {
+        const size_t bracket = authority.find(']');
+        if (bracket == std::string::npos || bracket + 2 >= authority.size() ||
+            authority[bracket + 1] != ':')
+            return false;
+        host = authority.substr(1, bracket - 1);
+        port = authority.substr(bracket + 2);
+    } else {
+        const size_t colon = authority.rfind(':');
+        if (colon == std::string::npos || colon == 0 || colon + 1 >= authority.size() ||
+            authority.find(':') != colon)
+            return false;
+        host = authority.substr(0, colon);
+        port = authority.substr(colon + 1);
+    }
+    return !host.empty() && host.find_first_of("\r\n") == std::string::npos &&
+           validSharePort(port);
+}
+
+bool parseUserPassword(const std::string &userinfo, bool allow_plain,
+                       std::string &username, std::string &password) {
+    std::string decoded;
+    if (allow_plain && userinfo.find(':') != std::string::npos)
+        decoded = decodeShareUriUserInfo(userinfo);
+    else if (!decodeStrictBase64(userinfo, decoded))
+        return false;
+
+    const size_t colon = decoded.find(':');
+    if (colon == std::string::npos)
+        return false;
+    username = decoded.substr(0, colon);
+    password = decoded.substr(colon + 1);
+    return username.find_first_of("\r\n") == std::string::npos &&
+           password.find_first_of("\r\n") == std::string::npos;
+}
+
+bool parseShareUri(std::string uri, const std::string &scheme, ParsedShareUri &parsed) {
+    const std::string prefix = scheme + "://";
+    if (!startsWith(uri, prefix))
+        return false;
+    uri.erase(0, prefix.size());
+
+    extractRemark(uri, parsed.remark);
+    const size_t query_pos = uri.find('?');
+    if (query_pos != std::string::npos) {
+        parsed.query = uri.substr(query_pos + 1);
+        uri.erase(query_pos);
+    }
+    if (!uri.empty() && uri.back() == '/')
+        uri.pop_back();
+
+    const size_t at = uri.rfind('@');
+    if (at == std::string::npos || at == 0 || at + 1 >= uri.size())
+        return false;
+    parsed.user = decodeShareUriUserInfo(uri.substr(0, at));
+    std::string authority = uri.substr(at + 1);
+
+    if (!authority.empty() && authority.front() == '[') {
+        const size_t bracket = authority.find(']');
+        if (bracket == std::string::npos || bracket + 1 >= authority.size() || authority[bracket + 1] != ':')
+            return false;
+        parsed.host = authority.substr(1, bracket - 1);
+        parsed.port = authority.substr(bracket + 2);
+    } else {
+        const size_t colon = authority.rfind(':');
+        if (colon == std::string::npos || colon == 0 || colon + 1 >= authority.size())
+            return false;
+        parsed.host = authority.substr(0, colon);
+        parsed.port = authority.substr(colon + 1);
+    }
+
+    return !parsed.user.empty() && !parsed.host.empty() && validSharePort(parsed.port);
+}
+
+bool validHysteria2PortToken(const std::string &token, uint16_t &first_port,
+                             std::string &remaining) {
+    const size_t dash = token.find('-');
+    if (dash == std::string::npos) {
+        if (!validSharePort(token))
+            return false;
+        first_port = static_cast<uint16_t>(to_int(token, 0));
+        remaining.clear();
+        return true;
+    }
+    if (dash == 0 || dash + 1 >= token.size() || token.find('-', dash + 1) != std::string::npos)
+        return false;
+    const std::string start = token.substr(0, dash);
+    const std::string end = token.substr(dash + 1);
+    if (!validSharePort(start) || !validSharePort(end))
+        return false;
+    const int first = to_int(start, 0);
+    const int last = to_int(end, 0);
+    if (first > last)
+        return false;
+    first_port = static_cast<uint16_t>(first);
+    remaining = first < last ? std::to_string(first + 1) + "-" + end : std::string();
+    return true;
+}
+
+bool normalizeHysteriaPortSpec(const std::string &value,
+                               std::string &normalized,
+                               uint16_t &first_port) {
+    string_array normalized_ranges;
+    first_port = 0;
+    for (std::string range : split(value, ",")) {
+        range = trim(range);
+        if (range.empty())
+            return false;
+        if (range.find(':') != std::string::npos) {
+            if (range.find(':') != range.rfind(':'))
+                return false;
+            range[range.find(':')] = '-';
+        }
+        uint16_t range_first = 0;
+        std::string ignored_remaining;
+        if (!validHysteria2PortToken(range, range_first, ignored_remaining))
+            return false;
+        if (normalized_ranges.empty())
+            first_port = range_first;
+        normalized_ranges.emplace_back(std::move(range));
+    }
+    if (normalized_ranges.empty())
+        return false;
+    normalized = join(normalized_ranges, ",");
+    return true;
+}
+
+bool normalizeHysteriaProtocol(std::string &protocol) {
+    protocol = toLower(trim(protocol));
+    if (protocol.empty())
+        protocol = "udp";
+    return protocol == "udp" || protocol == "wechat-video" ||
+           protocol == "faketcp";
+}
+
+bool normalizeHysteriaNetwork(std::string &network) {
+    network = toLower(trim(network));
+    return network.empty() || network == "tcp" || network == "udp";
+}
+
+bool validHysteriaHopInterval(const std::string &interval) {
+    return interval.empty() ||
+           regMatch(interval, R"(^([1-9][0-9]*(?:ns|us|ms|s|m|h))+$)");
+}
+
+bool parseModernShareUri(std::string uri, const std::string &scheme,
+                         bool require_user, const std::string &default_port,
+                         bool allow_hysteria2_ports, ParsedShareUri &parsed,
+                         std::string &additional_ports) {
+    const std::string prefix = scheme + "://";
+    if (!startsWith(uri, prefix))
+        return false;
+    uri.erase(0, prefix.size());
+
+    const size_t fragment_pos = uri.find('#');
+    if (fragment_pos != std::string::npos) {
+        parsed.remark = decodeShareUriUserInfo(uri.substr(fragment_pos + 1));
+        uri.erase(fragment_pos);
+    }
+    const size_t query_pos = uri.find('?');
+    if (query_pos != std::string::npos) {
+        parsed.query = uri.substr(query_pos + 1);
+        uri.erase(query_pos);
+    }
+    if (!uri.empty() && uri.back() == '/')
+        uri.pop_back();
+    if (uri.empty() || uri.find('/') != std::string::npos)
+        return false;
+
+    const size_t at = uri.rfind('@');
+    std::string authority;
+    if (at == std::string::npos) {
+        if (require_user)
+            return false;
+        authority = uri;
+    } else {
+        if (at == 0 || at + 1 >= uri.size())
+            return false;
+        parsed.user = decodeShareUriUserInfo(uri.substr(0, at));
+        authority = uri.substr(at + 1);
+    }
+
+    std::string port_spec;
+    if (!authority.empty() && authority.front() == '[') {
+        const size_t bracket = authority.find(']');
+        if (bracket == std::string::npos)
+            return false;
+        parsed.host = authority.substr(1, bracket - 1);
+        if (bracket + 1 < authority.size()) {
+            if (authority[bracket + 1] != ':' || bracket + 2 >= authority.size())
+                return false;
+            port_spec = authority.substr(bracket + 2);
+        }
+    } else {
+        const size_t colon = authority.rfind(':');
+        if (colon == std::string::npos) {
+            parsed.host = authority;
+        } else {
+            if (authority.find(':') != colon || colon == 0 || colon + 1 >= authority.size())
+                return false;
+            parsed.host = authority.substr(0, colon);
+            port_spec = authority.substr(colon + 1);
+        }
+    }
+    if (parsed.host.empty())
+        return false;
+    if (port_spec.empty())
+        port_spec = default_port;
+
+    if (!allow_hysteria2_ports) {
+        if (!validSharePort(port_spec))
+            return false;
+        parsed.port = port_spec;
+        return !require_user || !parsed.user.empty();
+    }
+
+    const string_array port_tokens = split(port_spec, ",");
+    if (port_tokens.empty())
+        return false;
+    uint16_t primary_port = 0;
+    std::string first_remaining;
+    if (!validHysteria2PortToken(port_tokens.front(), primary_port, first_remaining))
+        return false;
+    string_array remaining_ports;
+    if (!first_remaining.empty())
+        remaining_ports.emplace_back(std::move(first_remaining));
+    for (size_t i = 1; i < port_tokens.size(); ++i) {
+        uint16_t ignored_port = 0;
+        std::string ignored_remaining;
+        if (!validHysteria2PortToken(port_tokens[i], ignored_port, ignored_remaining))
+            return false;
+        remaining_ports.emplace_back(port_tokens[i]);
+    }
+    parsed.port = std::to_string(primary_port);
+    additional_ports = join(remaining_ports, ",");
+    return true;
+}
+
+bool isXrayUuid(const std::string &value) {
+    static const std::string pattern =
+            R"(^[\da-fA-F]{8}-[\da-fA-F]{4}-[\da-fA-F]{4}-[\da-fA-F]{4}-[\da-fA-F]{12}$)";
+    return regMatch(value, pattern);
+}
+
+std::string decodedUrlArg(const std::string &query, const std::string &key) {
+    return urlDecode(getUrlArg(query, key));
+}
+
+std::vector<std::string> getUrlAlpnList(const std::string &query) {
+    std::vector<std::string> result;
+    for (std::string item : split(decodedUrlArg(query, "alpn"), ",")) {
+        item = trim(item);
+        if (!item.empty())
+            result.emplace_back(std::move(item));
+    }
+    return result;
+}
+
+std::string decodedFirstUrlArg(const std::string &query,
+                               std::initializer_list<const char *> keys) {
+    for (const char *key : keys) {
+        std::string value = decodedUrlArg(query, key);
+        if (!value.empty())
+            return value;
+    }
+    return {};
+}
+
+uint16_t parseUint16Option(const std::string &value, uint16_t fallback,
+                           bool allow_seconds_suffix = false) {
+    std::string normalized = trim(value);
+    if (allow_seconds_suffix && normalized.size() > 1 && normalized.back() == 's')
+        normalized.pop_back();
+    if (normalized.empty() || normalized.size() > 5 ||
+        !std::all_of(normalized.begin(), normalized.end(), [](unsigned char ch) {
+            return std::isdigit(ch) != 0;
+        }))
+        return fallback;
+    const int parsed = to_int(normalized, -1);
+    return parsed >= 0 && parsed <= 65535 ? static_cast<uint16_t>(parsed) : fallback;
+}
+
+tribool getXrayAllowInsecure(const std::string &query) {
+    std::string value = getUrlArg(query, "insecure");
+    if (value.empty())
+        value = getUrlArg(query, "allowInsecure");
+    return tribool(value);
+}
+
+std::string normalizeXrayTransport(std::string network) {
+    network = toLower(trim(network));
+    if (network.empty() || network == "raw")
+        return "tcp";
+    if (network == "none")
+        return "tcp";
+    if (network == "websocket")
+        return "ws";
+    if (network == "mkcp")
+        return "kcp";
+    if (network == "gun")
+        return "grpc";
+    if (network == "h2")
+        return "http";
+    if (network == "splithttp")
+        return "xhttp";
+    return network;
+}
+
+void rememberXrayLinkOption(Proxy &node, const std::string &query, const std::string &key) {
+    std::string value = decodedUrlArg(query, key);
+    if (!value.empty())
+        node.XrayLinkOptions.emplace_back(key, std::move(value));
+}
+
+void rememberXrayLinkOptions(Proxy &node, const std::string &query) {
+    static const string_array keys = {
+        "authority", "extra", "fm", "ech", "pcs", "vcn", "pqv", "spx"
+    };
+    for (const std::string &key : keys)
+        rememberXrayLinkOption(node, query, key);
+}
+
+bool parseXrayTransport(const std::string &query, Proxy &node, std::string &network,
+                        std::string &header_type, std::string &path, std::string &host,
+                        std::string &mode) {
+    network = normalizeXrayTransport(decodedUrlArg(query, "type"));
+    header_type = decodedUrlArg(query, "headerType");
+    switch (hash_(network)) {
+        case "tcp"_hash:
+            if (header_type == "http") {
+                host = decodedUrlArg(query, "host");
+                path = getUrlArg(query, "path");
+            }
+            break;
+        case "kcp"_hash:
+            path = getUrlArg(query, "seed");
+            break;
+        case "ws"_hash:
+        case "http"_hash:
+        case "httpupgrade"_hash:
+            host = decodedUrlArg(query, "host");
+            path = getUrlArg(query, "path");
+            break;
+        case "grpc"_hash:
+            path = getUrlArg(query, "serviceName");
+            mode = decodedUrlArg(query, "mode");
+            break;
+        case "xhttp"_hash:
+            host = decodedUrlArg(query, "host");
+            path = getUrlArg(query, "path");
+            mode = decodedUrlArg(query, "mode");
+            break;
+        case "quic"_hash:
+            host = decodedUrlArg(query, "quicSecurity");
+            path = getUrlArg(query, "key");
+            break;
+        default:
+            return false;
+    }
+    rememberXrayLinkOptions(node, query);
+    return true;
+}
+
+std::string stripWireGuardQuotes(std::string value) {
+    value = trim(value);
+    if (value.size() >= 2 &&
+        ((value.front() == '"' && value.back() == '"') ||
+         (value.front() == '\'' && value.back() == '\'')))
+        value = value.substr(1, value.size() - 2);
+    return trim(value);
+}
+
+std::vector<std::string> splitWireGuardFields(const std::string &value) {
+    std::vector<std::string> result;
+    size_t start = 0;
+    int round_depth = 0, square_depth = 0, brace_depth = 0;
+    char quote = 0;
+    bool escaped = false;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const char ch = value[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (quote != 0) {
+            if (ch == '\\')
+                escaped = true;
+            else if (ch == quote)
+                quote = 0;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+            continue;
+        }
+        switch (ch) {
+            case '(': ++round_depth; break;
+            case ')': --round_depth; break;
+            case '[': ++square_depth; break;
+            case ']': --square_depth; break;
+            case '{': ++brace_depth; break;
+            case '}': --brace_depth; break;
+            case ',':
+                if (round_depth == 0 && square_depth == 0 && brace_depth == 0) {
+                    result.emplace_back(trim(value.substr(start, i - start)));
+                    start = i + 1;
+                }
+                break;
+            default: break;
+        }
+        if (round_depth < 0 || square_depth < 0 || brace_depth < 0)
+            return {};
+    }
+    if (quote != 0 || round_depth != 0 || square_depth != 0 || brace_depth != 0)
+        return {};
+    result.emplace_back(trim(value.substr(start)));
+    return result;
+}
+
+bool parseWireGuardEndpoint(std::string endpoint, std::string &host,
+                            uint16_t &port) {
+    endpoint = stripWireGuardQuotes(std::move(endpoint));
+    std::string port_text;
+    if (endpoint.size() > 2 && endpoint.front() == '[') {
+        const size_t bracket = endpoint.find(']');
+        if (bracket == std::string::npos || bracket + 2 >= endpoint.size() ||
+            endpoint[bracket + 1] != ':')
+            return false;
+        host = endpoint.substr(1, bracket - 1);
+        port_text = endpoint.substr(bracket + 2);
+    } else {
+        const size_t colon = endpoint.rfind(':');
+        if (colon == std::string::npos || colon == 0 || colon + 1 >= endpoint.size())
+            return false;
+        host = endpoint.substr(0, colon);
+        port_text = endpoint.substr(colon + 1);
+    }
+    if (!validSharePort(port_text) || host.find_first_of("\r\n") != std::string::npos)
+        return false;
+    port = static_cast<uint16_t>(to_int(port_text, 0));
+    return !host.empty();
+}
+
+std::string normalizeWireGuardAllowedIPs(const std::string &value) {
+    string_array networks;
+    for (std::string network : split(value, ",")) {
+        network = trim(network);
+        if (network.empty())
+            return {};
+        const size_t slash = network.find('/');
+        const std::string address = slash == std::string::npos
+                                        ? network
+                                        : network.substr(0, slash);
+        const bool ipv4 = isIPv4(address);
+        const bool ipv6 = isIPv6(address);
+        if (!ipv4 && !ipv6)
+            return {};
+        if (slash == std::string::npos) {
+            network += ipv6 ? "/128" : "/32";
+        } else {
+            const std::string prefix = network.substr(slash + 1);
+            if (prefix.empty() ||
+                !std::all_of(prefix.begin(), prefix.end(), [](unsigned char ch) {
+                    return std::isdigit(ch) != 0;
+                }))
+                return {};
+            const int bits = to_int(prefix, -1);
+            if (bits < 0 || bits > (ipv6 ? 128 : 32))
+                return {};
+        }
+        networks.emplace_back(std::move(network));
+    }
+    return join(networks, ", ");
+}
+
+bool validWireGuardPeer(const WireGuardPeer &peer) {
+    return !peer.Hostname.empty() && peer.Port > 0 && !peer.PublicKey.empty() &&
+           !peer.AllowedIPs.empty();
+}
+
+std::string normalizeWireGuardReserved(std::string value) {
+    value = replaceAllDistinct(stripWireGuardQuotes(std::move(value)), "/", ",");
+    string_array bytes;
+    for (std::string item : split(value, ",")) {
+        item = trim(item);
+        if (item.empty() || item.size() > 3 ||
+            !std::all_of(item.begin(), item.end(), [](unsigned char ch) {
+                return std::isdigit(ch) != 0;
+            }))
+            return {};
+        const int byte = to_int(item, -1);
+        if (byte < 0 || byte > 255)
+            return {};
+        bytes.emplace_back(std::to_string(byte));
+    }
+    return join(bytes, ",");
+}
+
+void syncLegacyWireGuardProjection(Proxy &node) {
+    if (node.WireGuardLocalAddresses.empty()) {
+        if (!node.SelfIP.empty())
+            node.WireGuardLocalAddresses.emplace_back(node.SelfIP);
+        if (!node.SelfIPv6.empty())
+            node.WireGuardLocalAddresses.emplace_back(node.SelfIPv6);
+    }
+    if (node.WireGuardPeers.empty()) {
+        WireGuardPeer peer;
+        peer.Hostname = node.Hostname;
+        peer.Port = node.Port;
+        peer.PublicKey = node.PublicKey;
+        peer.PreSharedKey = node.PreSharedKey;
+        peer.AllowedIPs = node.AllowedIPs;
+        peer.Reserved = node.ClientId;
+        peer.KeepAlive = node.KeepAlive;
+        if (validWireGuardPeer(peer))
+            node.WireGuardPeers.emplace_back(std::move(peer));
+    }
+    if (!node.WireGuardPeers.empty()) {
+        const WireGuardPeer &peer = node.WireGuardPeers.front();
+        node.Hostname = peer.Hostname;
+        node.Port = peer.Port;
+        node.PublicKey = peer.PublicKey;
+        node.PreSharedKey = peer.PreSharedKey;
+        node.AllowedIPs = peer.AllowedIPs;
+        node.ClientId = peer.Reserved;
+        node.KeepAlive = peer.KeepAlive;
+    }
+}
+
+std::vector<std::string> jsonStringArray(const rapidjson::Value &value) {
+    std::vector<std::string> result;
+    if (value.IsString()) {
+        result.emplace_back(value.GetString());
+        return result;
+    }
+    if (!value.IsArray())
+        return result;
+    for (const auto &item : value.GetArray()) {
+        std::string text;
+        item >> text;
+        if (!text.empty())
+            result.emplace_back(std::move(text));
+    }
+    return result;
+}
+
+std::string jsonWireGuardReserved(const rapidjson::Value &value) {
+    if (value.IsArray())
+        return normalizeWireGuardReserved(join(jsonStringArray(value), ","));
+    std::string result;
+    value >> result;
+    return normalizeWireGuardReserved(std::move(result));
+}
+
+WireGuardPeer parseSingBoxWireGuardPeer(const rapidjson::Value &value,
+                                        bool endpoint_schema) {
+    WireGuardPeer peer;
+    if (!value.IsObject())
+        return peer;
+    peer.Hostname = GetMember(value, endpoint_schema ? "address" : "server");
+    peer.Port = parseUint16Option(
+        GetMember(value, endpoint_schema ? "port" : "server_port"), 0);
+    peer.PublicKey = GetMember(value, "public_key");
+    peer.PreSharedKey = GetMember(value, "pre_shared_key");
+    if (value.HasMember("allowed_ips"))
+        peer.AllowedIPs = normalizeWireGuardAllowedIPs(
+            join(jsonStringArray(value["allowed_ips"]), ", "));
+    if (value.HasMember("reserved"))
+        peer.Reserved = jsonWireGuardReserved(value["reserved"]);
+    std::string keepalive = GetMember(value, "persistent_keepalive_interval");
+    if (!keepalive.empty() && keepalive.back() == 's')
+        keepalive.pop_back();
+    peer.KeepAlive = parseUint16Option(keepalive, 0);
+    return peer;
+}
+
+} // namespace
+
 void commonConstruct(Proxy &node, ProxyType type, const std::string &group, const std::string &remarks,
                      const std::string &server, const std::string &port, const tribool &udp, const tribool &tfo,
                      const tribool &scv, const tribool &tls13, const std::string &underlying_proxy) {
@@ -1172,23 +1861,7 @@ void explodeTrojan(std::string trojan, Proxy &node) {
 
     std::string group, host, path, network, fp, sni, mode, header_type;
     tribool tfo, scv;
-    if (startsWith(trojan, "trojan://")) {
-        trojan.erase(0, 9);
-    }
-    if (startsWith(trojan, "trojan-go://")) {
-        trojan.erase(0, 12);
-    }
-    extractRemark(trojan, remark);
-    string_size pos;
-    pos = trojan.find('?');
-    if (pos != std::string::npos) {
-        addition = trojan.substr(pos + 1);
-        trojan.erase(pos);
-    }
-
-    if (regGetMatch(trojan, "(.*?)@(.*):(.*)", 4, 0, &psk, &server, &port))
-        return;
-    if (port == "0")
+    if (!parseXrayTransport(parsed.query, node, network, header_type, path, host, mode))
         return;
 
     sni = decodedUrlArg(parsed.query, "sni");
@@ -1240,12 +1913,10 @@ void explodeMierus(std::string mierus, Proxy &node) {
 }
 
 void explodeHysteria(std::string hysteria, Proxy &node) {
-    writeLog(0, "正在解析 Hysteria 节点。", LOG_LEVEL_DEBUG);
-    hysteria = regReplace(hysteria, "(hysteria|hy)://", "hysteria://");
-    if (regMatch(hysteria, "hysteria://(.*?)[:](.*)")) {
-        explodeStdHysteria(hysteria, node);
-        return;
-    }
+    writeLog(LOG_LEVEL_DEBUG, "正在解析 Hysteria 节点。");
+    if (startsWith(hysteria, "hy://"))
+        hysteria.replace(0, 5, "hysteria://");
+    explodeStdHysteria(std::move(hysteria), node);
 }
 
 void explodeHysteria2(std::string hysteria2, Proxy &node) {
@@ -1918,7 +2589,7 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes) {
                     host = singleproxy["sni"].IsDefined()
                                ? safe_as<std::string>(singleproxy["sni"])
                                : safe_as<std::string>(singleproxy["servername"]);
-                    writeLog(0, "Reality 主机：" + host, LOG_LEVEL_DEBUG);
+                    writeLog(LOG_LEVEL_DEBUG, "Reality 主机：" + host);
                     singleproxy["reality-opts"]["public-key"] >>= pbk;
                     singleproxy["reality-opts"]["short-id"] >>= sid;
                 }
@@ -2171,14 +2842,10 @@ void explodeStdVMess(std::string vmess, Proxy &node) {
 
 
 void explodeStdHysteria(std::string hysteria, Proxy &node) {
-    std::string add, port, type, auth, host, insecure, up, down, alpn, obfsParam, remarks, auth_str, sni;
-    std::string addition;
-    hysteria = hysteria.substr(11);
-    string_size pos;
-
-    extractRemark(hysteria, remarks);
-    const std::string stdhysteria_matcher = R"(^(.*)[:](\d+)[?](.*)$)";
-    if (regGetMatch(hysteria, stdhysteria_matcher, 4, 0, &add, &port, &addition))
+    ParsedShareUri parsed;
+    std::string ignored_ports;
+    if (!parseModernShareUri(std::move(hysteria), "hysteria", false, "",
+                             false, parsed, ignored_ports))
         return;
 
     std::string protocol = decodedUrlArg(parsed.query, "protocol");
@@ -2227,21 +2894,9 @@ void explodeStdMieru(std::string mieru, Proxy &node) {
         node = std::move(parsed_nodes.front());
 }
 
-    // 去除前缀
-    string_size pos;
-
-    // 提取 remarks
-    extractRemark(mieru, remarks);
-
-    // 提取参数
-    pos = mieru.rfind("?");
-    if (pos != mieru.npos) {
-        addition = mieru.substr(pos + 1);
-        mieru.erase(pos);
-    }
-
-    // 账号密码@host
-    if (regGetMatch(mieru, R"(^(.*?):(.*?)@(.*)$)", 4, 0, &username, &password, &host))
+void explodeMierusNodes(const std::string &mieru, std::vector<Proxy> &nodes) {
+    MieruSimpleConfig config;
+    if (!parseMieruSimpleUri(mieru, config))
         return;
 
     nodes.reserve(nodes.size() + config.port_bindings.size());
@@ -2276,7 +2931,56 @@ void explodeStdHysteria2(std::string hysteria2, Proxy &node) {
     if (!parseModernShareUri(std::move(hysteria2), "hysteria2", false, "443", true, parsed, ports))
         return;
 
-    extractRemark(hysteria2, remarks);
+    std::string password = parsed.user;
+    if (password.empty())
+        password = decodedUrlArg(parsed.query, "password");
+    std::string query_ports = decodedUrlArg(parsed.query, "ports");
+    if (!query_ports.empty()) {
+        for (const std::string &token : split(query_ports, ",")) {
+            uint16_t ignored_port = 0;
+            std::string ignored_remaining;
+            if (!validHysteria2PortToken(token, ignored_port,
+                                         ignored_remaining))
+                return;
+        }
+        ports = ports.empty() ? query_ports : ports + "," + query_ports;
+    }
+    const std::string sni = decodedUrlArg(parsed.query, "sni");
+    if (parsed.remark.empty())
+        parsed.remark = parsed.host + ":" + parsed.port;
+
+    hysteria2Construct(node, HYSTERIA2_DEFAULT_GROUP, parsed.remark, parsed.host, parsed.port, password, sni,
+                       decodedUrlArg(parsed.query, "up"), decodedUrlArg(parsed.query, "down"),
+                       decodedUrlArg(parsed.query, "alpn"), decodedUrlArg(parsed.query, "obfs"),
+                       decodedUrlArg(parsed.query, "obfs-password"), sni, "", ports,
+                       tribool(), tribool(), tribool(getUrlArg(parsed.query, "insecure")));
+    node.Fingerprint = decodedFirstUrlArg(parsed.query, {"pinSHA256", "pinsha256"});
+    node.Hysteria2ECH = decodedUrlArg(parsed.query, "ech");
+    node.Hysteria2PortsAreAdditional = !ports.empty();
+    if (toLower(trim(node.OBFSParam)) == "gecko") {
+        node.Hysteria2GeckoMinPacketSize = decodedFirstUrlArg(
+            parsed.query, {"minPacketSize", "min_packet_size"});
+        node.Hysteria2GeckoMaxPacketSize = decodedFirstUrlArg(
+            parsed.query, {"maxPacketSize", "max_packet_size"});
+    }
+}
+
+void explodeHysteria2Realm(std::string hysteria2, Proxy &node) {
+    const bool http = startsWith(hysteria2, "hysteria2+realm+http://");
+    const std::string prefix =
+        http ? "hysteria2+realm+http://" : "hysteria2+realm://";
+    if (!startsWith(hysteria2, prefix))
+        return;
+    hysteria2.erase(0, prefix.size());
+
+    std::string remark;
+    extractRemark(hysteria2, remark);
+    std::string query;
+    const size_t query_pos = hysteria2.find('?');
+    if (query_pos != std::string::npos) {
+        query = hysteria2.substr(query_pos + 1);
+        hysteria2.erase(query_pos);
+    }
 
     const size_t at = hysteria2.rfind('@');
     const size_t path = at == std::string::npos
@@ -2368,15 +3072,8 @@ void explodeStdHysteria2(std::string hysteria2, Proxy &node) {
 
 
 void explodeStdVless(std::string vless, Proxy &node) {
-    std::string add, port, type, id, aid, net, flow, pbk, sid, fp, mode, path, host, tls, remarks, sni;
-    std::string addition;
-    vless = vless.substr(8);
-    string_size pos;
-
-    extractRemark(vless, remarks);
-    const std::string stdvless_matcher =
-            R"(^([\da-fA-F]{8}-[\da-fA-F]{4}-[\da-fA-F]{4}-[\da-fA-F]{4}-[\da-fA-F]{12})@\[?([\d\-a-zA-Z:.]+)\]?:(\d+)(?:\/?\?(.*))?$)";
-    if (regGetMatch(vless, stdvless_matcher, 5, 0, &id, &add, &port, &addition))
+    ParsedShareUri parsed;
+    if (!parseShareUri(vless, "vless", parsed) || !isXrayUuid(parsed.user))
         return;
 
     std::string type, net, path, host, mode;
@@ -3756,43 +4453,6 @@ bool explodeSurge(std::string surge, std::vector<Proxy> &nodes) {
                                 std::vector<std::string>{}, fp, sni,
                                 udp, tribool(), scv, tribool(), "", 30, 30, 0);
                 break;
-            case "anytls"_hash: //Surge style anytls proxy
-                server = trim(configs[1]);
-                port = trim(configs[2]);
-                if (port == "0")
-                    continue;
-
-                for (i = 3; i < configs.size(); i++) {
-                    vArray = split(configs[i], "=");
-                    if (vArray.size() != 2)
-                        continue;
-                    itemName = trim(vArray[0]);
-                    itemVal = trim(vArray[1]);
-                    switch (hash_(itemName)) {
-                        case "password"_hash:
-                            password = itemVal;
-                            break;
-                        case "sni"_hash:
-                            sni = itemVal;
-                            break;
-                        case "skip-cert-verify"_hash:
-                            scv = itemVal;
-                            break;
-                        case "fingerprint"_hash:
-                            fp = itemVal;
-                            break;
-                        case "tls13"_hash:
-                            tls13 = itemVal;
-                            break;
-                        default:
-                            continue;
-                    }
-                }
-
-                anyTlSConstruct(node, ANYTLS_DEFAULT_GROUP, remarks, port, password, server,
-                                std::vector<std::string>{}, fp, sni,
-                                udp, tribool(), scv, tribool(), "", 30, 30, 0);
-                break;
             default:
                 switch (hash_(remarks)) {
                     case "shadowsocks"_hash: //quantumult x style ss/ssr link
@@ -5004,7 +5664,21 @@ void explodeTuic(const std::string &tuic, Proxy &node) {
     if (!parseModernShareUri(tuic, "tuic", true, "", false, parsed, ignored_ports))
         return;
 
-    extractRemark(link, remarks);
+    std::string uuid, password, token;
+    const size_t credential_separator = parsed.user.find(':');
+    if (credential_separator == std::string::npos) {
+        token = parsed.user;
+    } else {
+        uuid = parsed.user.substr(0, credential_separator);
+        password = parsed.user.substr(credential_separator + 1);
+        if (!isXrayUuid(uuid) || password.empty())
+            return;
+    }
+    const std::string query_token = decodedUrlArg(parsed.query, "token");
+    if (!query_token.empty())
+        token = query_token;
+    if (parsed.remark.empty())
+        parsed.remark = parsed.host + ":" + parsed.port;
 
     std::string udp_relay_mode = decodedFirstUrlArg(parsed.query, {"udp_relay_mode", "udp-relay-mode"});
     if (udp_relay_mode.empty())
@@ -5037,7 +5711,44 @@ void explodeAnyTLS(std::string anytls, Proxy &node) {
     if (parsed.remark.empty())
         parsed.remark = parsed.host + ":" + parsed.port;
 
-    extractRemark(anytls, remarks);
+    const uint16_t idle_check = parseUint16Option(
+        decodedFirstUrlArg(parsed.query, {"idle_session_check_interval", "idle-session-check-interval"}), 30, true);
+    const uint16_t idle_timeout = parseUint16Option(
+        decodedFirstUrlArg(parsed.query, {"idle_session_timeout", "idle-session-timeout"}), 30, true);
+    const uint16_t min_idle = parseUint16Option(
+        decodedFirstUrlArg(parsed.query, {"min_idle_session", "min-idle-session"}), 0);
+    const std::string insecure = decodedFirstUrlArg(parsed.query, {"insecure", "allow_insecure", "allow-insecure"});
+
+    anyTlSConstruct(node, ANYTLS_DEFAULT_GROUP, parsed.remark, parsed.port, parsed.user, parsed.host,
+                    getUrlAlpnList(parsed.query), decodedFirstUrlArg(parsed.query, {"fp", "fingerprint"}),
+                    decodedUrlArg(parsed.query, "sni"), tribool(decodedUrlArg(parsed.query, "udp")),
+                    tribool(decodedUrlArg(parsed.query, "tfo")), tribool(insecure), tribool(), "",
+                    idle_check, idle_timeout, min_idle);
+    node.TLSStr = decodedUrlArg(parsed.query, "security");
+    if (node.TLSStr.empty())
+        node.TLSStr = "tls";
+    node.PublicKey = decodedUrlArg(parsed.query, "pbk");
+    node.ShortId = decodedUrlArg(parsed.query, "sid");
+}
+
+void explodeNaive(std::string naive, Proxy &node) {
+    const bool quic = startsWith(naive, "naive+quic://");
+    ParsedShareUri parsed;
+    std::string ignored_ports;
+    if (!parseModernShareUri(std::move(naive),
+                             quic ? "naive+quic" : "naive+https", true,
+                             "443", false, parsed, ignored_ports))
+        return;
+
+    std::string username;
+    std::string password = parsed.user;
+    const size_t separator = parsed.user.find(':');
+    if (separator != std::string::npos) {
+        username = parsed.user.substr(0, separator);
+        password = parsed.user.substr(separator + 1);
+    }
+    if (password.empty())
+        return;
 
     uint32_t insecure_concurrency = 0;
     const std::string concurrency =

@@ -13,8 +13,23 @@
 inline void warnUnknownRulesetOptions(const StrArray &unknown_options)
 {
     for(const String &option : unknown_options)
-        writeLog(0, "未知规则集选项 '" + option + "'，已忽略。",
-                 LOG_LEVEL_WARNING);
+        writeLog(LOG_LEVEL_WARNING, "未知规则集选项 '" + option + "'，已忽略。");
+}
+
+inline bool isSelectHealthCheckUrl(const String &value)
+{
+    String scheme = toLower(value);
+    return startsWith(scheme, "http://") || startsWith(scheme, "https://");
+}
+
+inline void normalizeSelectHealthCheck(ProxyGroupConfig &conf)
+{
+    if(conf.Type != ProxyGroupType::Select || !conf.Url.empty() ||
+       conf.Proxies.empty() || !isSelectHealthCheckUrl(conf.Proxies.back()))
+        return;
+
+    conf.Url = std::move(conf.Proxies.back());
+    conf.Proxies.pop_back();
 }
 
 namespace toml

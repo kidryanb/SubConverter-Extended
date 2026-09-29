@@ -2,12 +2,21 @@
 set -euo pipefail
 
 VERSION="${1:?version is required}"
-SHA="${2:-}"
+REVISION="${2:-}"
 BUILD_DATE="${3:-}"
 THREADS="${THREADS:-4}"
+BUILD_TESTS="${BUILD_TESTS:-false}"
 : "${QUICKJSPP_REF:?QUICKJSPP_REF is required}"
 : "${LIBCRON_REF:?LIBCRON_REF is required}"
 : "${TOML11_REF:?TOML11_REF is required}"
+
+case "${BUILD_TESTS}" in
+  true|false) ;;
+  *)
+    echo "BUILD_TESTS must be true or false." >&2
+    exit 2
+    ;;
+esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK_DIR="${ROOT}/build/windows-amd64"
@@ -34,8 +43,9 @@ checkout_dependency() {
   fi
 }
 
-if [ -n "${SHA}" ]; then
-  sed -i "s/#define BUILD_ID \"\"/#define BUILD_ID \"${SHA}\"/ " src/version.h || true
+BUILD_ID="$(printf '%.7s' "${REVISION}")"
+if [ -n "${BUILD_ID}" ]; then
+  sed -i "s/#define BUILD_ID \"\"/#define BUILD_ID \"${BUILD_ID}\"/ " src/version.h || true
 fi
 if [ -n "${VERSION}" ]; then
   sed -i "s/#define VERSION \"dev\"/#define VERSION \"${VERSION}\"/" src/version.h || true
@@ -47,9 +57,11 @@ fi
 (
   cd bridge
   go mod download
-  go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated.go
-  go run ../scripts/generate_schemes.go ../src/parser/mihomo_schemes.h
-  go run ../scripts/generate_param_compat.go -o ../src/parser/param_compat.h
+  go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated.go -manifest mihomo_capabilities.json
+  go run ../scripts/generate_schemes.go -manifest mihomo_capabilities.json -o ../src/parser/mihomo_schemes.h
+  go run ../scripts/generate_param_compat.go -manifest mihomo_capabilities.json -o ../src/parser/param_compat.h
+  CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" -o "${WORK_DIR}/subconverter-update.exe" ./cmd/portable-updater
   CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=gcc \
     go build -trimpath -buildmode=c-archive -ldflags="-s -w" -o libmihomo.a .
 )
@@ -88,8 +100,13 @@ cmake -S "${ROOT}" -B "${BUILD_DIR}" -G Ninja \
   -DLIBCRON_INCLUDE_DIR="${DEPS_DIR}/include" \
   -DDATE_INCLUDE_DIR="${DEPS_DIR}/include" \
   -DLIBCRON_LIBRARY="${DEPS_DIR}/lib/liblibcron.a" \
-  -DTOML11_INCLUDE_DIR="${DEPS_DIR}/include"
+  -DTOML11_INCLUDE_DIR="${DEPS_DIR}/include" \
+  -DBUILD_TESTS="${BUILD_TESTS}"
 cmake --build "${BUILD_DIR}" -j "${THREADS}"
+
+if [ "${BUILD_TESTS}" = "true" ]; then
+  ctest --test-dir "${BUILD_DIR}" --output-on-failure --timeout 120
+fi
 
 RUNTIME_DLLS="${WORK_DIR}/runtime-dlls.txt"
 : > "${RUNTIME_DLLS}"

@@ -1,32 +1,57 @@
 name: Merge validated Dependabot PRs
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows:
+      - PR Validation
+      - Build and Push Docker image
+      - CodeQL
+    types: [completed]
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Inspect the queue without making changes
+        type: boolean
+        default: false
+      refresh_dependencies:
+        description: Request the separately validated full upstream refresh on dev
+        type: boolean
+        default: false
 
 permissions:
   actions: write
   contents: write
   pull-requests: write
 
+concurrency:
+  group: dependabot-maintenance
+  cancel-in-progress: false
+
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    timeout-minutes: 10
     steps:
-      - name: Merge Dependabot PR
-        uses: actions/github-script@v9
+      # Only default-branch maintenance code is loaded, never a PR checkout,
+      # artifact, cache, or script supplied by a dependency update.
+      - name: Checkout trusted maintenance code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Reconcile validated updates and dev delivery
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
+        env:
+          AUTOMERGE_MODE: ${{ vars.DEPENDABOT_AUTOMERGE_MODE || 'off' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          REFRESH_DEPENDENCIES: ${{ inputs.refresh_dependencies || false }}
+          # Dependabot rejects rebase commands from github-actions[bot]. This
+          # credential is used only for that command, never for merging a PR.
+          REBASE_TOKEN: ${{ secrets.PAT_TOKEN }}
+        with:
+          github-token: ${{ github.token }}
           script: |
-            const pullNumber = context.payload.pull_request.number;
-            const title = context.payload.pull_request.title;
-
-            await github.rest.pulls.merge({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pullNumber,
-              merge_method: 'squash',
-              commit_title: `${title} (#${pullNumber})`,
-            });
-
-            console.log('Dependabot PR merged successfully.');
+            await require('./.github/scripts/dependabot-maintenance.cjs')({github, context, core});

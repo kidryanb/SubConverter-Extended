@@ -3,7 +3,6 @@ subconverter.exe
 cmake-build-debug
 .idea
 base/cache
-base/Custom_OpenClash_Rules/
 scripts/quickjspp
 scripts/yaml-cpp
 .DS_Store
@@ -21,3 +20,7 @@ __pycache__/
 upstream-sync-*.json
 upstream-sync-*.md
 upstream-sync-decisions.raw
+
+# Local Markdown files under docs
+docs/*.md
+docs/**/*.md

@@ -12,7 +12,10 @@
 
 void refreshRulesets(RulesetConfigs &ruleset_list,
                      std::vector<RulesetContent> &rca,
-                     FetchContext context = FetchContext::TrustedConfig);
+                     FetchContext context = FetchContext::TrustedConfig,
+                     RulesetRefreshMode mode = RulesetRefreshMode::FetchAll,
+                     const std::vector<RulesetContent> *reusable_content =
+                         nullptr);
 bool readConf();
 int simpleGenerator();
 std::string convertRuleset(const std::string &content, int type);
@@ -22,6 +25,9 @@ std::string getRuleset(RESPONSE_CALLBACK_ARGS);
 
 std::string subconverter(RESPONSE_CALLBACK_ARGS);
 std::string subconverterTracked(RESPONSE_CALLBACK_ARGS);
+void subconverterAsync(Request request, async_response_completion completion);
+void subconverterTrackedAsync(Request request,
+                              async_response_completion completion);
 std::string simpleToClashR(RESPONSE_CALLBACK_ARGS);
 std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS);
 

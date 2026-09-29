@@ -58,9 +58,6 @@ jobs:
           git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
           git fetch --no-tags upstream "$UPSTREAM_BRANCH"
 
-      - name: Check protected master integrations
-        run: python3 scripts/check_sync_guards.py
-
       - name: Plan advisory upstream parser review
         run: |
           set -euo pipefail

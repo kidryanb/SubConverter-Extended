@@ -234,20 +234,6 @@ static void warnNoResolveIgnoredForTarget(
     const std::vector<RulesetContent> &ruleset_content_array,
     const std::string &target)
 {
-    for(const RulesetContent &ruleset : ruleset_content_array)
-    {
-        if(!ruleset.options.no_resolve)
-            continue;
-        writeLog(0,
-                 "规则集选项 no-resolve 不支持 " + target +
-                     " 输出，已对策略组 '" + ruleset.rule_group +
-                     "' 安全忽略。",
-                 LOG_LEVEL_WARNING);
-    }
-}
-
-void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules, bool new_field_name, RuleConversionStats *stats)
-{
     ForceMaxCooperativeBatch checkpoint(
         effectiveSettings().resourceControlEffective == "force_max", 128);
     for(const RulesetContent &ruleset : ruleset_content_array)
@@ -667,7 +653,7 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
         retrieved_rules = materializeRulesetContent(x);
         if(retrieved_rules.empty())
         {
-            writeLog(0, "获取规则集失败或规则集为空：'" + x.rule_path + "'。", LOG_LEVEL_WARNING);
+            writeLog(LOG_LEVEL_WARNING, "获取规则集失败或规则集为空：'" + x.rule_path + "'。");
             continue;
         }
         if(startsWith(retrieved_rules, "[]"))
@@ -676,8 +662,7 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
             strLine = appendClashRuleTarget(strLine, rule_group);
             allRules.emplace_back(strLine);
             total_rules++;
-            if(stats)
-                stats->add();
+            local_stats.add();
             continue;
         }
         retrieved_rules = convertRuleset(retrieved_rules, x.rule_type);
@@ -707,8 +692,7 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
                 appendClashIpCidrNoResolve(strLine, x.rule_type, x.options);
             allRules.emplace_back(strLine);
             total_rules++;
-            if(stats)
-                stats->add();
+            local_stats.add();
         }
     }
 
@@ -753,7 +737,7 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
         retrieved_rules = materializeRulesetContent(x);
         if(retrieved_rules.empty())
         {
-            writeLog(0, "获取规则集失败或规则集为空：'" + x.rule_path + "'。", LOG_LEVEL_WARNING);
+            writeLog(LOG_LEVEL_WARNING, "获取规则集失败或规则集为空：'" + x.rule_path + "'。");
             continue;
         }
         if(startsWith(retrieved_rules, "[]"))
@@ -762,8 +746,7 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
             strLine = appendClashRuleTarget(strLine, rule_group);
             output_content += "  - " + strLine + "\n";
             total_rules++;
-            if(stats)
-                stats->add();
+            local_stats.add();
             continue;
         }
         retrieved_rules = convertRuleset(retrieved_rules, x.rule_type);
@@ -794,8 +777,7 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
                 appendClashIpCidrNoResolve(strLine, x.rule_type, x.options);
             output_content += "  - " + strLine + "\n";
             total_rules++;
-            if(stats)
-                stats->add();
+            local_stats.add();
         }
     }
     if(stats)
@@ -805,6 +787,9 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
 
 void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_content_array, int surge_ver, bool overwrite_original_rules, const std::string &remote_path_prefix, RuleConversionStats *stats)
 {
+    ForceMaxCooperativeBatch checkpoint(
+        effectiveSettings().resourceControlEffective == "force_max", 128);
+    RuleConversionStats local_stats;
     warnNoResolveIgnoredForTarget(ruleset_content_array, "非 Clash");
     string_array allRules;
     std::string rule_group, rule_path, rule_path_typed, retrieved_rules, strLine;
@@ -871,8 +856,7 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
             strLine = replaceAllDistinct(strLine, ",,", ",");
             allRules.emplace_back(strLine);
             total_rules++;
-            if(stats)
-                stats->add();
+            local_stats.add();
             continue;
         }
         else
@@ -881,8 +865,7 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
             {
                 strLine = rule_path + ", tag=" + rule_group + ", force-policy=" + rule_group + ", enabled=true";
                 base_rule.set("filter_remote", "{NONAME}", strLine);
-                if(stats)
-                    stats->add();
+                local_stats.add();
                 continue;
             }
             if(fileExist(rule_path))
@@ -893,8 +876,7 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                     if(x.update_interval)
                         strLine += ",update-interval=" + std::to_string(x.update_interval);
                     allRules.emplace_back(strLine);
-                    if(stats)
-                        stats->add();
+                    local_stats.add();
                     continue;
                 }
                 else if(surge_ver == -1 && !remote_path_prefix.empty())
@@ -902,16 +884,14 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                     strLine = remote_path_prefix + "/getruleset?type=2&url=" + urlSafeBase64Encode(rule_path_typed) + "&group=" + urlSafeBase64Encode(rule_group);
                     strLine += ", tag=" + rule_group + ", enabled=true";
                     base_rule.set("filter_remote", "{NONAME}", strLine);
-                    if(stats)
-                        stats->add();
+                    local_stats.add();
                     continue;
                 }
                 else if(surge_ver == -4 && !remote_path_prefix.empty())
                 {
                     strLine = remote_path_prefix + "/getruleset?type=1&url=" + urlSafeBase64Encode(rule_path_typed) + "," + rule_group;
                     base_rule.set("Remote Rule", "{NONAME}", strLine);
-                    if(stats)
-                        stats->add();
+                    local_stats.add();
                     continue;
                 }
             }
@@ -933,8 +913,7 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                         strLine += ",update-interval=" + std::to_string(x.update_interval);
 
                     allRules.emplace_back(strLine);
-                    if(stats)
-                        stats->add();
+                    local_stats.add();
                     continue;
                 }
                 else if(surge_ver == -1 && !remote_path_prefix.empty())
@@ -942,16 +921,14 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                     strLine = remote_path_prefix + "/getruleset?type=2&url=" + urlSafeBase64Encode(rule_path_typed) + "&group=" + urlSafeBase64Encode(rule_group);
                     strLine += ", tag=" + rule_group + ", enabled=true";
                     base_rule.set("filter_remote", "{NONAME}", strLine);
-                    if(stats)
-                        stats->add();
+                    local_stats.add();
                     continue;
                 }
                 else if(surge_ver == -4)
                 {
                     strLine = rule_path + "," + rule_group;
                     base_rule.set("Remote Rule", "{NONAME}", strLine);
-                    if(stats)
-                        stats->add();
+                    local_stats.add();
                     continue;
                 }
             }
@@ -960,7 +937,7 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
             retrieved_rules = materializeRulesetContent(x);
             if(retrieved_rules.empty())
             {
-                writeLog(0, "获取规则集失败或规则集为空：'" + x.rule_path + "'。", LOG_LEVEL_WARNING);
+                writeLog(LOG_LEVEL_WARNING, "获取规则集失败或规则集为空：'" + x.rule_path + "'。");
                 continue;
             }
 
@@ -1027,8 +1004,7 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                 }
                 allRules.emplace_back(strLine);
                 total_rules++;
-                if(stats)
-                    stats->add();
+                local_stats.add();
             }
         }
     }
@@ -1226,56 +1202,68 @@ void emitSingBoxRuleBuckets(
     }
 }
 
-static rapidjson::Value transformRuleToSingBox(std::vector<std::string_view> &args, const std::string& rule, const std::string &group, rapidjson::MemoryPoolAllocator<>& allocator)
-{
-    args.clear();
-    split(args, rule, ',');
-    if (args.size() < 2) return rapidjson::Value(rapidjson::kObjectType);
-    auto type = toLower(std::string(args[0]));
-    auto value = toLower(std::string(args[1]));
-//    std::string_view option;
-//    if (args.size() >= 3) option = args[2];
-
-    rapidjson::Value rule_obj(rapidjson::kObjectType);
-    type = replaceAllDistinct(type, "-", "_");
-    type = replaceAllDistinct(type, "ip_cidr6", "ip_cidr");
-    type = replaceAllDistinct(type, "src_", "source_");
-    if (type == "match" || type == "final")
-    {
-        rule_obj.AddMember("outbound", rapidjson::Value(value.data(), value.size(), allocator), allocator);
+void appendSingBoxRemoteRuleSet(
+    rapidjson::Value &rule_sets, std::set<std::string> &existing_tags,
+    const std::string &family, const std::string &code,
+    const std::string &http_client,
+    rapidjson::MemoryPoolAllocator<> &allocator) {
+    const std::string tag = singBoxRuleSetTag(family, code);
+    if (!existing_tags.emplace(tag).second)
+        return;
+    rapidjson::Value rule_set(rapidjson::kObjectType);
+    rule_set.AddMember("type", "remote", allocator);
+    rule_set.AddMember("tag", rapidjson::Value(tag.c_str(), allocator),
+                       allocator);
+    rule_set.AddMember("format", "binary", allocator);
+    const std::string url =
+        "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/"
+        "sing/geo/" + family + "/" + code + ".srs";
+    rule_set.AddMember("url", rapidjson::Value(url.c_str(), allocator),
+                       allocator);
+    if (http_client.empty()) {
+        rule_set.AddMember("download_detour", "DIRECT", allocator);
+    } else {
+        rule_set.AddMember("http_client",
+                           rapidjson::Value(http_client.c_str(), allocator),
+                           allocator);
     }
-    else
-    {
-        rule_obj.AddMember(rapidjson::Value(type.c_str(), allocator), rapidjson::Value(value.data(), value.size(), allocator), allocator);
-        rule_obj.AddMember("outbound", rapidjson::Value(group.c_str(), allocator), allocator);
-    }
-    return rule_obj;
+    rule_sets.PushBack(rule_set, allocator);
 }
 
-static bool appendSingBoxRule(std::vector<std::string_view> &args, rapidjson::Value &rules, const std::string& rule, rapidjson::MemoryPoolAllocator<>& allocator)
-{
-    using namespace rapidjson_ext;
-    args.clear();
-    split(args, rule, ',');
-    if (args.size() < 2) return false;
-    auto type = args[0];
-//    std::string_view option;
-//    if (args.size() >= 3) option = args[2];
+std::string singBoxRuleSetHttpClient(const rapidjson::Document &base_rule) {
+    if (base_rule.HasMember("route") && base_rule["route"].IsObject()) {
+        const rapidjson::Value &route = base_rule["route"];
+        if (route.HasMember("default_http_client") &&
+            route["default_http_client"].IsString())
+            return route["default_http_client"].GetString();
+    }
+    if (base_rule.HasMember("http_clients") &&
+        base_rule["http_clients"].IsArray() &&
+        !base_rule["http_clients"].Empty()) {
+        const rapidjson::Value &client = base_rule["http_clients"][0];
+        if (client.IsObject() && client.HasMember("tag") &&
+            client["tag"].IsString())
+            return client["tag"].GetString();
+    }
+    return {};
+}
 
-    if (none_of(SingBoxRuleTypes, [&](const std::string& t){ return type == t; }))
+bool preserveSingBoxBaseActionRule(const rapidjson::Value &rule) {
+    if (!rule.IsObject() || !rule.HasMember("action") ||
+        !rule["action"].IsString())
         return false;
-
-    auto realType = toLower(std::string(type));
-    auto value = toLower(std::string(args[1]));
-    realType = replaceAllDistinct(realType, "-", "_");
-    realType = replaceAllDistinct(realType, "ip_cidr6", "ip_cidr");
-
-    rules | AppendToArray(realType.c_str(), rapidjson::Value(value.c_str(), value.size(), allocator), allocator);
-    return true;
+    const std::string action = rule["action"].GetString();
+    return action == "sniff" || action == "hijack-dns" ||
+           action == "resolve" || action == "route-options";
 }
+
+} // namespace
 
 void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules, RuleConversionStats *stats)
 {
+    ForceMaxCooperativeBatch checkpoint(
+        effectiveSettings().resourceControlEffective == "force_max", 128);
+    RuleConversionStats local_stats;
     warnNoResolveIgnoredForTarget(ruleset_content_array, "sing-box");
     using namespace rapidjson_ext;
     std::string rule_group, retrieved_rules, strLine, final;
@@ -1334,7 +1322,7 @@ void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent
         retrieved_rules = materializeRulesetContent(x);
         if(retrieved_rules.empty())
         {
-            writeLog(0, "获取规则集失败或规则集为空：'" + x.rule_path + "'。", LOG_LEVEL_WARNING);
+            writeLog(LOG_LEVEL_WARNING, "获取规则集失败或规则集为空：'" + x.rule_path + "'。");
             continue;
         }
         if(startsWith(retrieved_rules, "[]"))
@@ -1347,10 +1335,6 @@ void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent
                 total_rules++;
                 local_stats.add();
             }
-            rules.PushBack(transformRuleToSingBox(temp, strLine, rule_group, allocator), allocator);
-            total_rules++;
-            if(stats)
-                stats->add();
             continue;
         }
         retrieved_rules = convertRuleset(retrieved_rules, x.rule_type);
@@ -1376,11 +1360,11 @@ void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent
                 strLine.erase(strLine.find("//"));
                 strLine = trimWhitespace(strLine);
             }
-            if (appendSingBoxRule(temp, rule, strLine, allocator))
+            if (appendSingBoxRule(temp, buckets, geosite_codes, geoip_codes,
+                                  strLine, final, rule_group))
             {
                 total_rules++;
-                if(stats)
-                    stats->add();
+                local_stats.add();
             }
         }
         emitSingBoxRuleBuckets(buckets, rule_group, rules, allocator);

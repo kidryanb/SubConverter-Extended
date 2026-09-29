@@ -22,8 +22,8 @@ body:
   - type: textarea
     id: problem
     attributes:
-      label: 功能描述
-      description: 请详细、清晰地表达你要提出的论述，例如这个问题如何影响到你？你想实现什么功能？目前 SubConverter-Extended 的行为是什么？
+      label: 需求与影响
+      description: 说明需要完成什么、当前行为造成什么限制，以及受影响的目标格式或客户端。
     validations:
       required: true
   - type: textarea
@@ -32,4 +32,14 @@ body:
       label: 期望行为
       description: 描述对用户可见的输入、输出、默认值和失败条件。
     validations:
-      required: false
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 现有替代方式（可选）
+      description: 说明已尝试的参数、模板、客户端原生能力或其他工具，以及它们为何不适用。
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: 兼容性与安全考量（可选）
+      description: 如果建议会改变现有输出、远程访问、隐私边界或资源消耗，请说明预期影响。

@@ -189,9 +189,11 @@ void writeLog(LogLevel level, const std::string &content)
     const std::string safe_content = sanitizeLogLine(content);
     const std::string request_id = currentLogRequestId();
     std::lock_guard<std::mutex> lock(log_mutex);
-    const char *levels[] = {"[FATL]", "[ERRO]", "[WARN]", "[INFO]", "[DEBG]", "[VERB]"};
-    std::cerr<<getTime(2)<<" ["<<getpid()<<" "<<get_thread_name()<<"]"<<levels[level % 6];
-    std::cerr<<" "<<redactSensitiveLogText(content)<<"\n";
+    truncateBoundedStderrLog();
+    std::cerr<<getTime(2)<<" ["<<getpid()<<" "<<get_thread_name()<<"]"<<logLevelLabel(level);
+    if (!request_id.empty())
+        std::cerr<<" request_id="<<request_id;
+    std::cerr<<" "<<safe_content<<"\n";
 }
 
 

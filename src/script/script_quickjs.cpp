@@ -1,4 +1,6 @@
-#include <string>
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -400,10 +402,23 @@ static qjs_fetch_Response qjs_fetch(qjs_fetch_Request request)
     }
 
     std::string response_headers;
+    const Settings &settings = effectiveSettings();
     ProxyPolicy proxy = request.proxy_specified
-                            ? parseProxy(request.proxy)
-                            : parseProxy(global.proxyConfig);
-    FetchArgument argument {method, request.url, proxy, &request.postdata, &request.headers.headers, &request.cookies, 0};
+                            ? parseProxy(request.proxy, settings.proxyBypass)
+                            : parseProxy(settings.proxyConfig,
+                                         settings.proxyBypass);
+    const std::shared_ptr<RequestContext> request_context =
+        captureCurrentRequestContext();
+    const auto deadline = request_context
+        ? request_context->deadline()
+        : std::chrono::steady_clock::time_point::max();
+    const RequestCancellationToken cancellation = request_context
+        ? request_context->cancellationToken()
+        : RequestCancellationToken();
+    FetchArgument argument {
+        method, request.url, proxy, &request.postdata,
+        &request.headers.headers, &request.cookies, 0, false,
+        FetchContext::TrustedConfig, deadline, cancellation};
     FetchResult result {&response.status_code, &response.content, &response_headers, &response.cookies};
 
     webGet(argument, result);
@@ -419,9 +434,12 @@ static std::string qjs_getUrlArg(const std::string &url, const std::string &requ
 
 std::string getGeoIP(const std::string &address, const std::string &proxy)
 {
-    ProxyPolicy policy = proxy.empty() ? parseProxy(global.proxyConfig)
-                                       : parseProxy(proxy);
-    return fetchFile("https://api.ip.sb/geoip/" + address, policy, global.cacheConfig);
+    const Settings &settings = effectiveSettings();
+    ProxyPolicy policy =
+        proxy.empty() ? parseProxy(settings.proxyConfig, settings.proxyBypass)
+                      : parseProxy(proxy, settings.proxyBypass);
+    return fetchFile("https://api.ip.sb/geoip/" + address, policy,
+                     settings.cacheConfig);
 }
 
 void script_runtime_init(qjs::Runtime &runtime)
@@ -662,7 +680,10 @@ int script_cleanup(qjs::Context &context)
 void script_print_stack(qjs::Context &context)
 {
     auto exc = context.getException();
-    std::cerr << "脚本异常：" << (std::string) exc << std::endl;
+    writeLog(LOG_LEVEL_ERROR,
+             "SCRIPT_EXCEPTION detail=" + static_cast<std::string>(exc));
     if((bool) exc["stack"])
-        std::cerr << "脚本堆栈：" << (std::string) exc["stack"] << std::endl;
+        writeLog(LOG_LEVEL_ERROR,
+                 "SCRIPT_STACK detail=" +
+                     static_cast<std::string>(exc["stack"]));
 }

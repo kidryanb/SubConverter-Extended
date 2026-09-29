@@ -12,6 +12,7 @@ ARG TARGETVARIANT
 ARG MIHOMO_REF="Alpha"
 ARG MIHOMO_CACHE_BUST=1
 ARG REFRESH_GO_DEPS=false
+ARG ENABLE_SANITIZERS=false
 
 WORKDIR /build/bridge
 
@@ -26,22 +27,47 @@ COPY bridge/converter.go ./
 COPY bridge/age.go ./
 COPY bridge/parser.go ./
 COPY bridge/preprocess.go ./
+COPY bridge/mieru.go ./
+COPY bridge/cmd/portable-updater/ ./cmd/portable-updater/
 
 RUN set -xe && \
+    retry_go_dependency() { \
+      attempt=1; \
+      while ! "$@"; do \
+        if [ "${attempt}" = 3 ]; then \
+          echo "Go dependency command failed after ${attempt} attempts" >&2; \
+          return 1; \
+        fi; \
+        echo "Go dependency command attempt ${attempt} failed; retrying" >&2; \
+        sleep "$((attempt * 5))"; \
+        attempt="$((attempt + 1))"; \
+      done; \
+    } && \
     if [ "${REFRESH_GO_DEPS}" = "true" ]; then \
       echo "MIHOMO_CACHE_BUST=$MIHOMO_CACHE_BUST" && \
-      go get github.com/metacubex/mihomo@${MIHOMO_REF} && \
-      go get -u all && \
-      go mod tidy; \
+      retry_go_dependency go get github.com/metacubex/mihomo@${MIHOMO_REF} && \
+      mihomo_version="$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)" && \
+      mieru_version="$(go list -m -f '{{.Version}}' github.com/enfein/mieru/v3)" && \
+      protobuf_version="$(go list -m -f '{{.Version}}' google.golang.org/protobuf)" && \
+      test -n "${mihomo_version}" && test -n "${mieru_version}" && test -n "${protobuf_version}" && \
+      retry_go_dependency go get -u all && \
+      retry_go_dependency go get \
+        "github.com/metacubex/mihomo@${mihomo_version}" \
+        "github.com/enfein/mieru/v3@${mieru_version}" \
+        "google.golang.org/protobuf@${protobuf_version}" && \
+      go mod tidy && \
+      test "$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)" = "${mihomo_version}" && \
+      test "$(go list -m -f '{{.Version}}' github.com/enfein/mieru/v3)" = "${mieru_version}" && \
+      test "$(go list -m -f '{{.Version}}' google.golang.org/protobuf)" = "${protobuf_version}"; \
     else \
-      go mod download; \
+      retry_go_dependency go mod download; \
     fi
 
 # Copy scripts for scheme generation
 COPY scripts/ ../scripts/
-RUN go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated.go
-RUN go run ../scripts/generate_schemes.go mihomo_schemes.h
-RUN go run ../scripts/generate_param_compat.go -o param_compat.h
+RUN go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated.go -manifest mihomo_capabilities.json
+RUN go run ../scripts/generate_schemes.go -manifest mihomo_capabilities.json -o mihomo_schemes.h
+RUN go run ../scripts/generate_param_compat.go -manifest mihomo_capabilities.json -o param_compat.h
 
 RUN CGO_ENABLED=0 go build \
     -trimpath \
@@ -126,7 +152,7 @@ ARG CPP_HTTPLIB_REF
 ARG NLOHMANN_JSON_REF
 ARG INJA_REF
 ARG JPCRE2_REF
-ARG BUILD_TESTS=false
+ARG ENABLE_SANITIZERS=false
 
 WORKDIR /
 
@@ -187,12 +213,47 @@ RUN set -xe && \
 COPY --from=go-builder /build/bridge/libmihomo.so /usr/lib/
 COPY --from=go-builder /build/bridge/libmihomo.a /usr/lib/
 COPY --from=go-builder /build/bridge/libmihomo.h /usr/include/
+COPY --from=go-builder /build/test-tools/ /opt/subconverter-test-tools/
+
+ARG BUILD_TESTS=false
+ARG TARGETARCH
+ARG SINGBOX_STABLE_VERSION=1.13.18
+ARG SINGBOX_STABLE_SHA256=b5c973890cf171a42512baaec6f21939f1b75b87551f335344986fd6041916d9
+ARG SINGBOX_NEXT_VERSION=1.14.0-beta.14
+ARG SINGBOX_NEXT_SHA256=b526ec3f4ef231db82eee935715812115055cfad3e1116a9d31cc9aad8bbd3af
+RUN set -eux; \
+    if [ "${BUILD_TESTS}" = "true" ]; then \
+      test "${TARGETARCH}" = "amd64"; \
+      for channel in stable next; do \
+        if [ "${channel}" = "stable" ]; then \
+          version="${SINGBOX_STABLE_VERSION}"; \
+          checksum="${SINGBOX_STABLE_SHA256}"; \
+        else \
+          version="${SINGBOX_NEXT_VERSION}"; \
+          checksum="${SINGBOX_NEXT_SHA256}"; \
+        fi; \
+        archive="/tmp/sing-box-${version}-linux-amd64-glibc.tar.gz"; \
+        curl --retry 5 --retry-all-errors --retry-delay 5 -fsSL \
+          "https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-amd64-glibc.tar.gz" \
+          -o "${archive}"; \
+        printf '%s  %s\n' "${checksum}" "${archive}" | sha256sum -c -; \
+        tar -xzf "${archive}" -C /tmp; \
+        install -m755 \
+          "/tmp/sing-box-${version}-linux-amd64-glibc/sing-box" \
+          "/opt/subconverter-test-tools/sing-box-${channel}"; \
+        rm -rf "${archive}" \
+          "/tmp/sing-box-${version}-linux-amd64-glibc"; \
+      done; \
+      /opt/subconverter-test-tools/sing-box-stable version; \
+      /opt/subconverter-test-tools/sing-box-next version; \
+    fi
 
 # build SubConverter-Extended from THIS repository source
 WORKDIR /src
 COPY . /src
 COPY --from=go-builder /build/bridge/go.mod /src/bridge/go.mod
 COPY --from=go-builder /build/bridge/go.sum /src/bridge/go.sum
+COPY --from=go-builder /build/bridge/mihomo_capabilities.json /src/bridge/mihomo_capabilities.json
 COPY --from=go-builder /build/bridge/proxy_validation_generated.go /src/bridge/proxy_validation_generated.go
 COPY --from=go-builder /build/bridge/mihomo_schemes.h /src/src/parser/mihomo_schemes.h
 COPY --from=go-builder /build/bridge/param_compat.h /src/src/parser/param_compat.h
@@ -221,6 +282,8 @@ RUN set -xe && \
       echo "Using committed header libraries"; \
     fi
 
+RUN python3 scripts/ci/patch_cpp_httplib_force_max.py include/httplib.h
+
 RUN set -xe && \
     BUILD_ID="$(printf '%.7s' "${SHA}")" && \
     [ -n "${BUILD_ID}" ] && sed -i "s/#define BUILD_ID \"\"/#define BUILD_ID \"${BUILD_ID}\"/ " src/version.h || true && \
@@ -245,6 +308,12 @@ RUN set -xe && \
     cmake -GNinja \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTS=${BUILD_TESTS} \
+    -DREQUIRE_MIHOMO_TEST_BINARY=${BUILD_TESTS} \
+    -DMIHOMO_TEST_BINARY=/opt/subconverter-test-tools/mihomo \
+    -DREQUIRE_SINGBOX_TEST_BINARIES=${BUILD_TESTS} \
+    -DSINGBOX_STABLE_TEST_BINARY=/opt/subconverter-test-tools/sing-box-stable \
+    -DSINGBOX_NEXT_TEST_BINARY=/opt/subconverter-test-tools/sing-box-next \
+    -DENABLE_SANITIZERS=${ENABLE_SANITIZERS} \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=OFF \
@@ -269,7 +338,14 @@ RUN export PATH="/usr/lib/ccache:$PATH" && \
     export CCACHE_COMPILERCHECK=content && \
     ninja -j ${THREADS}
 
-RUN if [ "${BUILD_TESTS}" = "true" ]; then ctest --output-on-failure; fi
+RUN if [ "${BUILD_TESTS}" = "true" ]; then \
+      if [ "${ENABLE_SANITIZERS}" = "true" ]; then \
+        export ASAN_OPTIONS="detect_leaks=1:strict_string_checks=1:halt_on_error=1:abort_on_error=1"; \
+        export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"; \
+        echo "Sanitizers enabled; production runtime and full correctness suite instrumented"; \
+      fi; \
+      ctest --test-dir . --output-on-failure --timeout 120; \
+    fi
 
 # 收集 glibc 运行时依赖（动态探测，避免固定版本）
 RUN set -xe && \
@@ -282,6 +358,7 @@ RUN set -xe && \
         libnss_files.so.2 \
         libnss_compat.so.2 \
         libresolv.so.2 && \
+    chmod 0755 /runtime-libs/usr/lib/libmihomo.so && \
     if [ -f /etc/nsswitch.conf ]; then \
       mkdir -p /runtime-libs/etc && \
       cp -aL /etc/nsswitch.conf /runtime-libs/etc/nsswitch.conf; \
@@ -291,6 +368,7 @@ RUN set -xe && \
 # loading the full compiler toolchain into the runner's Docker daemon.
 FROM scratch AS ci-export
 COPY --from=builder /src/subconverter /src/subconverter
+COPY --from=go-builder /build/bridge/subconverter-update /src/subconverter-update
 COPY --from=builder /runtime-libs /runtime-libs
 COPY --from=builder /src/bridge /src/bridge
 COPY --from=builder /src/src/parser/mihomo_schemes.h /src/src/parser/mihomo_schemes.h
@@ -305,7 +383,6 @@ FROM ${ALPINE_IMAGE}
 ARG VERSION="dev"
 ARG SHA=""
 ARG BUILD_DATE=""
-ARG CUSTOM_OPENCLASH_RULES_REVISION=""
 ARG DEPENDENCY_SNAPSHOT_SHA=""
 LABEL \
   org.opencontainers.image.title="SubConverter-Extended" \
@@ -316,7 +393,6 @@ LABEL \
   org.opencontainers.image.version="${VERSION}" \
   org.opencontainers.image.revision="${SHA}" \
   org.opencontainers.image.created="${BUILD_DATE}" \
-  com.aethersailor.custom-openclash-rules.revision="${CUSTOM_OPENCLASH_RULES_REVISION}" \
   com.aethersailor.dependency-snapshot.sha256="${DEPENDENCY_SNAPSHOT_SHA}" \
   maintainer="Aethersailor"
 
@@ -325,12 +401,9 @@ RUN apk add --no-cache ca-certificates tzdata && \
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone
 
-COPY --from=builder /src/subconverter /usr/bin/subconverter
+COPY --from=builder --chmod=0755 /src/subconverter /usr/bin/subconverter
 COPY --from=builder /src/base /base/
 COPY --from=builder /runtime-libs/ /
-
-# 确保二进制和库可执行
-RUN chmod +x /usr/bin/subconverter && chmod +x /usr/lib/libmihomo.so
 
 ENV LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib64:/usr/lib"
 

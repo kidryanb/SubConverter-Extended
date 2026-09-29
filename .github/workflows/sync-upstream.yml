@@ -38,51 +38,22 @@ jobs:
             git remote set-url upstream https://github.com/Aethersailor/SubConverter-Extended.git
 
           git fetch upstream master
+          python3 scripts/ci/sync_upstream_master.py \
+            --upstream-ref upstream/master \
+            --target-branch master \
+            --origin origin \
+            --github-output "$GITHUB_OUTPUT"
 
-          before="$(git rev-parse HEAD)"
+      - name: Validate synced master
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          bash tests/ci_delivery_scripts_test.sh
+          git diff --check HEAD^1..HEAD
 
-          # 自动合并；冲突代码块优先保留 fork 版本。
-          if ! git merge --no-edit -X ours upstream/master; then
-            # 非冲突原因导致的失败，直接退出。
-            git rev-parse -q --verify MERGE_HEAD >/dev/null || exit 1
-
-            mapfile -d '' -t conflicts < <(
-              git diff --name-only --diff-filter=U -z
-            )
-
-            if [ "${#conflicts[@]}" -eq 0 ]; then
-              echo "::error::Merge failed without unresolved file conflicts"
-              exit 1
-            fi
-
-            # 处理剩余冲突，保留 fork 中的文件或删除状态。
-            for file in "${conflicts[@]}"; do
-              if git cat-file -e "HEAD:$file" 2>/dev/null; then
-                git restore --source=HEAD --staged --worktree -- "$file"
-              else
-                git rm -f --ignore-unmatch -- "$file"
-              fi
-            done
-
-            # 确保所有冲突均已解决。
-            remaining="$(git diff --name-only --diff-filter=U)"
-            if [ -n "$remaining" ]; then
-              echo "::error::Unresolved merge conflicts remain"
-              printf '%s\n' "$remaining"
-              exit 1
-            fi
-
-            git commit --no-edit
-          fi
-
-          after="$(git rev-parse HEAD)"
-
-          if [ "$before" != "$after" ]; then
-            git push origin HEAD:master
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Push validated master
+        if: steps.sync.outputs.changed == 'true'
+        run: git push origin HEAD:master
 
       - name: Trigger image build
         if: steps.sync.outputs.changed == 'true'

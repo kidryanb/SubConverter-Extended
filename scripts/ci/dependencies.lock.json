@@ -3,17 +3,12 @@
     "cpp_httplib": {
       "ref": "HEAD",
       "repository": "https://github.com/yhirose/cpp-httplib.git",
-      "revision": "82b1492c3dd380617cabf2c69592e6882c212798"
-    },
-    "custom_openclash_rules": {
-      "ref": "refs/heads/main",
-      "repository": "https://github.com/Aethersailor/Custom_OpenClash_Rules.git",
-      "revision": "e4519af61e6952dae5424a85603f1975889b96bd"
+      "revision": "4f3f9ef19be83ae97a5d9a059432dc00e445b7ab"
     },
     "inja": {
       "ref": "HEAD",
       "repository": "https://github.com/pantor/inja.git",
-      "revision": "94289188eaee21b6b553ed4c706a1ecea2a03387"
+      "revision": "446379d2ba196f5070e0838cdf9ca3e10280e532"
     },
     "jpcre2": {
       "ref": "HEAD",
@@ -26,9 +21,9 @@
       "revision": "ee34810b11bd23c8be637345532f91059b68b2d7"
     },
     "mihomo": {
-      "ref": "refs/heads/Meta",
+      "ref": "refs/heads/Alpha",
       "repository": "https://github.com/MetaCubeX/mihomo.git",
-      "revision": "e26714a181ac0e2fa803453c0a8e9a9ce94e31cb"
+      "revision": "f103639c808d93a2c34cae56757b458862871b22"
     },
     "nlohmann_json": {
       "ref": "latest-semver-tag",
@@ -53,19 +48,19 @@
       "source": "mirror.gcr.io/library/alpine:latest"
     },
     "debian_builder": {
-      "pinned": "mirror.gcr.io/library/debian@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+      "pinned": "mirror.gcr.io/library/debian@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c",
       "source": "mirror.gcr.io/library/debian:latest"
     },
     "debian_trixie": {
-      "pinned": "mirror.gcr.io/library/debian@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+      "pinned": "mirror.gcr.io/library/debian@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c",
       "source": "mirror.gcr.io/library/debian:trixie"
     },
     "debian_trixie_slim": {
-      "pinned": "mirror.gcr.io/library/debian@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd",
+      "pinned": "mirror.gcr.io/library/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a",
       "source": "mirror.gcr.io/library/debian:trixie-slim"
     },
     "golang": {
-      "pinned": "mirror.gcr.io/library/golang@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647",
+      "pinned": "mirror.gcr.io/library/golang@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244",
       "source": "mirror.gcr.io/library/golang:latest"
     }
   },

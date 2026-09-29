@@ -9,6 +9,15 @@ inputs:
     description: Port used for the smoke test.
     required: false
     default: "25500"
+  expected-version:
+    description: Exact formal vX.Y.Z identity.
+    required: true
+  expected-revision:
+    description: Exact full tag commit SHA.
+    required: true
+  expected-build-date:
+    description: Exact canonical UTC build timestamp.
+    required: true
 
 runs:
   using: composite
@@ -34,10 +43,35 @@ runs:
 
         tar -xzf "$ARTIFACT" -C "$WORKDIR"
         cd "$WORKDIR/SubConverter-Extended"
-        test -s base/Custom_OpenClash_Rules/manifest.sha256
-        test -s base/Custom_OpenClash_Rules/main/rule/Custom_Direct.list
+        test ! -e base/Custom_OpenClash_Rules
+        test -x subconverter-update
+        test -x update.sh
+        test -s UPDATE-README.txt
+        identity_args=()
+        if [ "${{ inputs.expected-version }}" = dev ]; then
+          identity_args+=(--allow-dev)
+        fi
+        python3 "$GITHUB_WORKSPACE/scripts/ci/write_build_info.py" verify \
+          --path BUILD-INFO.json \
+          --version "${{ inputs.expected-version }}" \
+          --revision "${{ inputs.expected-revision }}" \
+          --build-date "${{ inputs.expected-build-date }}" \
+          "${identity_args[@]}"
+        ./update.sh status >"$WORKDIR/update-status.json"
+        python3 - "$WORKDIR/update-status.json" "${{ inputs.expected-version }}" <<'PY'
+        import json
+        import sys
 
-        PORT="$PORT" PREF_PATH="$PWD/base/pref.toml" ./start.sh >"$WORKDIR/stdout.log" 2>"$WORKDIR/stderr.log" &
+        status = json.load(open(sys.argv[1], encoding="utf-8"))
+        if status["state"] != "idle" or status["current_version"] != sys.argv[2]:
+            raise SystemExit(f"unexpected portable updater status: {status!r}")
+        if status["rollback_available"] or status["available"]:
+            raise SystemExit(f"unexpected new-install update state: {status!r}")
+        PY
+
+        PORT="$PORT" PREF_PATH="$PWD/base/pref.toml" \
+          SUBCONVERTER_SKIP_AUTO_UPDATE=1 \
+          ./start.sh >"$WORKDIR/stdout.log" 2>"$WORKDIR/stderr.log" &
         PID="$!"
 
         URL="http://127.0.0.1:${PORT}/version"
@@ -45,6 +79,9 @@ runs:
           if curl -fsS "$URL" >"$WORKDIR/response.out"; then
             head -c 200 "$WORKDIR/response.out"
             python3 "$GITHUB_WORKSPACE/scripts/run-subconverter-smoke.py" --base-url "http://127.0.0.1:${PORT}"
+            route_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              "http://127.0.0.1:${PORT}/Custom_OpenClash_Rules/main/rule/example.yaml")"
+            test "$route_status" = "404"
             exit 0
           fi
 

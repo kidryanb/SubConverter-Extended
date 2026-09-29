@@ -9,7 +9,9 @@ echo "==> Downloading Go dependencies..."
 go mod download
 
 echo "==> Generating proxy validation metadata..."
-go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated.go
+go run ../scripts/generate_proxy_validation.go \
+    -o proxy_validation_generated.go \
+    -manifest mihomo_capabilities.json
 
 echo "==> Generating supported schemes header..."
 go run ../scripts/generate_schemes.go \

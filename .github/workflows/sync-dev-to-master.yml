@@ -3,21 +3,16 @@ name: Sync Dev to Master
 on:
   workflow_dispatch:
     inputs:
-      release_mode:
-        description: "Release mode: new creates a tag, overwrite rebuilds an existing release, sync_only only syncs branches."
+      operation:
+        description: "操作类型：sync_only 仅同步 dev；new 同步 dev 并创建发布标签。"
         required: true
-        default: "new"
+        default: sync_only
         type: choice
         options:
-          - new
-          - overwrite
           - sync_only
+          - new
       version:
-        description: "Release tag, e.g. v1.2.3. Empty auto bumps for new or uses latest existing tag for overwrite."
-        required: false
-        type: string
-      confirm_overwrite:
-        description: "Type OVERWRITE to confirm rebuilding an existing release."
+        description: "版本号（仅用于 new）：可留空以自动递增最新 vX.Y.Z 的最后一位，或填写未使用的版本号。"
         required: false
         type: string
 
@@ -39,69 +34,12 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           fetch-depth: 0
 
-      - name: Setup Git User
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Merge Dev into Master
-        run: |
-          echo "Merging dev into master..."
-          # Attempt merge; if it fails (conflicts), continue execution to resolve them
-          if ! git merge origin/dev --no-commit --no-ff; then
-            echo "Merge conflicts detected, resolving..."
-            
-            # Get list of conflicting files
-            CONFLICTED_FILES=$(git diff --name-only --diff-filter=U)
-            
-            for file in $CONFLICTED_FILES; do
-              if [[ "$file" == README*.md || "$file" == docs/images/readme-flow-*.svg ]]; then
-                # For README files and their diagram assets, keep master version
-                echo "Keeping master version of $file"
-                git checkout --ours "$file"
-              else
-                # For other files (code, workflows), use dev version
-                echo "Using dev version of $file"
-                git checkout --theirs "$file"
-              fi
-              git add "$file"
-            done
-          fi
-          
-          echo "Restoring master README and diagram assets..."
-          # Restore README.md and its diagram assets from HEAD (master) state, discarding changes from dev
-          git checkout HEAD -- README.md 2>/dev/null || true
-          git checkout HEAD -- 'README-*.md' 2>/dev/null || true
-          git checkout HEAD -- 'docs/images/readme-flow-*.svg' 2>/dev/null || true
-          
-          # Re-add README files and diagram assets to staging if they were modified
-          git add README.md 2>/dev/null || true
-          git add README-*.md 2>/dev/null || true
-          git add docs/images/readme-flow-*.svg 2>/dev/null || true
-          
-          # Commit whenever a merge is in progress, even if protected docs made
-          # the final tree identical to master. This records dev as merged.
-          if [ -f .git/MERGE_HEAD ]; then
-            echo "Committing merge..."
-            git commit -m "chore: sync dev to master"
-            echo "Pushing..."
-            git push origin master
-          elif git diff --staged --quiet; then
-            echo "No changes to commit (maybe dev is already merged or only protected docs changed)"
-          else
-            echo "Committing..."
-            git commit -m "chore: sync dev to master"
-            echo "Pushing..."
-            git push origin master
-          fi
-
-      - name: Resolve Release Tag
-        id: release_tag
-        if: ${{ inputs.release_mode != 'sync_only' }}
+      - name: Resolve dev and release request
+        id: request
+        shell: bash
         env:
-          RELEASE_MODE: ${{ inputs.release_mode }}
+          OPERATION: ${{ inputs.operation }}
           REQUESTED_VERSION: ${{ inputs.version }}
-          CONFIRM_OVERWRITE: ${{ inputs.confirm_overwrite }}
         run: |
           set -euo pipefail
 
@@ -125,15 +63,10 @@ jobs:
                 fi
               done < <(git tag --list 'v*' --sort=-version:refname)
 
-          if [ "$RELEASE_MODE" = "overwrite" ] && [ "${CONFIRM_OVERWRITE:-}" != "OVERWRITE" ]; then
-            echo "::error::confirm_overwrite must be exactly 'OVERWRITE' when release_mode=overwrite."
-            exit 1
-          fi
-
-          if [ -n "$REQUESTED_VERSION" ]; then
-            TAG_NAME="$REQUESTED_VERSION"
-            if [[ "$TAG_NAME" != v* ]]; then
-              TAG_NAME="v$TAG_NAME"
+              if [ -z "$VERSION" ]; then
+                echo "::error::未找到可用于递增的 vX.Y.Z 标签，请手动填写版本号。"
+                exit 1
+              fi
             fi
 
             if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -208,99 +141,7 @@ jobs:
             git tag -a "$VERSION" "$MASTER_SHA" -m "Release $VERSION"
             git push --atomic origin "HEAD:refs/heads/master" "refs/tags/$VERSION"
           else
-            LATEST_TAG="$(git tag --list 'v*.*.*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
-
-            if [ -z "$LATEST_TAG" ]; then
-              if [ "$RELEASE_MODE" = "new" ]; then
-                TAG_NAME="v0.1.0"
-                echo "No existing vX.Y.Z tag found. Starting at $TAG_NAME"
-              else
-                echo "::error::No existing vX.Y.Z tag found to overwrite."
-                exit 1
-              fi
-            else
-              if [ "$RELEASE_MODE" = "new" ]; then
-                VERSION="${LATEST_TAG#v}"
-                IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-                TAG_NAME="v${MAJOR}.${MINOR}.$((PATCH + 1))"
-                echo "Auto bumped release tag from $LATEST_TAG to $TAG_NAME"
-              else
-                TAG_NAME="$LATEST_TAG"
-                echo "No release tag requested. Using latest existing release tag: $TAG_NAME"
-              fi
-            fi
+            git push origin "HEAD:refs/heads/master"
           fi
 
-          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Invalid release tag '$TAG_NAME'. Use vX.Y.Z, for example v1.2.3."
-            exit 1
-          fi
-
-          if [ "$RELEASE_MODE" = "new" ]; then
-            if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
-              echo "::error::Tag '$TAG_NAME' already exists locally."
-              exit 1
-            fi
-
-            if git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
-              echo "::error::Tag '$TAG_NAME' already exists on origin."
-              exit 1
-            fi
-          else
-            if ! git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
-              echo "::error::Tag '$TAG_NAME' does not exist locally."
-              exit 1
-            fi
-
-            if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
-              echo "::error::Tag '$TAG_NAME' does not exist on origin."
-              exit 1
-            fi
-
-            TAG_COMMIT="$(git rev-list -n 1 "$TAG_NAME")"
-            MASTER_COMMIT="$(git rev-parse HEAD)"
-            echo "Overwrite release tag: $TAG_NAME"
-            echo "Tag commit: $TAG_COMMIT"
-            echo "Master commit used for rebuilt assets: $MASTER_COMMIT"
-          fi
-
-          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Create and Push Release Tag
-        if: ${{ inputs.release_mode == 'new' }}
-        env:
-          TAG_NAME: ${{ steps.release_tag.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-
-          git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
-          git push origin "$TAG_NAME"
-
-      - name: Dispatch Overwrite Release Build
-        if: ${{ inputs.release_mode == 'overwrite' }}
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-          TAG_NAME: ${{ steps.release_tag.outputs.tag_name }}
-        run: |
-          set -euo pipefail
-
-          gh workflow run build-dockerhub.yml \
-            --ref master \
-            -f release_tag="$TAG_NAME" \
-            -f overwrite_existing_release=true
-
-          echo "Dispatched release rebuild for $TAG_NAME from master."
-
-      - name: Dispatch Sync-only Master Build
-        if: ${{ inputs.release_mode == 'sync_only' }}
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          MASTER_COMMIT="$(git rev-parse HEAD)"
-
-          gh workflow run build-dockerhub.yml \
-            --ref master
-
-          echo "release_mode=sync_only; synced dev to master at $MASTER_COMMIT and dispatched a master build without creating or overwriting a release."
+          echo "Synced dev $DEV_SHA to master $MASTER_SHA."

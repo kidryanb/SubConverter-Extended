@@ -5,33 +5,27 @@ on:
   push:
     branches:
       - dev
-    tags:
-      - 'v*.*.*'
     paths-ignore:
       - 'README.md'
       - 'README-*.md'
       - 'docker-compose.yml'
-  pull_request:
-    branches:
-      - master
-      - dev
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: "Existing release tag to rebuild, e.g. v1.2.3"
-        required: false
-        type: string
-      overwrite_existing_release:
-        description: "Overwrite assets/body of an existing GitHub Release"
-        required: false
-        default: false
+      refresh_dependencies:
+        description: Refresh all upstream dependencies on dev before validation
         type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      refresh_dependencies:
+        type: boolean
+        default: false
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 concurrency:
-  group: dockerhub-${{ inputs.overwrite_existing_release && inputs.release_tag || github.ref_name }}
+  group: build-core-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -68,6 +62,11 @@ jobs:
             core.setOutput('current', String(isCurrent));
             if (isCurrent) {
               core.info(`${context.sha} is still the current head of ${branch}.`);
+            } else if (context.eventName === 'workflow_dispatch') {
+              core.setFailed(
+                `Refusing stale workflow_dispatch event for ${context.sha}; ` +
+                `${branch} now points to ${currentSha}.`
+              );
             } else {
               core.notice(
                 `Skipping stale ${context.eventName} event for ${context.sha}; ` +
@@ -79,14 +78,15 @@ jobs:
     name: "🔧 Prepare Metadata"
     runs-on: ubuntu-latest
     needs: source-head
-    if: needs.source-head.outputs.current == 'true' && github.actor != 'dependabot[bot]' && !contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')
+    if: needs.source-head.outputs.current == 'true' && (github.ref != 'refs/heads/dev' || (!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')))
     outputs:
-      sha_short: ${{ steps.vars.outputs.sha_short }}
-      version: ${{ steps.mode.outputs.version }}
-      mode: ${{ steps.mode.outputs.mode }}
-      is_release: ${{ steps.mode.outputs.is_release }}
+      sha: ${{ steps.metadata.outputs.sha }}
+      sha_short: ${{ steps.metadata.outputs.sha_short }}
+      version: ${{ steps.metadata.outputs.version }}
+      mode: ${{ steps.metadata.outputs.mode }}
+      is_release: ${{ steps.metadata.outputs.is_release }}
       tags: ${{ steps.meta.outputs.tags }}
-      build_date: ${{ steps.build_date.outputs.build_date }}
+      build_date: ${{ steps.metadata.outputs.build_date }}
       linux_matrix: ${{ steps.linux_matrix.outputs.matrix }}
     steps:
       - name: Checkout
@@ -95,75 +95,99 @@ jobs:
           token: ${{ secrets.PAT_TOKEN || github.token }}
           fetch-depth: 0
 
-      - name: Get short SHA
-        id: vars
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      - name: Resolve build metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/build_metadata.py \
+            --github-output "$GITHUB_OUTPUT"
 
-      - name: Determine build mode and version
-        id: mode
+      - name: Verify formal release preconditions
+        if: steps.metadata.outputs.mode == 'release'
         shell: bash
         env:
-          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag }}
-          OVERWRITE_EXISTING_RELEASE: ${{ inputs.overwrite_existing_release }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          REVISION: ${{ steps.metadata.outputs.sha }}
         run: |
           set -euo pipefail
 
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            MODE="release"
-            VERSION="${GITHUB_REF#refs/tags/}"
-          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${OVERWRITE_EXISTING_RELEASE:-false}" = "true" ]; then
-            if [ "$GITHUB_REF" != "refs/heads/master" ]; then
-              echo "::error::Existing releases may be rebuilt only from master."
-              exit 1
-            fi
-            MODE="release"
-            VERSION="${DISPATCH_RELEASE_TAG:-}"
-            VERSION="${VERSION#"${VERSION%%[![:space:]]*}"}"
-            VERSION="${VERSION%"${VERSION##*[![:space:]]}"}"
-            [[ "$VERSION" == v* ]] || VERSION="v$VERSION"
-            if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::Invalid release tag '$VERSION'. Use vX.Y.Z."
-              exit 1
-            fi
-            git fetch --tags --force origin
-            git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null || {
-              echo "::error::Release tag '$VERSION' does not exist."
-              exit 1
-            }
-          elif [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            MODE="pr"
-            VERSION="pr-${{ steps.vars.outputs.sha_short }}"
-          elif [ "$GITHUB_REF" = "refs/heads/dev" ]; then
-            MODE="dev"
-            VERSION="dev"
-          elif [ "$GITHUB_REF" = "refs/heads/master" ]; then
-            MODE="master"
-            VERSION="master-${{ steps.vars.outputs.sha_short }}"
-          else
-            echo "::error::Unsupported build ref $GITHUB_REF ($GITHUB_EVENT_NAME)."
+          if [ "$(git cat-file -t "$GITHUB_REF")" != "tag" ]; then
+            echo "::error::Formal releases require an annotated vX.Y.Z tag."
             exit 1
           fi
+          TAG_COMMIT="$(git rev-list -n 1 "$GITHUB_REF")"
+          python3 scripts/ci/release_guard.py \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --github-sha "$GITHUB_SHA" \
+            --checkout-sha "$(git rev-parse HEAD)" \
+            --tag-sha "$TAG_COMMIT"
 
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if [ "$MODE" = "release" ]; then
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Build mode: $MODE; version: $VERSION"
+          release_status="$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$VERSION")"
+          case "$release_status" in
+            404) ;;
+            200)
+              echo "::error::Release $VERSION already exists."
+              exit 1
+              ;;
+            *)
+              cat /tmp/release.json >&2
+              echo "::error::Could not prove that Release $VERSION is absent (HTTP $release_status)."
+              exit 1
+              ;;
+          esac
 
-      - name: Verify runtime rule assets are not tracked
+          assert_registry_tag_absent() {
+            local registry="$1"
+            local repository="$2"
+            local token_url="$3"
+            local token
+            local status
+            token="$(curl --fail-with-body --silent --show-error "$token_url" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+            status="$(curl -sS -o /tmp/registry-manifest -w '%{http_code}' \
+              -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://$registry/v2/$repository/manifests/$VERSION")"
+            case "$status" in
+              404) ;;
+              200)
+                echo "::error::$registry/$repository:$VERSION already exists and must not be overwritten."
+                exit 1
+                ;;
+              *)
+                cat /tmp/registry-manifest >&2
+                echo "::error::Could not prove $registry/$repository:$VERSION is absent (HTTP $status)."
+                exit 1
+                ;;
+            esac
+          }
+
+          assert_registry_tag_absent \
+            registry-1.docker.io \
+            aethersailor/subconverter-extended \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:aethersailor/subconverter-extended:pull"
+          assert_registry_tag_absent \
+            ghcr.io \
+            aethersailor/subconverter-extended \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:aethersailor/subconverter-extended:pull"
+
+      - name: Verify COCR runtime assets are absent
         shell: bash
         run: |
           set -euo pipefail
-          if git ls-files -- base/Custom_OpenClash_Rules | grep -q .; then
-            echo "::error::Custom_OpenClash_Rules runtime assets must be fetched at build time, not committed."
+          if [ -e base/Custom_OpenClash_Rules ] || \
+             git ls-files -- base/Custom_OpenClash_Rules | grep -q .; then
+            echo "::error::Custom_OpenClash_Rules runtime assets must not exist in this project."
             exit 1
           fi
 
       - name: Refresh dependency snapshot on dev
-        if: steps.mode.outputs.mode == 'dev'
+        if: steps.metadata.outputs.mode == 'dev' && inputs.refresh_dependencies
         shell: bash
         run: |
           set -euo pipefail
@@ -187,71 +211,119 @@ jobs:
           {
             echo "### Dependency snapshot"
             echo
-            echo "Mode: \`${{ steps.mode.outputs.mode }}\`"
+            echo "Mode: \`${{ steps.metadata.outputs.mode }}\`"
             echo "Snapshot SHA-256: \`${{ steps.dependencies.outputs.dependency_snapshot_sha }}\`"
-            echo "Custom_OpenClash_Rules: \`${{ steps.dependencies.outputs.custom_openclash_rules_revision }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload dependency snapshot
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dependency-snapshot
           path: scripts/ci/dependencies.lock.json
           if-no-files-found: error
           retention-days: 1
 
-      - name: Set build date
-        id: build_date
-        shell: bash
-        run: |
-          commit_date="$(git show -s --format=%cI HEAD)"
-          build_date="$(date -u --date="$commit_date" +%Y-%m-%dT%H:%M:%SZ)"
-          echo "build_date=$build_date" >> "$GITHUB_OUTPUT"
-
       - name: Build Linux matrix
         id: linux_matrix
         shell: bash
         run: |
-          if [ "${{ steps.mode.outputs.mode }}" = "release" ] || [ "${{ steps.mode.outputs.mode }}" = "master" ]; then
-            {
-              echo 'matrix<<JSON'
-              cat <<'JSON'
-          {"include":[{"arch":"amd64","runner":"ubuntu-latest","dockerfile":"./Dockerfile","builder_platform":"linux/amd64","image_platform":"linux/amd64","builder_tag":"subconverter-temp:amd64-builder","threads":"16","cache_scope":"subconverter-alpine","extract_mode":"shared","extract_generated":"true","bridge_budget":"bridge-linux-amd64","openwrt_arches":"x86_64","qemu_platforms":""},{"arch":"arm64","runner":"ubuntu-24.04-arm","dockerfile":"./Dockerfile","builder_platform":"linux/arm64","image_platform":"linux/arm64","builder_tag":"subconverter-temp:arm64-builder","threads":"4","cache_scope":"subconverter-alpine-arm64","extract_mode":"shared","extract_generated":"false","bridge_budget":"bridge-linux-arm64","openwrt_arches":"aarch64_generic,aarch64_cortex-a53,aarch64_cortex-a72","qemu_platforms":""},{"arch":"armv7","runner":"ubuntu-latest","dockerfile":"./docker/Dockerfile.armv7-cross","builder_platform":"linux/amd64","image_platform":"linux/arm/v7","builder_tag":"subconverter-temp:armv7-builder","threads":"2","cache_scope":"subconverter-armv7-cross","extract_mode":"root","extract_generated":"false","bridge_budget":"bridge-linux-armv7","openwrt_arches":"arm_cortex-a5_vfpv4,arm_cortex-a7,arm_cortex-a7_vfpv4,arm_cortex-a7_neon-vfpv4,arm_cortex-a8_vfpv3,arm_cortex-a9,arm_cortex-a9_neon,arm_cortex-a9_vfpv3-d16,arm_cortex-a15_neon-vfpv4","qemu_platforms":"arm"}]}
-          JSON
-              echo 'JSON'
-            } >> "$GITHUB_OUTPUT"
-          else
-            {
-              echo 'matrix<<JSON'
-              cat <<'JSON'
-          {"include":[{"arch":"amd64","runner":"ubuntu-latest","dockerfile":"./Dockerfile","builder_platform":"linux/amd64","image_platform":"linux/amd64","builder_tag":"subconverter-temp:amd64-builder","threads":"16","cache_scope":"subconverter-alpine","extract_mode":"shared","extract_generated":"true","bridge_budget":"bridge-linux-amd64","openwrt_arches":"x86_64","qemu_platforms":""}]}
-          JSON
-              echo 'JSON'
-            } >> "$GITHUB_OUTPUT"
-          fi
+          python3 scripts/ci/build_plan.py matrix \
+            --mode "${{ steps.metadata.outputs.mode }}" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Docker meta
         id: meta
         shell: bash
         env:
-          VERSION: ${{ steps.mode.outputs.version }}
-          MODE: ${{ steps.mode.outputs.mode }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          MODE: ${{ steps.metadata.outputs.mode }}
+        run: |
+          python3 scripts/ci/build_plan.py tags \
+            --mode "$MODE" \
+            --version "$VERSION" \
+            --github-output "$GITHUB_OUTPUT"
+
+  cross-build:
+    name: "🧭 Non-publishing cross build (${{ matrix.arch }})"
+    runs-on: ${{ matrix.runner }}
+    needs: prepare
+    if: needs.prepare.outputs.mode == 'dev'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            dockerfile: ./Dockerfile
+            platform: linux/arm64
+            threads: "4"
+          - arch: armv7
+            runner: ubuntu-latest
+            dockerfile: ./docker/Dockerfile.armv7-cross
+            platform: linux/arm/v7
+            threads: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download dependency snapshot
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dependency-snapshot
+          path: dependency-snapshot
+
+      - name: Activate dependency snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp dependency-snapshot/dependencies.lock.json scripts/ci/dependencies.lock.json
+          python3 scripts/ci/dependency_snapshot.py check
+          python3 scripts/ci/dependency_snapshot.py emit --github-env "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
+
+      - name: Prepare cross-build arguments
+        id: cross_args
+        shell: bash
+        env:
+          THREADS: ${{ matrix.threads }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
+          REFRESH_GO_DEPS: "false"
+          REFRESH_HEADERS: "false"
+          BUILD_TESTS: "false"
         run: |
           {
-            echo 'tags<<EOF'
-            if [ "$MODE" = "release" ]; then
-              printf '%s\n' \
-                "aethersailor/subconverter-extended:latest" \
-                "aethersailor/subconverter-extended:${VERSION}" \
-                "ghcr.io/aethersailor/subconverter-extended:latest" \
-                "ghcr.io/aethersailor/subconverter-extended:${VERSION}"
-            elif [ "$MODE" = "dev" ]; then
-              printf '%s\n' \
-                "aethersailor/subconverter-extended:dev" \
-                "ghcr.io/aethersailor/subconverter-extended:dev"
-            fi
+            echo 'args<<EOF'
+            bash scripts/ci/docker-build-args.sh
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
+
+      - name: Compile without loading or publishing an image
+        shell: bash
+        env:
+          BUILD_ARGS: ${{ steps.cross_args.outputs.args }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r arg; do
+            [ -n "$arg" ] && args+=(--build-arg "$arg")
+          done <<< "$BUILD_ARGS"
+          docker buildx build \
+            --file "${{ matrix.dockerfile }}" \
+            --platform "${{ matrix.platform }}" \
+            --target builder \
+            --output type=cacheonly \
+            --cache-from type=gha,scope="subconverter-cross-${{ matrix.arch }}" \
+            --cache-to type=gha,mode=max,scope="subconverter-cross-${{ matrix.arch }}" \
+            "${args[@]}" \
+            .
 
   build-linux:
     name: "🐳 Docker Build (${{ matrix.arch }})"
@@ -268,7 +340,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download dependency snapshot
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: dependency-snapshot
           path: dependency-snapshot
@@ -284,47 +356,23 @@ jobs:
             --github-output "$GITHUB_OUTPUT" \
             --github-env "$GITHUB_ENV"
 
-      - name: Fetch pinned Custom_OpenClash_Rules assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/sync_custom_openclash_rules.py --ref "$CUSTOM_OPENCLASH_RULES_REVISION"
-          test -s base/Custom_OpenClash_Rules/manifest.sha256
-          test -s base/Custom_OpenClash_Rules/main/cfg/Custom_Clash.ini
-          test -s base/Custom_OpenClash_Rules/main/rule/Custom_Direct.list
-
       - name: Set up Docker Buildx
         shell: bash
         run: |
           docker buildx create --name sce-builder --driver docker-container --use
           docker buildx inspect --bootstrap
 
-      - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
-        shell: bash
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        shell: bash
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ github.token }}
-        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
-
       - name: Prepare Docker build args
         id: docker_args
         shell: bash
         env:
           THREADS: ${{ matrix.threads }}
-          SHA: ${{ needs.prepare.outputs.sha_short }}
+          SHA: ${{ needs.prepare.outputs.sha }}
           VERSION: ${{ needs.prepare.outputs.version }}
           BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
-          REFRESH_GO_DEPS: ${{ needs.prepare.outputs.mode == 'dev' && matrix.extract_generated == 'true' }}
-          REFRESH_HEADERS: ${{ needs.prepare.outputs.mode == 'dev' && matrix.extract_generated == 'true' }}
+          REFRESH_GO_DEPS: ${{ needs.prepare.outputs.mode == 'dev' && inputs.refresh_dependencies && matrix.extract_generated == 'true' }}
+          REFRESH_HEADERS: ${{ needs.prepare.outputs.mode == 'dev' && inputs.refresh_dependencies && matrix.extract_generated == 'true' }}
+          BUILD_TESTS: ${{ needs.prepare.outputs.mode == 'dev' && inputs.refresh_dependencies && matrix.extract_generated == 'true' }}
         run: |
           {
             echo 'args<<EOF'
@@ -338,78 +386,56 @@ jobs:
         env:
           BUILD_ARGS: ${{ steps.docker_args.outputs.args }}
         run: |
-          set -euo pipefail
-          args=()
-          while IFS= read -r arg; do
-            [ -n "$arg" ] && args+=(--build-arg "$arg")
-          done <<< "$BUILD_ARGS"
-          tags=(--tag "subconverter-extended:${{ matrix.arch }}-ci")
-          output=(--load)
-          cache=()
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            candidate="ci-${{ needs.prepare.outputs.mode }}-${{ matrix.arch }}"
-            if [ "${{ needs.prepare.outputs.mode }}" = "release" ]; then
-              candidate="ci-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}"
-            fi
-            tags=(
-              --tag "aethersailor/subconverter-extended:${candidate}"
-              --tag "ghcr.io/aethersailor/subconverter-extended:${candidate}"
-            )
-            output=(--push)
-            cache=(
-              --cache-from "type=registry,ref=ghcr.io/aethersailor/subconverter-extended:buildcache-${{ matrix.cache_scope }}"
-              --cache-to "type=registry,ref=ghcr.io/aethersailor/subconverter-extended:buildcache-${{ matrix.cache_scope }},mode=max,ignore-error=true"
-            )
-          fi
-          metadata_file="${RUNNER_TEMP}/build-metadata-${{ matrix.arch }}.json"
-          docker buildx build \
-            --file "${{ matrix.dockerfile }}" \
-            --platform "${{ matrix.image_platform }}" \
-            "${output[@]}" \
-            "${tags[@]}" \
-            "${cache[@]}" \
-            "${args[@]}" \
-            --metadata-file "$metadata_file" \
-            .
-          digest="$(python3 - "$metadata_file" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], "r", encoding="utf-8") as handle:
-              data = json.load(handle)
-          print(data.get("containerimage.digest", ""))
-          PY
-          )"
-          if [ "${{ github.event_name }}" != "pull_request" ] && [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Build did not return a valid candidate image digest."
-            exit 1
-          fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          bash scripts/ci/build-candidate-image.sh \
+            "${{ matrix.arch }}" \
+            "${{ matrix.dockerfile }}" \
+            "${{ matrix.image_platform }}"
 
       - name: Export CI artifacts from the existing cache
         shell: bash
         env:
           BUILD_ARGS: ${{ steps.docker_args.outputs.args }}
         run: |
-          set -euo pipefail
-          args=()
-          while IFS= read -r arg; do
-            [ -n "$arg" ] && args+=(--build-arg "$arg")
-          done <<< "$BUILD_ARGS"
-          docker buildx build \
-            --file "${{ matrix.dockerfile }}" \
-            --load \
-            --tag "${{ matrix.builder_tag }}" \
-            --target ci-export \
-            --platform "${{ matrix.builder_platform }}" \
-            "${args[@]}" \
-            .
+          bash scripts/ci/export-ci-image.sh \
+            "${{ matrix.dockerfile }}" \
+            "${{ matrix.builder_tag }}" \
+            "${{ matrix.builder_platform }}"
 
       - name: Extract builder output
         shell: bash
         env:
           EXTRACT_GENERATED: ${{ matrix.extract_generated }}
         run: bash scripts/ci/extract-builder-output.sh "${{ matrix.builder_tag }}" "${{ matrix.extract_mode }}"
+
+      - name: Set up Go for upstream refresh validation
+        if: needs.prepare.outputs.mode == 'dev' && inputs.refresh_dependencies && matrix.extract_generated == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: bridge/go.mod
+          cache-dependency-path: bridge/go.sum
+
+      - name: Test refreshed Go bridge
+        if: needs.prepare.outputs.mode == 'dev' && inputs.refresh_dependencies && matrix.extract_generated == 'true'
+        working-directory: bridge
+        run: go test -mod=readonly ./...
+
+      - name: Package dev-only OpenWrt amd64 without publishing
+        if: needs.prepare.outputs.mode == 'dev' && matrix.arch == 'amd64'
+        shell: bash
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+          BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
+          BUILD_TIME: "0"
+        run: |
+          set -euo pipefail
+          bash scripts/ci/build-linux-release.sh v0.0.0 amd64 x86_64
+          python3 scripts/ci/check_file_size.py --budget release-openwrt \
+            SubConverter-Extended-v0.0.0-openwrt-x86_64.apk
+          rm -rf -- \
+            SubConverter-Extended \
+            SubConverter-Extended-v0.0.0-linux-amd64.tar.gz \
+            SubConverter-Extended-v0.0.0-openwrt-x86_64.apk \
+            build/openwrt-apk/amd64
 
       - name: Check bridge size budget (${{ matrix.arch }})
         shell: bash
@@ -418,6 +444,9 @@ jobs:
       - name: Package Release Artifacts (Linux ${{ matrix.arch }})
         if: needs.prepare.outputs.is_release == 'true'
         shell: bash
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+          BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
         run: bash scripts/ci/build-linux-release.sh "${{ needs.prepare.outputs.version }}" "${{ matrix.arch }}" "${{ matrix.openwrt_arches }}"
 
       - name: Check release size budgets (Linux ${{ matrix.arch }})
@@ -432,7 +461,7 @@ jobs:
       - name: Set up QEMU for smoke test
         if: matrix.qemu_platforms != ''
         shell: bash
-        run: docker run --privileged --rm tonistiigi/binfmt --install "${{ matrix.qemu_platforms }}"
+        run: docker run --privileged --rm tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 --install "${{ matrix.qemu_platforms }}"
 
       - name: Smoke test artifact (Linux ${{ matrix.arch }})
         if: needs.prepare.outputs.is_release == 'true'
@@ -440,24 +469,30 @@ jobs:
         uses: ./.github/actions/smoke-linux-artifact
         with:
           artifact: SubConverter-Extended-${{ needs.prepare.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+          expected-version: ${{ needs.prepare.outputs.version }}
+          expected-revision: ${{ needs.prepare.outputs.sha }}
+          expected-build-date: ${{ needs.prepare.outputs.build_date }}
 
       - name: Smoke test APKs (OpenWrt ${{ matrix.arch }})
         if: needs.prepare.outputs.is_release == 'true'
-        timeout-minutes: 3
+        timeout-minutes: 15
         uses: ./.github/actions/smoke-openwrt-apk
         with:
           artifacts: SubConverter-Extended-${{ needs.prepare.outputs.version }}-openwrt-*.apk
+          expected-version: ${{ needs.prepare.outputs.version }}
+          expected-revision: ${{ needs.prepare.outputs.sha }}
+          expected-build-date: ${{ needs.prepare.outputs.build_date }}
 
       - name: Upload Artifact (Linux ${{ matrix.arch }})
         if: needs.prepare.outputs.is_release == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-${{ matrix.arch }}
           path: SubConverter-Extended-*.tar.gz
 
       - name: Upload Artifact (OpenWrt ${{ matrix.arch }})
         if: needs.prepare.outputs.is_release == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: openwrt-${{ matrix.arch }}
           path: SubConverter-Extended-*-openwrt-*.apk
@@ -465,48 +500,59 @@ jobs:
       - name: Clean release packaging files
         if: needs.prepare.outputs.is_release == 'true'
         shell: bash
-        run: rm -rf SubConverter-Extended SubConverter-Extended-*.tar.gz SubConverter-Extended-*.apk subconverter runtime-libs runtime-root libmihomo.so build/openwrt-apk
+        run: rm -rf SubConverter-Extended SubConverter-Extended-*.tar.gz SubConverter-Extended-*.apk subconverter subconverter-update runtime-libs runtime-root libmihomo.so build/openwrt-apk
 
       - name: Check for file changes
         id: check_changes
         if: matrix.extract_generated == 'true'
         shell: bash
         run: |
-          if [ -n "$(git status --porcelain -- scripts/ci/dependencies.lock.json bridge/go.mod bridge/go.sum bridge/libmihomo.h bridge/proxy_validation_generated.go src/parser/mihomo_schemes.h src/parser/param_compat.h include/httplib.h include/nlohmann/json.hpp include/inja.hpp include/jpcre2.hpp include/quickjspp.hpp include/libcron include/date include/toml.hpp include/toml11)" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
+          if [ -n "$(git status --porcelain -- scripts/ci/dependencies.lock.json bridge/go.mod bridge/go.sum bridge/libmihomo.h bridge/mihomo_capabilities.json bridge/proxy_validation_generated.go src/parser/mihomo_schemes.h src/parser/param_compat.h include/httplib.h include/nlohmann/json.hpp include/inja.hpp include/jpcre2.hpp include/quickjspp.hpp include/libcron include/date include/toml.hpp include/toml11)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify frozen generated inputs outside dev
         if: steps.check_changes.outputs.changed == 'true' && needs.prepare.outputs.mode != 'dev'
         shell: bash
         run: |
-          git status --short -- scripts/ci/dependencies.lock.json bridge/go.mod bridge/go.sum bridge/libmihomo.h bridge/proxy_validation_generated.go src/parser/mihomo_schemes.h src/parser/param_compat.h include/httplib.h include/nlohmann/json.hpp include/inja.hpp include/jpcre2.hpp include/quickjspp.hpp include/libcron include/date include/toml.hpp include/toml11
+          git status --short -- scripts/ci/dependencies.lock.json bridge/go.mod bridge/go.sum bridge/libmihomo.h bridge/mihomo_capabilities.json bridge/proxy_validation_generated.go src/parser/mihomo_schemes.h src/parser/param_compat.h include/httplib.h include/nlohmann/json.hpp include/inja.hpp include/jpcre2.hpp include/quickjspp.hpp include/libcron include/date include/toml.hpp include/toml11
           echo "::error::Frozen dependency/generated inputs are stale. Refresh and commit them on dev before building master or a release."
           exit 1
 
-      - name: Save image digest
-        if: github.event_name != 'pull_request'
-        shell: bash
-        run: |
-          mkdir -p docker-digests
-          printf '%s\n' "${{ steps.build_image.outputs.digest }}" > "docker-digests/${{ matrix.arch }}.txt"
-
-      - name: Upload image digest
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v7
-        with:
-          name: docker-digest-${{ matrix.arch }}
-          path: docker-digests/${{ matrix.arch }}.txt
-          retention-days: 1
-
       - name: Smoke test image (${{ matrix.arch }})
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && needs.prepare.outputs.mode != 'master'
         timeout-minutes: 3
         uses: ./.github/actions/smoke-docker-image
         with:
-          image: ghcr.io/aethersailor/subconverter-extended@${{ steps.build_image.outputs.digest }}
+          image: subconverter-extended:${{ matrix.arch }}-ci
           platform: ${{ matrix.image_platform }}
-          custom-openclash-rules-revision: ${{ steps.dependencies.outputs.custom_openclash_rules_revision }}
+          expected-version: ${{ needs.prepare.outputs.version }}
+          expected-revision: ${{ needs.prepare.outputs.sha }}
+          expected-build-date: ${{ needs.prepare.outputs.build_date }}
+
+      - name: Export tested image archive (${{ matrix.arch }})
+        if: github.event_name != 'pull_request' && needs.prepare.outputs.mode != 'master'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docker-images
+          archive="subconverter-extended-${{ matrix.arch }}.tar.gz"
+          docker save "subconverter-extended:${{ matrix.arch }}-ci" | \
+            gzip -1 > "docker-images/$archive"
+          (
+            cd docker-images
+            sha256sum "$archive" > "$archive.sha256"
+          )
+
+      - name: Upload tested image archive (${{ matrix.arch }})
+        if: github.event_name != 'pull_request' && needs.prepare.outputs.mode != 'master'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: docker-image-${{ matrix.arch }}
+          path: docker-images/subconverter-extended-${{ matrix.arch }}.tar.gz*
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
 
       - name: Commit and push generated development files
         if: steps.check_changes.outputs.changed == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'
@@ -526,7 +572,7 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add scripts/ci/dependencies.lock.json bridge/go.mod bridge/go.sum bridge/libmihomo.h bridge/proxy_validation_generated.go src/parser/mihomo_schemes.h src/parser/param_compat.h include/httplib.h include/nlohmann/json.hpp include/inja.hpp include/jpcre2.hpp include/quickjspp.hpp include/libcron include/date include/toml.hpp include/toml11
+          git add scripts/ci/dependencies.lock.json bridge/go.mod bridge/go.sum bridge/libmihomo.h bridge/mihomo_capabilities.json bridge/proxy_validation_generated.go src/parser/mihomo_schemes.h src/parser/param_compat.h include/httplib.h include/nlohmann/json.hpp include/inja.hpp include/jpcre2.hpp include/quickjspp.hpp include/libcron include/date include/toml.hpp include/toml11
           git commit -m "chore: update generated development inputs after build [skip ci]"
           git push origin "HEAD:refs/heads/$BRANCH_NAME"
 
@@ -534,7 +580,10 @@ jobs:
     name: "🪟 Windows Build (amd64)"
     runs-on: windows-latest
     needs: prepare
-    if: needs.prepare.outputs.is_release == 'true'
+    if: >-
+      needs.prepare.outputs.is_release == 'true' ||
+      (needs.prepare.outputs.mode == 'dev' &&
+       github.event_name == 'workflow_dispatch')
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -543,7 +592,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download dependency snapshot
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: dependency-snapshot
           path: dependency-snapshot
@@ -555,16 +604,8 @@ jobs:
           python scripts/ci/dependency_snapshot.py check
           python scripts/ci/dependency_snapshot.py emit --github-env $env:GITHUB_ENV
 
-      - name: Fetch pinned Custom_OpenClash_Rules assets
-        shell: pwsh
-        run: |
-          python scripts/sync_custom_openclash_rules.py --ref $env:CUSTOM_OPENCLASH_RULES_REVISION
-          if (!(Test-Path "base/Custom_OpenClash_Rules/manifest.sha256")) {
-            throw "Custom_OpenClash_Rules manifest was not generated."
-          }
-
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: bridge/go.mod
           cache-dependency-path: bridge/go.sum
@@ -582,21 +623,24 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-boost
             mingw-w64-ucrt-x86_64-yaml-cpp
             mingw-w64-ucrt-x86_64-pcre2
             mingw-w64-ucrt-x86_64-rapidjson
 
       - name: Build Windows amd64
         shell: msys2 {0}
+        env:
+          BUILD_TESTS: "false"
         run: |
-          THREADS=4 bash scripts/build-windows-amd64.sh \
+          THREADS=4 BUILD_TESTS="$BUILD_TESTS" bash scripts/build-windows-amd64.sh \
             "${{ needs.prepare.outputs.version }}" \
-            "${{ needs.prepare.outputs.sha_short }}" \
+            "${{ needs.prepare.outputs.sha }}" \
             "${{ needs.prepare.outputs.build_date }}"
 
       - name: Package Release Artifact (Windows amd64)
         shell: pwsh
-        run: ./scripts/package-windows-portable.ps1 -Version "${{ needs.prepare.outputs.version }}"
+        run: ./scripts/package-windows-portable.ps1 -Version "${{ needs.prepare.outputs.version }}" -Revision "${{ needs.prepare.outputs.sha }}" -BuildDate "${{ needs.prepare.outputs.build_date }}"
 
       - name: Check release size budget (Windows amd64)
         shell: pwsh
@@ -607,18 +651,32 @@ jobs:
         uses: ./.github/actions/smoke-windows-artifact
         with:
           artifact: SubConverter-Extended-${{ needs.prepare.outputs.version }}-windows-amd64.zip
+          expected-version: ${{ needs.prepare.outputs.version }}
+          expected-revision: ${{ needs.prepare.outputs.sha }}
+          expected-build-date: ${{ needs.prepare.outputs.build_date }}
 
       - name: Upload Artifact (Windows amd64)
-        uses: actions/upload-artifact@v7
+        if: needs.prepare.outputs.is_release == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-amd64
           path: SubConverter-Extended-*.zip
 
   merge-manifest:
-    name: "🔗 Promote Docker Images"
+    name: "🔗 Publish Version Docker Images"
     runs-on: ubuntu-latest
-    needs: [prepare, build-linux]
-    if: github.event_name != 'pull_request' && needs.prepare.outputs.mode != 'master'
+    needs: [prepare, cross-build, build-linux, build-windows-amd64]
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.prepare.outputs.mode != 'master' &&
+      needs.prepare.result == 'success' &&
+      needs.build-linux.result == 'success' &&
+      (needs.build-windows-amd64.result == 'success' || needs.prepare.outputs.mode == 'dev') &&
+      (needs.cross-build.result == 'success' || needs.prepare.outputs.mode == 'release')
+    outputs:
+      dockerhub_digest: ${{ steps.published.outputs.dockerhub_digest }}
+      ghcr_digest: ${{ steps.published.outputs.ghcr_digest }}
     steps:
       - name: Prevent stale dev image promotion
         if: needs.prepare.outputs.mode == 'dev'
@@ -668,29 +726,105 @@ jobs:
             );
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download image digests
-        uses: actions/download-artifact@v8
+      - name: Download tested image archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          path: digests
-          pattern: docker-digest-*
+          path: images
+          pattern: docker-image-*
           merge-multiple: true
 
-      - name: Promote tested candidates
+      - name: Load and verify tested image archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.prepare.outputs.mode }}" = "dev" ]; then
+            ARCHES=(amd64)
+          else
+            ARCHES=(amd64 arm64 armv7)
+          fi
+          for arch in "${ARCHES[@]}"; do
+            archive="subconverter-extended-${arch}.tar.gz"
+            test -s "images/$archive"
+            test -s "images/$archive.sha256"
+            (
+              cd images
+              sha256sum -c "$archive.sha256"
+            )
+            gzip -dc "images/$archive" | docker load
+            image="subconverter-extended:${arch}-ci"
+            case "$arch" in
+              amd64) expected_platform="linux/amd64" ;;
+              arm64) expected_platform="linux/arm64" ;;
+              armv7) expected_platform="linux/arm/v7" ;;
+              *) echo "::error::Unsupported image archive architecture: $arch"; exit 1 ;;
+            esac
+            actual_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}{{if .Variant}}/{{.Variant}}{{end}}' "$image")"
+            test "$actual_platform" = "$expected_platform"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" = "${{ needs.prepare.outputs.sha }}"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")" = "${{ needs.prepare.outputs.version }}"
+            test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.created" }}' "$image")" = "${{ needs.prepare.outputs.build_date }}"
+          done
+
+      - name: Re-verify formal version tags are absent
+        if: needs.prepare.outputs.mode == 'release'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          remote_tag_commit="$(git ls-remote \
+            "https://github.com/$GITHUB_REPOSITORY.git" \
+            "refs/tags/$VERSION^{}" | awk '{print $1}')"
+          if [ "$remote_tag_commit" != "${{ needs.prepare.outputs.sha }}" ]; then
+            echo "::error::Remote annotated tag $VERSION no longer peels to the approved source SHA."
+            exit 1
+          fi
+          assert_absent() {
+            local registry="$1"
+            local repository="$2"
+            local token_url="$3"
+            local token
+            local status
+            token="$(curl --fail-with-body --silent --show-error "$token_url" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+            status="$(curl -sS -o /tmp/manifest -w '%{http_code}' \
+              -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://$registry/v2/$repository/manifests/$VERSION")"
+            if [ "$status" = "404" ]; then
+              return
+            fi
+            if [ "$status" = "200" ]; then
+              echo "::error::$registry/$repository:$VERSION appeared during the build; refusing overwrite."
+            else
+              echo "::error::Could not re-prove absence of $registry/$repository:$VERSION (HTTP $status)."
+            fi
+            exit 1
+          }
+          assert_absent \
+            registry-1.docker.io \
+            aethersailor/subconverter-extended \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:aethersailor/subconverter-extended:pull"
+          assert_absent \
+            ghcr.io \
+            aethersailor/subconverter-extended \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:aethersailor/subconverter-extended:pull"
+
+      - name: Push tested candidates and publish manifests
         shell: bash
         run: |
           set -euo pipefail
@@ -700,23 +834,58 @@ jobs:
           else
             ARCHES=(amd64 arm64 armv7)
           fi
-          for arch in "${ARCHES[@]}"; do
-            test -s "digests/${arch}.txt"
-            grep -Eq '^sha256:[0-9a-f]{64}$' "digests/${arch}.txt"
-          done
-
           TAGS="${{ needs.prepare.outputs.tags }}"
           IMAGE_NAMES=(
             "aethersailor/subconverter-extended"
             "ghcr.io/aethersailor/subconverter-extended"
           )
 
+          resolve_digest() {
+            local reference="$1"
+            local output
+            local digest
+            for attempt in 1 2 3 4 5 6; do
+              if output="$(docker buildx imagetools inspect "$reference" 2>/dev/null)"; then
+                digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$output")"
+                if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  printf '%s\n' "$digest"
+                  return 0
+                fi
+              fi
+              if [ "$attempt" -lt 6 ]; then
+                sleep 5
+              fi
+            done
+            echo "::error::Could not resolve candidate digest for $reference." >&2
+            return 1
+          }
+
+          for arch in "${ARCHES[@]}"; do
+            candidate="ci-${{ needs.prepare.outputs.mode }}-${arch}"
+            if [ "${{ needs.prepare.outputs.mode }}" = "release" ]; then
+              candidate="ci-${{ needs.prepare.outputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${arch}"
+            fi
+            local_image="subconverter-extended:${arch}-ci"
+            dockerhub_candidate="aethersailor/subconverter-extended:${candidate}"
+            ghcr_candidate="ghcr.io/aethersailor/subconverter-extended:${candidate}"
+            docker tag "$local_image" "$dockerhub_candidate"
+            docker tag "$local_image" "$ghcr_candidate"
+            docker push "$dockerhub_candidate"
+            docker push "$ghcr_candidate"
+            dockerhub_candidate_digest="$(resolve_digest "$dockerhub_candidate")"
+            ghcr_candidate_digest="$(resolve_digest "$ghcr_candidate")"
+            if [ "$dockerhub_candidate_digest" != "$ghcr_candidate_digest" ]; then
+              echo "::error::Candidate digest differs across registries for $arch."
+              exit 1
+            fi
+          done
+
           for IMAGE_NAME in "${IMAGE_NAMES[@]}"; do
             SOURCES=()
             for arch in "${ARCHES[@]}"; do
               candidate="ci-${{ needs.prepare.outputs.mode }}-${arch}"
               if [ "${{ needs.prepare.outputs.mode }}" = "release" ]; then
-                candidate="ci-${{ needs.prepare.outputs.version }}-${arch}"
+                candidate="ci-${{ needs.prepare.outputs.version }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${arch}"
               fi
               SOURCES+=("${IMAGE_NAME}:${candidate}")
             done
@@ -729,6 +898,7 @@ jobs:
           done
 
       - name: Verify manifest platforms
+        id: published
         shell: bash
         run: |
           set -euo pipefail
@@ -739,13 +909,9 @@ jobs:
             PLATFORMS=("linux/amd64" "linux/arm64" "linux/arm/v7")
           fi
           TAGS="${{ needs.prepare.outputs.tags }}"
+          DOCKERHUB_DIGEST=""
+          GHCR_DIGEST=""
           for TAG in $TAGS; do
-            if [[ "$TAG" != ghcr.io/* ]]; then
-              echo "Skipping Docker Hub platform inspection for $TAG to avoid pull rate limits."
-              echo "The manifest push step above already covered Docker Hub publication."
-              continue
-            fi
-
             echo "Inspecting $TAG"
             for attempt in $(seq 1 6); do
               if docker buildx imagetools inspect "$TAG" > manifest.txt; then
@@ -759,19 +925,51 @@ jobs:
             done
 
             cat manifest.txt
+            digest="$(awk '$1 == "Digest:" {print $2; exit}' manifest.txt)"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Could not resolve the manifest digest for $TAG."
+              exit 1
+            fi
+            if [[ "$TAG" == ghcr.io/* ]]; then
+              GHCR_DIGEST="$digest"
+              echo "ghcr_digest=$digest" >> "$GITHUB_OUTPUT"
+            else
+              DOCKERHUB_DIGEST="$digest"
+              echo "dockerhub_digest=$digest" >> "$GITHUB_OUTPUT"
+            fi
+
             for PLATFORM in "${PLATFORMS[@]}"; do
               if ! grep -Eq "Platform:[[:space:]]+${PLATFORM}$" manifest.txt; then
                 echo "Missing platform ${PLATFORM} in ${TAG}"
                 exit 1
               fi
+              docker pull --platform "$PLATFORM" "$TAG"
+              actual_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$TAG")"
+              actual_version="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$TAG")"
+              test "$actual_revision" = "${{ needs.prepare.outputs.sha }}"
+              test "$actual_version" = "${{ needs.prepare.outputs.version }}"
             done
           done
+          test -n "$DOCKERHUB_DIGEST"
+          test -n "$GHCR_DIGEST"
+          if [ "$DOCKERHUB_DIGEST" != "$GHCR_DIGEST" ]; then
+            echo "::error::Docker Hub and GHCR manifest digests differ."
+            exit 1
+          fi
 
   create-release:
     name: "🚀 Release Artifacts"
     runs-on: ubuntu-latest
     needs: [prepare, build-linux, build-windows-amd64, merge-manifest]
-    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.overwrite_existing_release == true)
+    if: >-
+      always() &&
+      !cancelled() &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.prepare.result == 'success' &&
+      needs.build-linux.result == 'success' &&
+      needs.build-windows-amd64.result == 'success' &&
+      needs.merge-manifest.result == 'success' &&
+      needs.prepare.outputs.is_release == 'true'
     permissions:
       contents: write
     steps:
@@ -782,34 +980,25 @@ jobs:
 
       - name: Prepare Release Notes Context
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          OVERWRITE_EXISTING_RELEASE: ${{ inputs.overwrite_existing_release }}
         run: |
           set -euo pipefail
 
           git fetch --tags --force origin
 
           CURRENT_TAG="$RELEASE_VERSION"
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${OVERWRITE_EXISTING_RELEASE}" = "true" ]; then
-            CURRENT_COMMIT="$(git rev-parse HEAD)"
-            TAG_COMMIT="$(git rev-list -n 1 "$CURRENT_TAG")"
-            PREVIOUS_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG_COMMIT}^" 2>/dev/null || true)"
-          else
-            CURRENT_COMMIT="$(git rev-list -n 1 "$CURRENT_TAG")"
-            PREVIOUS_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${CURRENT_COMMIT}^" 2>/dev/null || true)"
-          fi
-          EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-
-          if [ -n "$PREVIOUS_TAG" ]; then
-            RANGE_LABEL="$PREVIOUS_TAG..$CURRENT_COMMIT"
-            git log --pretty=format:'- %h %s' "$PREVIOUS_TAG..$CURRENT_COMMIT" > commits.md
-            git diff --name-only "$PREVIOUS_TAG" "$CURRENT_COMMIT" > changed-files.md
-            git diff --stat "$PREVIOUS_TAG" "$CURRENT_COMMIT" > diffstat.md
-          else
-            RANGE_LABEL="$CURRENT_COMMIT"
-            git log --pretty=format:'- %h %s' "$CURRENT_COMMIT" > commits.md
-            git diff --name-only "$EMPTY_TREE" "$CURRENT_COMMIT^{tree}" > changed-files.md
-            git diff --stat "$EMPTY_TREE" "$CURRENT_COMMIT^{tree}" > diffstat.md
+          CURRENT_COMMIT="$(git rev-list -n 1 "$CURRENT_TAG")"
+          test "$CURRENT_COMMIT" = "${{ needs.prepare.outputs.sha }}"
+          REMOTE_COMMIT="$(git ls-remote origin "refs/tags/$CURRENT_TAG^{}" | awk '{print $1}')"
+          test "$REMOTE_COMMIT" = "$CURRENT_COMMIT"
+          PREVIOUS_TAG="$(gh api \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq '.tag_name')"
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "::error::Latest published GitHub Release returned an empty tag."
+            exit 1
           fi
           if ! [[ "$PREVIOUS_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Latest published Release tag is not canonical SemVer: $PREVIOUS_TAG"
@@ -829,7 +1018,7 @@ jobs:
             echo
             echo "Current tag: $CURRENT_TAG"
             echo "Current commit: $CURRENT_COMMIT"
-            echo "Previous tag: ${PREVIOUS_TAG:-none}"
+            echo "Previous tag: $PREVIOUS_TAG"
             echo "Range: $RANGE_LABEL"
             echo
             echo "## Commits"
@@ -975,14 +1164,6 @@ jobs:
           - `SHA256SUMS`
           EOF
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.overwrite_existing_release }}" = "true" ]; then
-            {
-              echo
-              echo "<!-- rebuilt-from: $(git rev-parse HEAD) -->"
-              echo "<!-- rebuilt-at: $(date -u +%Y-%m-%dT%H:%M:%SZ) -->"
-            } >> release-notes.md
-          fi
-
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -994,20 +1175,284 @@ jobs:
         run: |
           set -euo pipefail
 
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.apk' \) -print | sort | while read -r file; do
+          find artifacts -type f \( -name 'SubConverter-Extended-*.tar.gz' -o -name 'SubConverter-Extended-*.zip' -o -name 'SubConverter-Extended-*.apk' \) -print | sort | while read -r file; do
             sha256sum "$file" | sed 's#  artifacts/[^/]*/#  #'
           done > SHA256SUMS
 
           cat SHA256SUMS
+          duplicate_names="$(find artifacts -type f \( -name 'SubConverter-Extended-*.tar.gz' -o -name 'SubConverter-Extended-*.zip' -o -name 'SubConverter-Extended-*.apk' \) -printf '%f\n' | sort | uniq -d)"
+          if [ -n "$duplicate_names" ]; then
+            echo "::error::Duplicate release asset names: $duplicate_names"
+            exit 1
+          fi
+          mkdir release-assets
+          find artifacts -type f \( -name 'SubConverter-Extended-*.tar.gz' -o -name 'SubConverter-Extended-*.zip' -o -name 'SubConverter-Extended-*.apk' \) \
+            -exec cp '{}' release-assets/ \;
+          cp SHA256SUMS release-assets/SHA256SUMS
 
-      - name: Create Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+      - name: Generate release manifest
+        shell: bash
+        run: |
+          python3 scripts/ci/release_manifest.py build \
+            --root release-assets \
+            --output release-assets/RELEASE-MANIFEST.json \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --revision "${{ needs.prepare.outputs.sha }}" \
+            --build-date "${{ needs.prepare.outputs.build_date }}" \
+            --dockerhub-digest "${{ needs.merge-manifest.outputs.dockerhub_digest }}" \
+            --ghcr-digest "${{ needs.merge-manifest.outputs.ghcr_digest }}"
+          python3 scripts/ci/release_manifest.py verify \
+            --root release-assets \
+            --manifest release-assets/RELEASE-MANIFEST.json
+
+      - name: Create draft Release without overwrites
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "$VERSION" \
+            --notes-file release-notes.md
+
+  finalize-release:
+    name: "🔒 Freeze Release and Advance latest"
+    runs-on: ubuntu-latest
+    needs: [prepare, merge-manifest, create-release]
+    if: >-
+      always() &&
+      !cancelled() &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.prepare.result == 'success' &&
+      needs.merge-manifest.result == 'success' &&
+      needs.create-release.result == 'success' &&
+      needs.prepare.outputs.is_release == 'true'
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          tag_name: ${{ needs.prepare.outputs.version }}
-          files: |
-            artifacts/linux-*/*.tar.gz
-            artifacts/openwrt-*/*.apk
-            artifacts/windows-*/*.zip
-            SHA256SUMS
-          body_path: release-notes.md
-          overwrite_files: true
+          fetch-depth: 0
+
+      - name: Re-verify draft assets and tag identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REVISION: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REVISION"
+          test "$(git rev-list -n 1 "$VERSION")" = "$REVISION"
+          test "$(git ls-remote origin "refs/tags/$VERSION^{}" | awk '{print $1}')" = "$REVISION"
+          is_draft="$(gh release view "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft')"
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::Release $VERSION is not a draft."
+            exit 1
+          fi
+
+          mkdir verified-assets
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --dir verified-assets
+          python3 scripts/ci/release_manifest.py verify \
+            --root verified-assets \
+            --manifest verified-assets/RELEASE-MANIFEST.json
+
+          python3 - "$REVISION" "${{ needs.merge-manifest.outputs.dockerhub_digest }}" "${{ needs.merge-manifest.outputs.ghcr_digest }}" <<'PY'
+          import json
+          import sys
+
+          revision, dockerhub_digest, ghcr_digest = sys.argv[1:]
+          manifest = json.load(open("verified-assets/RELEASE-MANIFEST.json", encoding="utf-8"))
+          if manifest["revision"] != revision:
+              raise SystemExit("release manifest revision changed")
+          if manifest["images"]["dockerhub"]["digest"] != dockerhub_digest:
+              raise SystemExit("Docker Hub digest changed")
+          if manifest["images"]["ghcr"]["digest"] != ghcr_digest:
+              raise SystemExit("GHCR digest changed")
+          PY
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Re-verify published version digests
+        id: version_images
+        shell: bash
+        run: |
+          set -euo pipefail
+          inspect_digest() {
+            docker buildx imagetools inspect "$1" | awk '$1 == "Digest:" && digest == "" {digest = $2} END {if (digest == "") exit 1; print digest}'
+          }
+          test "$(inspect_digest "aethersailor/subconverter-extended:${{ needs.prepare.outputs.version }}")" = "${{ needs.merge-manifest.outputs.dockerhub_digest }}"
+          test "$(inspect_digest "ghcr.io/aethersailor/subconverter-extended:${{ needs.prepare.outputs.version }}")" = "${{ needs.merge-manifest.outputs.ghcr_digest }}"
+          dockerhub_latest="$(inspect_digest aethersailor/subconverter-extended:latest)"
+          ghcr_latest="$(inspect_digest ghcr.io/aethersailor/subconverter-extended:latest)"
+          [[ "$dockerhub_latest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ghcr_latest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "dockerhub_latest=$dockerhub_latest" >> "$GITHUB_OUTPUT"
+          echo "ghcr_latest=$ghcr_latest" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
+          test "$(gh release view "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft')" = "false"
+
+      - name: Advance latest only after full release verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          inspect_digest() {
+            docker buildx imagetools inspect "$1" | awk '$1 == "Digest:" && digest == "" {digest = $2} END {if (digest == "") exit 1; print digest}'
+          }
+          OLD_DOCKERHUB="${{ steps.version_images.outputs.dockerhub_latest }}"
+          OLD_GHCR="${{ steps.version_images.outputs.ghcr_latest }}"
+          test "$(inspect_digest aethersailor/subconverter-extended:latest)" = "$OLD_DOCKERHUB"
+          test "$(inspect_digest ghcr.io/aethersailor/subconverter-extended:latest)" = "$OLD_GHCR"
+
+          rollback_latest() {
+            echo "::warning::Restoring the pre-release latest pointers after a promotion failure."
+            docker buildx imagetools create \
+              -t aethersailor/subconverter-extended:latest \
+              "aethersailor/subconverter-extended@$OLD_DOCKERHUB" || true
+            docker buildx imagetools create \
+              -t ghcr.io/aethersailor/subconverter-extended:latest \
+              "ghcr.io/aethersailor/subconverter-extended@$OLD_GHCR" || true
+          }
+
+          if ! docker buildx imagetools create \
+            -t aethersailor/subconverter-extended:latest \
+            "aethersailor/subconverter-extended:$VERSION"; then
+            rollback_latest
+            exit 1
+          fi
+          if ! docker buildx imagetools create \
+            -t ghcr.io/aethersailor/subconverter-extended:latest \
+            "ghcr.io/aethersailor/subconverter-extended:$VERSION"; then
+            rollback_latest
+            exit 1
+          fi
+
+          if [ "$(inspect_digest aethersailor/subconverter-extended:latest)" != "${{ needs.merge-manifest.outputs.dockerhub_digest }}" ] || \
+             [ "$(inspect_digest ghcr.io/aethersailor/subconverter-extended:latest)" != "${{ needs.merge-manifest.outputs.ghcr_digest }}" ]; then
+            rollback_latest
+            echo "::error::latest digest verification failed."
+            exit 1
+          fi
+
+  verify-release-complete:
+    name: "✅ Verify Formal Release Completion"
+    runs-on: ubuntu-latest
+    needs: [prepare, build-linux, build-windows-amd64, merge-manifest, create-release, finalize-release]
+    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Require every formal release stage
+        shell: bash
+        env:
+          RELEASE_MODE: ${{ needs.prepare.outputs.mode }}
+          IS_RELEASE: ${{ needs.prepare.outputs.is_release }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          LINUX_RESULT: ${{ needs.build-linux.result }}
+          WINDOWS_RESULT: ${{ needs.build-windows-amd64.result }}
+          MANIFEST_RESULT: ${{ needs.merge-manifest.result }}
+          RELEASE_RESULT: ${{ needs.create-release.result }}
+          FINALIZE_RESULT: ${{ needs.finalize-release.result }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_MODE" = "release"
+          test "$IS_RELEASE" = "true"
+          for stage in \
+            "prepare=$PREPARE_RESULT" \
+            "linux=$LINUX_RESULT" \
+            "windows=$WINDOWS_RESULT" \
+            "manifest=$MANIFEST_RESULT" \
+            "release=$RELEASE_RESULT" \
+            "finalize=$FINALIZE_RESULT"; do
+            if [ "${stage#*=}" != "success" ]; then
+              echo "::error::Formal release stage did not succeed: $stage"
+              exit 1
+            fi
+          done
+
+  cleanup-transient-images:
+    name: "🧹 Clean Temporary Container Data"
+    runs-on: ubuntu-latest
+    needs: [prepare, merge-manifest, verify-release-complete]
+    if: >-
+      always() &&
+      github.event_name != 'pull_request' &&
+      needs.prepare.result == 'success' &&
+      (needs.prepare.outputs.mode == 'dev' || needs.prepare.outputs.mode == 'release')
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: container-registry-cleanup
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Remove this run's temporary and unreachable container data
+        id: cleanup
+        continue-on-error: ${{ needs.prepare.outputs.mode == 'release' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "dev" ]; then
+            selector=(--current-tag ci-dev-amd64)
+          else
+            selector=(--current-prefix "ci-${VERSION}-${GITHUB_RUN_ID}-")
+          fi
+          python3 scripts/ci/cleanup_container_registry.py \
+            --prune-orphans \
+            --apply \
+            "${selector[@]}"
+
+      - name: Report non-blocking release cleanup failure
+        if: steps.cleanup.outcome == 'failure' && needs.prepare.outputs.mode == 'release'
+        shell: bash
+        run: |
+          echo "::warning::Temporary container cleanup failed. The scheduled registry cleanup workflow will retry it."

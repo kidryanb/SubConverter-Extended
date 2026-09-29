@@ -5,7 +5,8 @@
 #include <cctype>
 #include <string_view>
 
-inline constexpr int kDefaultProxyProviderInterval = 3600;
+// Keep provider refresh manual unless the user explicitly sets an interval.
+inline constexpr int kDefaultProxyProviderInterval = 0;
 
 inline bool parseProxyProviderInterval(std::string_view input, int &result) {
   while (!input.empty() &&

@@ -74,6 +74,9 @@ class UpstreamParserMonitorSafetyTests(unittest.TestCase):
         self.assertIn("contents: read", text)
         self.assertIn("TARGET_BRANCH: master", text)
         self.assertIn("persist-credentials: false", text)
+        self.assertIn("test_sync_upstream_parser.py", text)
+        self.assertIn("python3 scripts/sync_upstream_parser.py", text)
+        self.assertNotIn("scripts/check_sync_guards.py", text)
         for forbidden in (
             "contents: write",
             "git apply",

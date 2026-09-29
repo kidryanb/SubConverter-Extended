@@ -13,6 +13,8 @@
 
 #include "handler/fetch_context.h"
 #include "handler/proxy_policy.h"
+#include "runtime/memory_budget.h"
+#include "server/request_context.h"
 #include "utils/map_extra.h"
 #include "utils/string.h"
 #include "utils/workload_scheduler.h"

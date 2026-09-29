@@ -104,6 +104,11 @@ inline bool isExplicitHttpNodeUri(const std::string &uri) {
 
 inline bool isSupportedSchemeName(const std::string &scheme) {
   std::string normalized = normalizeScheme(scheme);
+  // The bridge expands the official binary Mieru client configuration into
+  // Mihomo's supported mierus:// projection before conversion. Keep this
+  // bridge-native scheme outside the generated upstream Mihomo manifest.
+  if (normalized == "mieru")
+    return true;
   return std::find(SUPPORTED_SCHEMES.begin(), SUPPORTED_SCHEMES.end(),
                    normalized) != SUPPORTED_SCHEMES.end();
 }

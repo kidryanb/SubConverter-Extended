@@ -50,16 +50,31 @@ static void appendMihomoNodes(std::vector<mihomo::ProxyNode> &source,
     node.Type = getProxyTypeFromString(mnode.type);
     node.Hostname = std::move(mnode.server);
     node.Port = mnode.port;
+    node.CanonicalProxyJson = std::move(mnode.canonical_json);
 
-    node.RawParams = std::move(mnode.params);
-    node.RawParamJson = std::move(mnode.param_json);
+    nlohmann::json canonical;
+    try {
+      canonical = nlohmann::json::parse(node.CanonicalProxyJson);
+    } catch (const nlohmann::json::exception &) {
+      continue;
+    }
 
-    // Preserve Mihomo's canonical type for generic pass-through, including
-    // protocols that do not yet have a dedicated C++ ProxyType.
-    node.RawParamJson["type"] = "\"" + mnode.type + "\"";
-    node.RawParams["type"] = std::move(mnode.type);
+    const bool is_vless = node.Type == ProxyType::VLESS;
+    const bool is_hysteria2 = node.Type == ProxyType::Hysteria2;
 
-    for (const auto &[key, value] : node.RawParams) {
+    for (auto it = canonical.begin(); it != canonical.end(); ++it) {
+      const std::string &key = it.key();
+      if (!it->is_string() && !it->is_boolean() && !it->is_number())
+        continue;
+
+      std::string value;
+      if (it->is_string())
+        value = it->get<std::string>();
+      else if (it->is_boolean())
+        value = it->get<bool>() ? "true" : "false";
+      else
+        value = it->dump();
+
       if (key == "password")
         node.Password = value;
       else if (key == "cipher" || key == "method")
@@ -70,12 +85,73 @@ static void appendMihomoNodes(std::vector<mihomo::ProxyNode> &source,
         node.AlterId = std::stoi(value);
       else if (key == "udp")
         node.UDP = (value == "true");
+      else if (is_hysteria2 && key == "skip-cert-verify")
+        node.AllowInsecure = (value == "true");
       else if (key == "tls")
-        node.TLSStr = value;
+        node.TLSStr = is_vless && value == "true" ? "tls" : value;
       else if (key == "sni" || key == "servername")
         node.ServerName = value;
       else if (key == "network")
         node.TransferProtocol = value;
+      else if (is_vless && key == "flow")
+        node.Flow = value;
+      else if (is_vless &&
+               (key == "client-fingerprint" || key == "fingerprint"))
+        node.Fingerprint = value;
+      else if (is_vless && key == "packet-encoding")
+        node.PacketEncoding = value;
+      else if (is_hysteria2 && key == "obfs")
+        node.OBFSParam = value;
+      else if (is_hysteria2 && key == "obfs-password")
+        node.OBFSPassword = value;
+      else if (is_hysteria2 && key == "ports")
+        node.Ports = value;
+    }
+
+    auto parse_object = [&](const std::string &key) {
+      auto value = canonical.find(key);
+      if (value == canonical.end() || !value->is_object())
+        return nlohmann::json();
+      return *value;
+    };
+
+    nlohmann::json ws_options = parse_object("ws-opts");
+    if (is_vless && !ws_options.empty()) {
+      node.Path = ws_options.value("path", std::string());
+      const nlohmann::json headers = ws_options.value(
+          "headers", nlohmann::json::object());
+      if (headers.is_object()) {
+        node.Host = headers.value(
+            "Host", headers.value("host", std::string()));
+        node.Edge = headers.value(
+            "Edge", headers.value("edge", std::string()));
+      }
+    }
+
+    nlohmann::json grpc_options = parse_object("grpc-opts");
+    if (is_vless && !grpc_options.empty()) {
+      node.GRPCServiceName =
+          grpc_options.value("grpc-service-name", std::string());
+      node.Path = node.GRPCServiceName;
+      node.GRPCMode = grpc_options.value("grpc-mode", std::string());
+    }
+
+    nlohmann::json reality_options = parse_object("reality-opts");
+    if (is_vless && !reality_options.empty()) {
+      node.PublicKey = reality_options.value("public-key", std::string());
+      node.ShortId = reality_options.value("short-id", std::string());
+    }
+
+    auto alpn = canonical.find("alpn");
+    if (is_vless && alpn != canonical.end()) {
+      if (alpn->is_array()) {
+        for (const auto &value : *alpn) {
+          if (value.is_string())
+            node.AlpnList.emplace_back(value.get<std::string>());
+        }
+      } else if (alpn->is_string()) {
+        node.AlpnList.emplace_back(alpn->get<std::string>());
+      }
     }
 
     nodes.emplace_back(std::move(node));
@@ -150,7 +226,7 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
         [&](qjs::Context &ctx) {
           if (startsWith(link, "script:")) /// process subscription with script
           {
-            writeLog(0, "发现脚本链接，开始执行...", LOG_LEVEL_INFO);
+            writeLog(LOG_LEVEL_INFO, "发现脚本链接，开始执行...");
             string_array args = split(link.substr(7), ",");
             if (args.size() >= 1) {
               std::string script = fileGet(args[0], false);
@@ -192,8 +268,8 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
       link = duktape_get_res_str(ctx);
   else
   {
-      writeLog(0, "执行脚本时发生错误：\n" +
-  duktape_get_err_stack(ctx), LOG_LEVEL_ERROR); duk_pop(ctx); /// pop err
+      writeLog(LOG_LEVEL_ERROR, "执行脚本时发生错误：\n" +
+  duktape_get_err_stack(ctx)); duk_pop(ctx); /// pop err
   }
   */
 
@@ -208,12 +284,30 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
 
   if (link == "nullnode") {
     node.GroupId = 0;
-    writeLog(0, "正在添加节点占位符...");
+    writeLog(LOG_LEVEL_VERBOSE, "正在添加节点占位符...");
     allNodes.emplace_back(std::move(node));
     return 0;
   }
 
-  bool isMihomoScheme = mihomo::isSupportedSchemeLink(link);
+  const bool use_mihomo_parser =
+      parse_set.parser_mode == NodeParserMode::MihomoOnly;
+  bool explicit_http_node = false;
+  if (startsWith(link, "node:")) {
+    link.erase(0, 5);
+    if (!use_mihomo_parser || !mihomo::isExplicitHttpNodeUri(link))
+      return -1;
+    explicit_http_node = true;
+  }
+  auto recordParserInvocation = [&]() {
+    if (parse_set.parser_stats)
+      parse_set.parser_stats->invocations++;
+  };
+  auto recordParserFailure = [&]() {
+    if (parse_set.parser_stats)
+      parse_set.parser_stats->failures++;
+  };
+  const bool isMihomoScheme =
+      use_mihomo_parser && mihomo::isSupportedSchemeLink(link);
 
   // Handle pipe separated links recursively
   if (link.find('|') != std::string::npos && (isLink(link) || isMihomoScheme)) {
@@ -226,8 +320,12 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
     return 0;
   }
 
-  writeLog(LOG_TYPE_INFO, "已收到链接。");
-  if (startsWith(link, "https://t.me/socks") || startsWith(link, "tg://socks"))
+  writeLog(LOG_LEVEL_VERBOSE, "已收到链接。");
+  if (parse_set.force_direct_link || explicit_http_node)
+    linkType = ConfType::HTTP;
+  else if (!use_mihomo_parser && isLegacyHttpProxyUri(link))
+    linkType = ConfType::HTTP;
+  else if (startsWith(link, "https://t.me/socks") || startsWith(link, "tg://socks"))
     linkType = ConfType::SOCKS;
   else if (startsWith(link, "https://t.me/http") ||
            startsWith(link, "tg://http"))
@@ -300,29 +398,29 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
     // 例如: api.com/sub, example.com/clash?token=xxx, sub.domain.com
     else if (link.find("://") == link.npos) {
       isSubscription = true;
-      writeLog(LOG_TYPE_INFO,
+      writeLog(LOG_LEVEL_VERBOSE,
                "检测到无协议头链接，按订阅处理：" +
-                   link);
+                   summarizeUrlForLog(link));
     }
     // 规则 3: 在 SUPPORTED_SCHEMES 中 = 节点链接
     // 例如: trojan://..., vmess://..., hysteria2://...
     else {
       isNodeLink = mihomo::isSupportedSchemeLink(link);
-      // 规则 4: 其他未知协议 = 节点链接（喂给 Mihomo 尝试）
+      // 规则 4: 其他未知协议 = 节点链接（交给当前目标的解析器尝试）
       // 例如: newproto://..., unknown://...
       // 解析器会拒绝自己不支持的协议。
       if (!isNodeLink) {
         isNodeLink = true;
-        writeLog(LOG_TYPE_INFO,
-                 "检测到未知协议，交给 Mihomo 解析器处理：" +
-                     link);
+        writeLog(LOG_LEVEL_VERBOSE,
+                 "检测到未知协议，交给当前目标的节点解析器处理：" +
+                     summarizeUrlForLog(link));
       }
     }
 
     // Clash proxy-provider sources are intercepted by the caller. Any
     // subscription URL that reaches addNodes must be expanded into nodes.
     if (isSubscription) {
-      writeLog(LOG_TYPE_INFO, "正在下载订阅数据...");
+      writeLog(LOG_LEVEL_VERBOSE, "正在下载订阅数据...");
       if (startsWith(link, "surge:///install-config"))
         link = urlDecode(getUrlArg(link, "url"));
 
@@ -330,21 +428,26 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
       if (request_headers) {
         auto ua_it = request_headers->find("User-Agent");
         if (ua_it != request_headers->end() && isBrowserUA(ua_it->second)) {
-          writeLog(LOG_TYPE_INFO, "检测到浏览器 UA，已替换为 clash.meta UA "
-                                  "以避免被拦截");
+          writeLog(LOG_LEVEL_VERBOSE,
+                   "检测到浏览器 UA，已替换为 clash.meta UA 以避免被拦截");
           ua_it->second = "clash.meta";
         }
       }
 
-      strSub = webGet(link, proxy, global.cacheSubscription, &extra_headers,
-                      request_headers, parse_set.fetch_context);
+      const int resolved = resolveSubscription(link);
+      if(resolved < 0)
+        return kAddNodesNeedsFetch;
+      if(resolved == 0)
+        strSub = webGet(link, proxy, effectiveSettings().cacheSubscription,
+                        &extra_headers, request_headers,
+                        parse_set.fetch_context);
     } else if (isNodeLink) {
-      // 节点链接：直接用 mihomo 解析（不需要 webGet）
-      writeLog(LOG_TYPE_INFO, "检测到节点链接，正在使用 Mihomo 解析...");
+      // 节点链接不需要下载，直接交给当前目标的解析器。
+      writeLog(LOG_LEVEL_VERBOSE, "检测到节点链接，正在直接解析...");
       strSub = link; // 直接使用链接本身作为解析内容
     } else {
       // 其他情况（surge config link 等）：保持原有逻辑
-      writeLog(LOG_TYPE_INFO, "正在下载订阅数据...");
+      writeLog(LOG_LEVEL_VERBOSE, "正在下载订阅数据...");
       if (startsWith(link, "surge:///install-config")) // surge config link
         link = urlDecode(getUrlArg(link, "url"));
 
@@ -352,8 +455,8 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
       if (request_headers) {
         auto ua_it = request_headers->find("User-Agent");
         if (ua_it != request_headers->end() && isBrowserUA(ua_it->second)) {
-          writeLog(LOG_TYPE_INFO, "检测到浏览器 UA，已替换为 clash.meta UA "
-                                  "以避免被拦截");
+          writeLog(LOG_LEVEL_VERBOSE,
+                   "检测到浏览器 UA，已替换为 clash.meta UA 以避免被拦截");
           ua_it->second = "clash.meta";
         }
       }
@@ -370,64 +473,44 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
     if(strSub.size() == 0)
     {
         //try to get it again with system proxy
-        writeLog(LOG_TYPE_WARN, "无法直接下载订阅，正在使用
+        writeLog(LOG_LEVEL_WARNING, "无法直接下载订阅，正在使用
     system proxy."); strProxy = getSystemProxy(); if(strProxy != "")
         {
             strSub = webGet(link, strProxy);
         }
         else
-            writeLog(LOG_TYPE_WARN, "未设置系统代理，跳过。");
+            writeLog(LOG_LEVEL_WARNING, "未设置系统代理，跳过。");
     }
     */
     if (!strSub.empty()) {
-      writeLog(LOG_TYPE_INFO,
-               "正在使用 Mihomo 解析器解析订阅数据...");
-
+      if (use_mihomo_parser) {
+        recordParserInvocation();
+        writeLog(LOG_LEVEL_VERBOSE,
+                 "NODE_PARSER_INVOKE parser=mihomo branch=sub");
 #ifdef USE_MIHOMO_PARSER
-      bool parsed_by_mihomo = false;
-      try {
-        auto mihomo_nodes = mihomo::parseSubscription(strSub);
-        appendMihomoNodes(mihomo_nodes, nodes);
-
+        try {
+          auto mihomo_nodes = mihomo::parseSubscription(strSub);
+          appendMihomoNodes(mihomo_nodes, nodes);
+        } catch (const std::exception &e) {
+          recordParserFailure();
+          writeLog(LOG_LEVEL_ERROR,
+                   "NODE_PARSER_FAILED parser=mihomo branch=sub detail=" +
+                       summarizeSensitiveTextForLog(e.what()));
+          return -1;
+        }
         if (nodes.empty()) {
-          writeLog(LOG_TYPE_WARN,
-                   "Mihomo 解析器未从链接中解析到有效节点，将回退到旧解析器：'" +
-                       link + "'。");
-        } else {
-          parsed_by_mihomo = true;
-        }
-
-        if (parsed_by_mihomo) {
-          writeLog(LOG_TYPE_INFO, "Mihomo 解析器成功解析 " +
-                                      std::to_string(nodes.size()) + " 个节点。");
-          writeLog(LOG_TYPE_INFO, "第一个节点：" + nodes[0].Remark);
-        }
-      } catch (const std::exception &e) {
-        writeLog(LOG_TYPE_ERROR,
-                 "Mihomo 解析器错误：" + std::string(e.what()) +
-                     "，回退到旧解析器。");
-      }
-
-      if (!parsed_by_mihomo) {
-        if (parse_set.mihomo_only) {
-          writeLog(LOG_TYPE_ERROR,
-                   "Mihomo 专用解析模式拒绝使用旧解析器：'" + link + "'。");
+          recordParserFailure();
+          writeLog(LOG_LEVEL_ERROR,
+                   "NODE_PARSER_FAILED parser=mihomo branch=sub reason=no_nodes");
           return -1;
         }
-        nodes.clear();
-        if (explodeConfContent(strSub, nodes) == 0) {
-          writeLog(LOG_TYPE_ERROR, "无效订阅：'" + link + "'！");
-          return -1;
-        }
-      }
+        writeLog(LOG_LEVEL_VERBOSE,
+                 "Mihomo 解析器成功解析 " + std::to_string(nodes.size()) +
+                     " 个节点。");
 #else
-      if (parse_set.mihomo_only) {
-        writeLog(LOG_TYPE_ERROR,
-                 "当前构建未集成 Mihomo 解析器，无法生成 Clash/Mihomo 节点列表。");
-        return -1;
-      }
-      if (explodeConfContent(strSub, nodes) == 0) {
-        writeLog(LOG_TYPE_ERROR, "无效订阅：'" + link + "'！");
+        recordParserFailure();
+        writeLog(LOG_LEVEL_ERROR,
+                 "NODE_PARSER_FAILED parser=mihomo branch=sub reason=unavailable");
         return -1;
 #endif
       } else {
@@ -448,24 +531,26 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
         if (!getSubInfoFromHeader(extra_headers, subInfo))
           getSubInfoFromNodes(nodes, stream_rules, time_rules, subInfo);
       }
-      writeLog(LOG_TYPE_INFO,
+      writeLog(LOG_LEVEL_VERBOSE,
                "过滤前节点数：" + std::to_string(nodes.size()));
       filterNodes(nodes, exclude_remarks, include_remarks, groupID);
-      writeLog(LOG_TYPE_INFO,
+      writeLog(LOG_LEVEL_VERBOSE,
                "过滤后节点数：" + std::to_string(nodes.size()));
       for (Proxy &x : nodes) {
         x.GroupId = groupID;
         if (custom_group.size())
           x.Group = custom_group;
       }
-      writeLog(LOG_TYPE_INFO, "正在复制 " + std::to_string(nodes.size()) +
-                                  " 个节点到总节点列表");
+      writeLog(LOG_LEVEL_VERBOSE,
+               "正在复制 " + std::to_string(nodes.size()) +
+                   " 个节点到总节点列表");
       copyNodes(nodes, allNodes);
-      writeLog(LOG_TYPE_INFO, "总节点列表当前共有 " +
-                                  std::to_string(allNodes.size()) +
-                                  " 个节点");
+      writeLog(LOG_LEVEL_VERBOSE,
+               "总节点列表当前共有 " + std::to_string(allNodes.size()) +
+                   " 个节点");
     } else {
-      writeLog(LOG_TYPE_ERROR, "无法下载订阅数据。");
+      writeLog(LOG_LEVEL_ERROR,
+               "NODE_SOURCE_FAILED branch=sub reason=fetch_empty");
       return -1;
     }
     break;
@@ -473,9 +558,14 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
   case ConfType::Local:
     if (!authorized)
       return -1;
-    writeLog(LOG_TYPE_INFO, "正在解析配置文件数据...");
+    recordParserInvocation();
+    writeLog(LOG_LEVEL_VERBOSE,
+             "NODE_PARSER_INVOKE parser=legacy branch=local");
+    writeLog(LOG_LEVEL_VERBOSE, "正在解析配置文件数据...");
     if (explodeConf(link, nodes) == 0) {
-      writeLog(LOG_TYPE_ERROR, "无效配置文件！");
+      recordParserFailure();
+      writeLog(LOG_LEVEL_ERROR,
+               "NODE_PARSER_FAILED parser=legacy branch=local reason=no_nodes");
       return -1;
     }
     if (startsWith(strSub, "ssd://")) {
@@ -492,23 +582,22 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
     copyNodes(nodes, allNodes);
     break;
   default:
-    // 理论上不应该走到这里，因为：
-    // 1. 所有 Mihomo 协议都走 SUB case（由新分流逻辑处理）
-    // 2. HTTP(S)/SOCKS/Netch/Local 都有专门的 case
-    // 如果走到这里，说明有未处理的边缘情况
-    writeLog(LOG_TYPE_WARN,
-             "遇到非预期链接类型，理论上不应发生：" + link);
-    writeLog(LOG_TYPE_INFO, "正在尝试使用 Mihomo 作为回退解析器...");
-
-    // 作为最后的 fallback，尝试喂给 Mihomo
-    strSub = link;
-    if (!strSub.empty()) {
-      writeLog(LOG_TYPE_INFO, "正在使用 Mihomo 解析器处理回退解析...");
+    if (use_mihomo_parser) {
+      recordParserInvocation();
+      writeLog(LOG_LEVEL_VERBOSE,
+               "NODE_PARSER_INVOKE parser=mihomo branch=direct");
+      strSub = link;
 #ifdef USE_MIHOMO_PARSER
       try {
         auto mihomo_nodes = mihomo::parseSubscription(strSub);
         std::vector<Proxy> parsed_nodes;
         appendMihomoNodes(mihomo_nodes, parsed_nodes);
+        if (parsed_nodes.empty()) {
+          recordParserFailure();
+          writeLog(LOG_LEVEL_ERROR,
+                   "NODE_PARSER_FAILED parser=mihomo branch=direct reason=no_nodes");
+          return -1;
+        }
         for (auto &node : parsed_nodes) {
           if (explicit_http_node) {
             auto canonical = nlohmann::json::parse(node.CanonicalProxyJson);
@@ -525,18 +614,50 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID,
           allNodes.emplace_back(std::move(node));
         }
       } catch (const std::exception &e) {
-        writeLog(LOG_TYPE_ERROR,
-                 "Mihomo 回退解析失败：" + std::string(e.what()));
+        recordParserFailure();
+        writeLog(LOG_LEVEL_ERROR,
+                 "NODE_PARSER_FAILED parser=mihomo branch=direct detail=" +
+                     summarizeSensitiveTextForLog(e.what()));
         return -1;
       }
 #else
-      writeLog(LOG_TYPE_ERROR,
-               "Mihomo 解析器不可用，且没有匹配到其他处理器。");
+      recordParserFailure();
+      writeLog(LOG_LEVEL_ERROR,
+               "NODE_PARSER_FAILED parser=mihomo branch=direct reason=unavailable");
       return -1;
 #endif
     } else {
-      writeLog(LOG_TYPE_ERROR, "默认分支未找到有效链接。");
-      return -1;
+      recordParserInvocation();
+      writeLog(LOG_LEVEL_VERBOSE,
+               "NODE_PARSER_INVOKE parser=legacy branch=direct");
+      if (startsWith(link, "mierus://")) {
+        std::vector<Proxy> parsed_nodes;
+        explodeMierusNodes(link, parsed_nodes);
+        if (parsed_nodes.empty()) {
+          recordParserFailure();
+          writeLog(LOG_LEVEL_ERROR,
+                   "NODE_PARSER_FAILED parser=legacy branch=direct reason=no_nodes");
+          return -1;
+        }
+        for (auto &parsed_node : parsed_nodes) {
+          parsed_node.GroupId = groupID;
+          if (!custom_group.empty())
+            parsed_node.Group = custom_group;
+          allNodes.emplace_back(std::move(parsed_node));
+        }
+        return 0;
+      }
+      explode(link, node);
+      if (node.Type == ProxyType::Unknown) {
+        recordParserFailure();
+        writeLog(LOG_LEVEL_ERROR,
+                 "NODE_PARSER_FAILED parser=legacy branch=direct reason=no_nodes");
+        return -1;
+      }
+      node.GroupId = groupID;
+      if (!custom_group.empty())
+        node.Group = custom_group;
+      allNodes.emplace_back(std::move(node));
     }
   }
   return 0;
@@ -547,7 +668,7 @@ bool chkIgnore(const Proxy &node, string_array &exclude_remarks,
   bool excluded = false, included = false;
   // std::string remarks = UTF8ToACP(node.remarks);
   // std::string remarks = node.remarks;
-  // writeLog(LOG_TYPE_INFO, "正在匹配排除规则...");
+  // writeLog(LOG_LEVEL_VERBOSE, "正在匹配排除规则...");
   excluded = std::any_of(exclude_remarks.cbegin(), exclude_remarks.cend(),
                          [&node](const auto &x) {
                            std::string real_rule;
@@ -559,7 +680,7 @@ bool chkIgnore(const Proxy &node, string_array &exclude_remarks,
                              return false;
                          });
   if (include_remarks.size() != 0) {
-    // writeLog(LOG_TYPE_INFO, "正在匹配包含规则...");
+    // writeLog(LOG_LEVEL_VERBOSE, "正在匹配包含规则...");
     included = std::any_of(include_remarks.cbegin(), include_remarks.cend(),
                            [&node](const auto &x) {
                              std::string real_rule;
@@ -775,14 +896,15 @@ void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks,
       effectiveSettings().resourceControlEffective == "force_max");
   auto write_iter = nodes.begin();
   for (auto iter = nodes.begin(); iter != nodes.end(); ++iter) {
-    if (chkIgnore(*iter, exclude_remarks, include_remarks)) {
-      writeLog(LOG_TYPE_INFO, "节点 " + iter->Group + " - " + iter->Remark +
-                                  " 已被忽略，不会添加。");
+    const bool excluded = matchesAnyPrepared(exclude_matchers, *iter);
+    const bool included = include_matchers.empty() ||
+                          matchesAnyPrepared(include_matchers, *iter);
+    if (excluded || !included) {
+      ignored_count++;
+      checkpoint.complete();
       continue;
     }
 
-    writeLog(LOG_TYPE_INFO, "节点 " + iter->Group + " - " + iter->Remark +
-                                " 已添加。");
     iter->Id = node_index;
     iter->GroupId = groupID;
     ++node_index;
@@ -833,7 +955,7 @@ void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks,
   NULL), &pcre2_match_data_free);
       include_match_data.emplace_back(std::move(match_data));
   }
-  writeLog(LOG_TYPE_INFO, "过滤开始。");
+  writeLog(LOG_LEVEL_VERBOSE, "过滤开始。");
   while(iter != nodes.end())
   {
       bool excluded = false, included = false;
@@ -876,13 +998,13 @@ void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks,
           included = true;
       if(excluded || !included)
       {
-          writeLog(LOG_TYPE_INFO, "节点 " + iter->group + " - " +
+          writeLog(LOG_LEVEL_VERBOSE, "节点 " + iter->group + " - " +
   iter->remarks
   + " 已被忽略，不会添加。"); nodes.erase(iter);
       }
       else
       {
-          writeLog(LOG_TYPE_INFO, "节点 " + iter->group + " - " +
+          writeLog(LOG_LEVEL_VERBOSE, "节点 " + iter->group + " - " +
   iter->remarks
   + " 已添加。"); iter->id = node_index; iter->groupID = groupID;
           ++node_index;
@@ -890,7 +1012,7 @@ void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks,
       }
   }
   */
-  writeLog(LOG_TYPE_INFO, "过滤完成。");
+  writeLog(LOG_LEVEL_VERBOSE, "过滤完成。");
 }
 
 void nodeRename(Proxy &node, const RegexMatchConfigs &rename_array,

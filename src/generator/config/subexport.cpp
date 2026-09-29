@@ -6,11 +6,12 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include "config/custom_openclash_rules.h"
 #include "config/regmatch.h"
 #include "external_rules.h"
 #include "generator/config/clash_proxy.h"
@@ -1098,6 +1099,16 @@ static YAML::Node providersMatchingGroupId(
   return use_node;
 }
 
+static YAML::Node providersMatchingGroupTag(
+    const std::string &target, const std::vector<ProxyProvider> &providers) {
+  YAML::Node use_node(YAML::NodeType::Sequence);
+  for (const ProxyProvider &p : providers) {
+    if (!p.tag.empty() && regFind(p.tag, target))
+      use_node.push_back(p.name);
+  }
+  return use_node;
+}
+
 using RemarkSet = std::unordered_set<std::string_view>;
 
 void processRemark(std::string &remark, const RemarkSet &used_remarks,
@@ -1291,33 +1302,17 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
     singleproxy["server"] = x.Hostname;
     singleproxy["port"] = x.Port;
 
-    // Generic Pass-Through (Phase 9 + 9.3: Smart Global Parameter Application)
-    // If RawParams are present (from Mihomo parser), use them directly.
-    // This allows supporting any new protocol without modifying SubConverter-Extended
-    // code.
-    if (!x.RawParams.empty()) {
-      // Get protocol type for compatibility check
-      std::string protocol =
-          x.RawParams.count("type") ? x.RawParams["type"] : "";
-
-      // Output all RawParams
-      for (const auto &[key, value] : x.RawParams) {
-        // Skip fields we already handled or want to override (e.g. name is
-        // handled by Remark)
-        if (key == "name" || key == "server" || key == "port")
-          continue;
-
-        auto json_value = x.RawParamJson.find(key);
-        if (json_value != x.RawParamJson.end()) {
-          try {
-            YAML::Node parsed = YAML::Load(json_value->second);
-            singleproxy[key] = parsed;
-          } catch (...) {
-            singleproxy[key] = value;
-          }
-        } else {
-          singleproxy[key] = value;
-        }
+    // Mihomo-produced nodes keep one complete typed mapping. Clash output is
+    // derived from that canonical document, while legacy target generators
+    // continue to use the compatibility projection in Proxy.
+    if (!x.CanonicalProxyJson.empty()) {
+      try {
+        singleproxy = buildCanonicalClashProxy(
+            x, ClashProxyOverlay{udp, scv, tfo, xudp});
+      } catch (const std::exception &e) {
+        writeLog(LOG_LEVEL_ERROR, "MIHOMO_CANONICAL_PROXY_INVALID detail=" +
+                        summarizeSensitiveTextForLog(e.what()));
+        continue;
       }
 
       // Preserve the existing compact representation for Mihomo-parsed nodes.
@@ -1945,10 +1940,9 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
     }
 
     yamlnode["proxy-providers"] = provider_node;
-    writeLog(0,
+    writeLog(LOG_LEVEL_INFO,
              "已生成 " + std::to_string(ext.providers.size()) +
-                 " 个 proxy provider。",
-             LOG_LEVEL_INFO);
+                 " 个 proxy provider。");
   }
 
   for (const ProxyGroupConfig &x : extra_proxy_group) {
@@ -1998,8 +1992,8 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
       // 检查策略组是否包含正则表达式（用于匹配节点）
       bool has_regex = false;
       std::string regex_pattern;
-      bool has_groupid_provider_match = false;
-      YAML::Node groupid_use_node(YAML::NodeType::Sequence);
+      bool has_provider_match = false;
+      YAML::Node provider_use_node(YAML::NodeType::Sequence);
 
       for (const auto &proxy : x.Proxies) {
         // 如果不是以 [] 开头，则认为是正则表达式
@@ -2010,9 +2004,22 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
             YAML::Node matched_providers =
                 providersMatchingGroupId(groupid_target, ext.providers);
             if (matched_providers.size() > 0) {
-              has_groupid_provider_match = true;
-              groupid_use_node = matched_providers;
+              has_provider_match = true;
+              provider_use_node = matched_providers;
               regex_pattern = groupid_filter;
+              has_regex = !regex_pattern.empty();
+              break;
+            }
+          }
+
+          std::string group_target, group_filter;
+          if (splitRenameGroupRule(proxy, group_target, group_filter)) {
+            YAML::Node matched_providers =
+                providersMatchingGroupTag(group_target, ext.providers);
+            if (matched_providers.size() > 0) {
+              has_provider_match = true;
+              provider_use_node = matched_providers;
+              regex_pattern = group_filter;
               has_regex = !regex_pattern.empty();
               break;
             }
@@ -2024,8 +2031,8 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
         }
       }
 
-      if (has_groupid_provider_match) {
-        singlegroup["use"] = groupid_use_node;
+      if (has_provider_match) {
+        singlegroup["use"] = provider_use_node;
         if (has_regex)
           singlegroup["filter"] = regex_pattern;
       } else if (has_regex && !regex_pattern.empty()) {
@@ -2096,20 +2103,9 @@ std::string proxyToClash(std::vector<Proxy> &nodes,
   try {
     yamlnode = YAML::Load(base_conf);
   } catch (std::exception &e) {
-    writeLog(0, std::string("Clash 基础配置加载失败：") + e.what(),
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "CLASH_BASE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(e.what()));
     return "";
-  }
-
-  if (ext.custom_openclash_rules_fallback) {
-    size_t rewritten = custom_openclash_rules::rewriteRuleProviderUrls(
-        yamlnode, ext.custom_openclash_rules_base_url);
-    if (rewritten) {
-      writeLog(0,
-               "已将 " + std::to_string(rewritten) +
-                   " 个 Custom_OpenClash_Rules 规则链接改写为本地发布接口。",
-               LOG_LEVEL_INFO);
-    }
   }
 
   proxyToClash(nodes, yamlnode, extra_proxy_group, clashR, ext);
@@ -2239,15 +2235,21 @@ std::string proxyToClash(std::vector<Proxy> &nodes,
         yamlnode["mode"] = ext.clash_script ? "Script" : "Rule";
     }
 
-    renderClashScript(yamlnode, ruleset_content_array,
-                      ext.managed_config_prefix, ext.clash_script,
-                      ext.overwrite_original_rules,
-                      ext.clash_classical_ruleset, ext.rule_stats);
-    std::string result = YAML::Dump(yamlnode);
-    bool has_providers = !proxy_providers_yaml.empty();
-    if (has_providers) {
-      insertProxyProvidersBeforeGroups(result, proxy_providers_yaml,
-                                       ext.clash_new_field_name);
+    if (has_external_rules)
+      yamlnode.remove(rules_field_name);
+    renderClashScript(
+        yamlnode, ruleset_content_array, ext.managed_config_prefix,
+        ext.clash_script,
+        has_external_rules ? true : ext.overwrite_original_rules,
+        ext.clash_classical_ruleset, ext.rule_stats);
+    if (has_external_rules) {
+      string_array generated_rules;
+      if (yamlnode[rules_field_name].IsDefined() &&
+          yamlnode[rules_field_name].IsSequence())
+        generated_rules = safe_as<string_array>(yamlnode[rules_field_name]);
+      yamlnode.remove(rules_field_name);
+      if (!merge_external_rules(generated_rules))
+        return "";
     }
     return dump_with_extracted_fields();
   }
@@ -2282,7 +2284,7 @@ std::string proxyToClash(std::vector<Proxy> &nodes,
   // 使用之前在 998-1002 行已提取的 proxy_providers_yaml
   std::string proxy_providers_str;
   if (!proxy_providers_yaml.empty()) {
-    writeLog(0, "正在使用先前提取的 proxy-providers", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "正在使用先前提取的 proxy-providers");
 
     // proxy_providers_yaml 已经是 YAML::Dump 的结果
     // 需要移除可能的文档分隔符 "---"
@@ -2317,46 +2319,39 @@ std::string proxyToClash(std::vector<Proxy> &nodes,
         proxy_providers_str += "\n";
       }
 
-      writeLog(0,
+      writeLog(LOG_LEVEL_INFO,
                "已准备待插入的 proxy-providers，长度：" +
-                   std::to_string(proxy_providers_str.length()),
-               LOG_LEVEL_INFO);
+                   std::to_string(proxy_providers_str.length()));
     }
   } else {
-    writeLog(0, "没有需要插入的 proxy-providers", LOG_LEVEL_INFO);
+    writeLog(LOG_LEVEL_INFO, "没有需要插入的 proxy-providers");
   }
 
   std::string yamlnode_str = YAML::Dump(yamlnode);
 
   // 在 proxy-groups 之前插入 proxy-providers
   if (!proxy_providers_str.empty()) {
-    writeLog(
-        0,
+    writeLog(LOG_LEVEL_INFO,
         "正在尝试将 proxy-providers 插入到 proxy-groups 前，大小：" +
-            std::to_string(proxy_providers_str.length()),
-        LOG_LEVEL_INFO);
+            std::to_string(proxy_providers_str.length()));
 
     std::string proxy_groups_key =
         ext.clash_new_field_name ? "proxy-groups:" : "Proxy Group:";
     size_t groups_pos = yamlnode_str.find(proxy_groups_key);
 
     if (groups_pos != std::string::npos) {
-      writeLog(0,
-               "已在位置 " + std::to_string(groups_pos) + " 找到 proxy-groups",
-               LOG_LEVEL_INFO);
+      writeLog(LOG_LEVEL_INFO,
+               "已在位置 " + std::to_string(groups_pos) + " 找到 proxy-groups");
       // 在 proxy-groups: 这一行之前插入
       yamlnode_str.insert(groups_pos, proxy_providers_str);
-      writeLog(0, "已将 proxy-providers 插入到 proxy-groups 前",
-               LOG_LEVEL_INFO);
+      writeLog(LOG_LEVEL_INFO, "已将 proxy-providers 插入到 proxy-groups 前");
     } else {
-      writeLog(0, "未找到 proxy-groups，将追加到末尾",
-               LOG_LEVEL_WARNING);
+      writeLog(LOG_LEVEL_WARNING, "未找到 proxy-groups，将追加到末尾");
       // 如果找不到 proxy-groups，尝试在文件末尾插入
       yamlnode_str += proxy_providers_str;
     }
   } else {
-    writeLog(0, "proxy-providers 内容为空，没有内容需要插入",
-             LOG_LEVEL_WARNING);
+    writeLog(LOG_LEVEL_WARNING, "proxy-providers 内容为空，没有内容需要插入");
   }
 
   // 插入 proxies 字段（在 proxy-groups 之前）
@@ -4134,6 +4129,13 @@ std::string proxyToSurge(std::vector<Proxy> &nodes,
   unsigned short local_port = 1080;
   RemarkSet used_remarks;
   used_remarks.reserve(nodes.size());
+  const bool surfboard = surge_ver == -3;
+  TargetGenerationStats &generation_stats = ext.target_generation_stats;
+  generation_stats = TargetGenerationStats{};
+  generation_stats.input_nodes = nodes.size();
+  TargetGenerationStatsMirror generation_stats_mirror(
+      generation_stats, surfboard ? ext.surfboard_generation_stats
+                                  : ext.surge_generation_stats);
 
   ini.store_any_line = true;
   // filter out sections that requires direct-save
@@ -4146,8 +4148,8 @@ std::string proxyToSurge(std::vector<Proxy> &nodes,
   ini.add_direct_save_section("URL Rewrite");
   ini.add_direct_save_section("Header Rewrite");
   if (ini.parse(base_conf) != 0 && !ext.nodelist) {
-    writeLog(0, "Surge 基础配置加载失败：" + ini.get_last_error(),
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "SURGE_BASE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(ini.get_last_error()));
     return "";
   }
 
@@ -4527,6 +4529,7 @@ std::string proxyToSurge(std::vector<Proxy> &nodes,
       nodelist.emplace_back(x);
     }
     used_remarks.emplace(x.Remark);
+    generation_stats.emitted_nodes++;
   }
 
   if (ext.nodelist)
@@ -5788,12 +5791,14 @@ std::string proxyToSSSub(std::string base_conf, std::vector<Proxy> &nodes,
   if (base_conf.empty())
     base_conf = "{}";
   rapidjson::ParseResult result = base.Parse(base_conf.data());
-  if (!result)
-    writeLog(0,
+  if (!result || !base.IsObject()) {
+    writeLog(LOG_LEVEL_ERROR,
              std::string("SIP008 基础配置加载失败：") +
-                 rapidjson::GetParseError_En(result.Code()) + " (" +
-                 std::to_string(result.Offset()) + ")",
-             LOG_LEVEL_ERROR);
+                 (result ? "root must be an object"
+                         : rapidjson::GetParseError_En(result.Code())) +
+                 " (" + std::to_string(result.Offset()) + ")");
+    base.SetObject();
+  }
 
   rapidjson::Value proxies(rapidjson::kArrayType);
   for (Proxy &x : nodes) {
@@ -5854,9 +5859,8 @@ std::string proxyToQuan(std::vector<Proxy> &nodes, const std::string &base_conf,
   INIReader ini;
   ini.store_any_line = true;
   if (!ext.nodelist && ini.parse(base_conf) != 0) {
-    writeLog(
-        0, "Quantumult 基础配置加载失败：" + ini.get_last_error(),
-        LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "QUANTUMULT_BASE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(ini.get_last_error()));
     return "";
   }
 
@@ -6081,6 +6085,198 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini,
                    "", ext.rule_stats);
 }
 
+static std::string escapeQuanXRegexLiteral(const std::string &value) {
+  std::string escaped;
+  escaped.reserve(value.size() * 2);
+  for (char ch : value) {
+    switch (ch) {
+    case '\\':
+    case '.':
+    case '^':
+    case '$':
+    case '|':
+    case '(':
+    case ')':
+    case '[':
+    case ']':
+    case '{':
+    case '}':
+    case '*':
+    case '+':
+    case '?':
+      escaped.push_back('\\');
+      break;
+    default:
+      break;
+    }
+    escaped.push_back(ch);
+  }
+  return escaped;
+}
+
+static std::string quanxResourceTagRegex(
+    const std::vector<const QuanXServerRemote *> &resources) {
+  string_array alternatives;
+  alternatives.reserve(resources.size());
+  for (const QuanXServerRemote *resource : resources)
+    alternatives.emplace_back(escapeQuanXRegexLiteral(resource->resource_tag));
+  if (alternatives.size() == 1)
+    return "^" + alternatives.front() + "$";
+  return "^(?:" + join(alternatives, "|") + ")$";
+}
+
+static bool parseQuanXSourceGroupRule(const std::string &rule,
+                                      std::string &source_pattern,
+                                      std::string &server_pattern) {
+  static const std::string group_regex =
+      R"(^!!GROUP=(.+?)(?:!!(.*))?$)";
+  if (!startsWith(rule, "!!GROUP="))
+    return false;
+  source_pattern.clear();
+  server_pattern.clear();
+  return regGetMatch(rule, group_regex, 3,
+                     static_cast<std::string *>(nullptr), &source_pattern,
+                     &server_pattern) == 0 &&
+         !source_pattern.empty();
+}
+
+struct QuanXRemoteSelector {
+  std::vector<const QuanXServerRemote *> resources;
+  std::string server_pattern;
+};
+
+static QuanXRemoteSelector quanxRemoteSelectorForGroup(
+    const ProxyGroupConfig &group,
+    const std::vector<QuanXServerRemote> &resources) {
+  QuanXRemoteSelector selector;
+  if (resources.empty() || group.Type == ProxyGroupType::SSID)
+    return selector;
+
+  for (const QuanXServerRemote &resource : resources)
+    selector.resources.emplace_back(&resource);
+
+  if (!group.UsingProvider.empty()) {
+    selector.resources.erase(
+        std::remove_if(selector.resources.begin(), selector.resources.end(),
+                       [&](const QuanXServerRemote *resource) {
+                         return std::find(group.UsingProvider.begin(),
+                                          group.UsingProvider.end(),
+                                          resource->resource_tag) ==
+                                    group.UsingProvider.end() &&
+                                std::find(group.UsingProvider.begin(),
+                                          group.UsingProvider.end(),
+                                          resource->requested_resource_tag) ==
+                                    group.UsingProvider.end() &&
+                                std::find(group.UsingProvider.begin(),
+                                          group.UsingProvider.end(),
+                                          resource->selection_resource_tag) ==
+                                    group.UsingProvider.end();
+                       }),
+        selector.resources.end());
+    selector.server_pattern = ".*";
+  }
+
+  for (const std::string &rule : group.Proxies) {
+    if (startsWith(rule, "[]") || rule == "DIRECT" || rule == "REJECT")
+      continue;
+
+    std::string target, server_pattern;
+    if (parseProviderGroupIdMatcher(rule, target, server_pattern)) {
+      selector.resources.erase(
+          std::remove_if(selector.resources.begin(), selector.resources.end(),
+                         [&](const QuanXServerRemote *resource) {
+                           return !matchRange(target, resource->group_id);
+                         }),
+          selector.resources.end());
+      selector.server_pattern =
+          server_pattern.empty() ? ".*" : server_pattern;
+    } else if (parseQuanXSourceGroupRule(rule, target, server_pattern)) {
+      selector.resources.erase(
+          std::remove_if(selector.resources.begin(), selector.resources.end(),
+                         [&](const QuanXServerRemote *resource) {
+                           return resource->source_tag.empty() ||
+                                  !regFind(resource->source_tag, target);
+                         }),
+          selector.resources.end());
+      selector.server_pattern =
+          server_pattern.empty() ? ".*" : server_pattern;
+    } else if (!startsWith(rule, "!!") && !startsWith(rule, "script:")) {
+      selector.server_pattern = rule;
+    }
+    break;
+  }
+
+  if (selector.server_pattern.empty())
+    selector.resources.clear();
+  return selector;
+}
+
+static std::string quanxRemoteTagFromLine(const std::string &line) {
+  std::string trimmed = trimWhitespace(line, true, true);
+  if (trimmed.empty() || startsWith(trimmed, ";") ||
+      startsWith(trimmed, "#") || startsWith(trimmed, "//"))
+    return "";
+  for (std::string item : split(trimmed, ",")) {
+    item = trimWhitespace(item, true, true);
+    std::string lower = toLower(item);
+    if (startsWith(lower, "tag="))
+      return trimWhitespace(item.substr(4), true, true);
+  }
+  return "";
+}
+
+static std::string clampQuanXResourceTag(const std::string &tag,
+                                         size_t max_length) {
+  if (tag.size() <= max_length)
+    return tag;
+  std::string result = tag.substr(0, max_length);
+  while (!result.empty() && !isStrUTF8(result))
+    result.pop_back();
+  return result;
+}
+
+static void appendQuanXServerRemotes(INIReader &ini, extra_settings &ext) {
+  if (ext.quanx_server_remotes.empty())
+    return;
+
+  std::unordered_set<std::string> used_tags;
+  string_array existing_lines;
+  ini.get_all("server_remote", "{NONAME}", existing_lines);
+  for (const std::string &line : existing_lines) {
+    std::string tag = quanxRemoteTagFromLine(line);
+    if (!tag.empty())
+      used_tags.emplace(std::move(tag));
+  }
+
+  ini.set_current_section("server_remote");
+  for (QuanXServerRemote &remote : ext.quanx_server_remotes) {
+    std::string base_tag = remote.resource_tag;
+    std::string candidate = base_tag;
+    int suffix_index = 1;
+    while (!used_tags.insert(candidate).second) {
+      const std::string suffix = "_" + std::to_string(suffix_index++);
+      const size_t max_base = 64 > suffix.size() ? 64 - suffix.size() : 0;
+      candidate = clampQuanXResourceTag(base_tag, max_base) + suffix;
+    }
+    if (candidate != remote.resource_tag) {
+      remote.resource_tag = candidate;
+      writeLog(LOG_LEVEL_INFO,
+               "QUANX_REMOTE_TAG_RENAMED group_id=" +
+                   std::to_string(remote.group_id));
+    }
+
+    std::string safe_url = replaceAllDistinct(remote.url, ",", "%2C");
+    std::string line = safe_url + ", tag=" + remote.resource_tag;
+    if (remote.has_update_interval) {
+      const int interval =
+          remote.update_interval == 0 ? -1 : remote.update_interval;
+      line += ", update-interval=" + std::to_string(interval);
+    }
+    line += ", enabled=true";
+    ini.set("{NONAME}", std::move(line));
+  }
+}
+
 std::string proxyToQuanX(std::vector<Proxy> &nodes,
                          const std::string &base_conf,
                          std::vector<RulesetContent> &ruleset_content_array,
@@ -6098,9 +6294,8 @@ std::string proxyToQuanX(std::vector<Proxy> &nodes,
   ini.add_direct_save_section("mitm");
   ini.add_direct_save_section("server_remote");
   if (!ext.nodelist && ini.parse(base_conf) != 0) {
-    writeLog(
-        0, "Quantumult X 基础配置加载失败：" + ini.get_last_error(),
-        LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "QUANTUMULT_X_BASE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(ini.get_last_error()));
     return "";
   }
 
@@ -6148,6 +6343,11 @@ void proxyToQuanX(std::vector<Proxy> &nodes, INIReader &ini,
     }
 
     processRemark(x.Remark, used_remarks);
+
+    if (x.Port == 0 || x.Hostname.empty() || x.Remark.empty() ||
+        !quanxProxyScalarIsSafe(x.Hostname) ||
+        !quanxProxyScalarIsSafe(x.Remark))
+      continue;
 
     std::string &hostname = x.Hostname, &method = x.EncryptMethod,
                 &id = x.UserId, &transproto = x.TransferProtocol,
@@ -6635,8 +6835,8 @@ std::string proxyToMellow(std::vector<Proxy> &nodes,
   INIReader ini;
   ini.store_any_line = true;
   if (ini.parse(base_conf) != 0) {
-    writeLog(0, "Mellow 基础配置加载失败：" + ini.get_last_error(),
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "MELLOW_BASE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(ini.get_last_error()));
     return "";
   }
 
@@ -6807,6 +7007,115 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini,
                    "", ext.rule_stats);
 }
 
+static std::string clampLoonAlias(const std::string &alias,
+                                  size_t max_length) {
+  if (alias.size() <= max_length)
+    return alias;
+  std::string result = alias.substr(0, max_length);
+  while (!result.empty() && !isStrUTF8(result))
+    result.pop_back();
+  return result;
+}
+
+static void collectLoonSectionNames(INIReader &ini, const std::string &section,
+                                    std::unordered_set<std::string> &names) {
+  string_multimap items;
+  ini.set_current_section(section);
+  ini.get_items(items);
+  for (const auto &[name, value] : items) {
+    (void)value;
+    std::string normalized = trimWhitespace(name, true, true);
+    if (!normalized.empty() && normalized != "{NONAME}")
+      names.emplace(std::move(normalized));
+  }
+}
+
+static std::string reserveLoonAlias(std::unordered_set<std::string> &used,
+                                    const std::string &base,
+                                    const std::string &fallback) {
+  std::string normalized = clampLoonAlias(base, 64);
+  if (normalized.empty())
+    normalized = fallback;
+  if (used.insert(normalized).second)
+    return normalized;
+  int suffix_index = 1;
+  while (true) {
+    const std::string suffix = "_" + std::to_string(suffix_index++);
+    const size_t max_base = 64 > suffix.size() ? 64 - suffix.size() : 0;
+    const std::string candidate =
+        clampLoonAlias(normalized, max_base) + suffix;
+    if (used.insert(candidate).second)
+      return candidate;
+  }
+}
+
+static bool loonRemoteMatchesProvider(const LoonRemoteProxyResource &remote,
+                                      const std::string &provider) {
+  return provider == remote.requested_name ||
+         provider == remote.selection_name ||
+         provider == remote.resource_name;
+}
+
+static std::vector<LoonRemoteProxyResource *>
+loonResourcesForRule(const std::string &rule,
+                     std::vector<LoonRemoteProxyResource> &remotes,
+                     std::string &server_pattern) {
+  std::vector<LoonRemoteProxyResource *> selected;
+  selected.reserve(remotes.size());
+  for (LoonRemoteProxyResource &remote : remotes)
+    selected.emplace_back(&remote);
+
+  std::string target;
+  if (parseProviderGroupIdMatcher(rule, target, server_pattern)) {
+    selected.erase(
+        std::remove_if(selected.begin(), selected.end(), [&](const auto *item) {
+          return !matchRange(target, item->group_id);
+        }),
+        selected.end());
+  } else if (parseQuanXSourceGroupRule(rule, target, server_pattern)) {
+    selected.erase(
+        std::remove_if(selected.begin(), selected.end(), [&](const auto *item) {
+          return item->source_tag.empty() ||
+                 !regFind(item->source_tag, target);
+        }),
+        selected.end());
+  } else if (!startsWith(rule, "!!") && !startsWith(rule, "script:")) {
+    server_pattern = rule;
+  } else {
+    selected.clear();
+  }
+  if (server_pattern.empty())
+    server_pattern = ".*";
+  return selected;
+}
+
+static void appendLoonRemoteProxies(
+    INIReader &ini, std::vector<Proxy> &nodes,
+    const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext,
+    std::unordered_set<std::string> &used_aliases) {
+  collectLoonSectionNames(ini, "Remote Proxy", used_aliases);
+  collectLoonSectionNames(ini, "Remote Filter", used_aliases);
+  collectLoonSectionNames(ini, "Proxy", used_aliases);
+  collectLoonSectionNames(ini, "Proxy Group", used_aliases);
+  for (const ProxyGroupConfig &group : extra_proxy_group)
+    used_aliases.emplace(group.Name);
+  for (const Proxy &node : nodes)
+    used_aliases.emplace(node.Remark);
+
+  ini.set_current_section("Remote Proxy");
+  for (LoonRemoteProxyResource &remote : ext.loon_remote_proxies) {
+    const std::string final_name = reserveLoonAlias(
+        used_aliases, remote.resource_name, "SubConverter_Remote");
+    if (final_name != remote.resource_name) {
+      remote.resource_name = final_name;
+      writeLog(LOG_LEVEL_INFO, "LOON_REMOTE_PROXY_RENAMED group_id=" +
+                                   std::to_string(remote.group_id));
+    }
+    ini.set(remote.resource_name,
+            replaceAllDistinct(remote.url, ",", "%2C"));
+  }
+}
+
 std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
                         std::vector<RulesetContent> &ruleset_content_array,
                         const ProxyGroupConfigs &extra_proxy_group,
@@ -6828,8 +7137,8 @@ std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
   ini.store_any_line = true;
   ini.add_direct_save_section("Plugin");
   if (ini.parse(base_conf) != INIREADER_EXCEPTION_NONE && !ext.nodelist) {
-    writeLog(0, "Loon 基础配置加载失败：" + ini.get_last_error(),
-             LOG_LEVEL_ERROR);
+    writeLog(LOG_LEVEL_ERROR, "LOON_BASE_CONFIG_PARSE_FAILED detail=" +
+                    summarizeSensitiveTextForLog(ini.get_last_error()));
     return "";
   }
 
@@ -7489,9 +7798,13 @@ void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json,
     endpoints.CopyFrom(json["endpoints"], allocator);
   std::vector<Proxy> nodelist;
   string_array remarks_list;
+  size_t wireguard_nodes_emitted = 0;
+  size_t wireguard_peers_emitted = 0;
+  size_t snell_nodes_input = 0;
+  size_t snell_nodes_emitted = 0;
+  size_t snell_v5_normalized = 0;
   RemarkSet used_remarks;
   used_remarks.reserve(nodes.size());
-  std::string search = " Mbps";
 
   if (!ext.nodelist) {
     auto direct = buildObject(allocator, "type", "direct", "tag", "DIRECT");
@@ -8140,11 +8453,9 @@ std::string proxyToSingBox(std::vector<Proxy> &nodes,
   if (!ext.nodelist) {
     json.Parse(base_conf.data());
     if (json.HasParseError()) {
-      writeLog(
-          0,
+      writeLog(LOG_LEVEL_ERROR,
           "sing-box 基础配置加载失败：" +
-              std::string(rapidjson::GetParseError_En(json.GetParseError())),
-          LOG_LEVEL_ERROR);
+              std::string(rapidjson::GetParseError_En(json.GetParseError())));
       return "";
     }
   } else {

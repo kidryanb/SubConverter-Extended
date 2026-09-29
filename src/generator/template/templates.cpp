@@ -9,7 +9,6 @@
 #include <inja.hpp>
 #include <nlohmann/json.hpp>
 
-#include "config/custom_openclash_rules.h"
 #include "handler/interfaces.h"
 #include "handler/settings.h"
 #include "handler/settings_view.h"
@@ -20,6 +19,7 @@
 #include "utils/network.h"
 #include "utils/redact.h"
 #include "utils/regexp.h"
+#include "utils/string_hash.h"
 #include "utils/time_compat.h"
 #include "utils/urlencode.h"
 #include "utils/yamlcpp_extra.h"
@@ -272,7 +272,8 @@ std::string parseHostname(inja::Arguments &args)
         return std::string();
 
     std::string input_content, output_content;
-    ProxyPolicy proxy = parseProxy(global.proxyConfig);
+    const Settings &settings = effectiveSettings();
+    ProxyPolicy proxy = parseProxy(settings.proxyConfig, settings.proxyBypass);
     for(std::string &x : urls)
     {
         input_content = webGet(x, proxy, settings.cacheConfig);
@@ -298,10 +299,31 @@ std::string parseHostname(inja::Arguments &args)
 std::string template_webGet(inja::Arguments &args)
 {
     std::string data = args.at(0)->get<std::string>();
-    ProxyPolicy proxy = parseProxy(global.proxyConfig);
-    writeLog(0, "模板调用 fetch，URL：'" + data + "'。", LOG_LEVEL_INFO);
-    return webGet(data, proxy, global.cacheConfig, nullptr, nullptr,
-                  current_template_fetch_context);
+    if(current_template_resolved_fetches)
+    {
+        const auto found = current_template_resolved_fetches->find(data);
+        if(found != current_template_resolved_fetches->end())
+        {
+            if(found->second.empty() && current_template_fetch_failed)
+                *current_template_fetch_failed = true;
+            return found->second;
+        }
+        if(current_template_missing_fetches &&
+           std::find(current_template_missing_fetches->begin(),
+                     current_template_missing_fetches->end(), data) ==
+               current_template_missing_fetches->end())
+            current_template_missing_fetches->push_back(data);
+        throw TemplateFetchSuspended{};
+    }
+    const Settings &settings = effectiveSettings();
+    ProxyPolicy proxy = parseProxy(settings.proxyConfig, settings.proxyBypass);
+    writeLog(LOG_LEVEL_INFO, "模板调用 fetch：" + summarizeUrlForLog(data) + "。");
+    std::string content =
+        webGet(data, proxy, settings.cacheConfig, nullptr, nullptr,
+               current_template_fetch_context);
+    if(content.empty() && current_template_fetch_failed)
+        *current_template_fetch_failed = true;
+    return content;
 }
 #endif // NO_WEBGET
 
@@ -595,8 +617,13 @@ int render_template(const std::string &content, const template_args &vars,
     }
     catch (std::exception &e)
     {
-        output = "模板渲染失败。原因：" + std::string(e.what());
-        writeLog(0, output, LOG_LEVEL_ERROR);
+        output = "Invalid template: rendering failed.\n"
+                 "无效模板：模板渲染失败。\n"
+                 "Please check the template syntax and configured resources.\n"
+                 "请检查模板语法和已配置资源。";
+        writeLog(LOG_LEVEL_ERROR,
+                 "TEMPLATE_RENDER_FAILED detail=" +
+                     summarizeSensitiveTextForLog(e.what()));
         return -1;
     }
     return -2;
@@ -695,8 +722,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                 strLine = "MATCH";
             strLine = appendClashRuleTarget(strLine, rule_group);
             rules.emplace_back(std::move(strLine));
-            if(stats)
-                stats->add();
+            local_stats.add();
             continue;
         }
         else
@@ -728,17 +754,15 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                 }
                 if(script && x.rule_type == RULESET_CLASH_IPCIDR &&
                    x.options.no_resolve)
-                    writeLog(0,
+                    writeLog(LOG_LEVEL_WARNING,
                              "Clash Script 模式不支持规则集选项 "
                              "no-resolve，已对策略组 '" +
-                                 rule_group + "' 安全忽略。",
-                             LOG_LEVEL_WARNING);
+                                 rule_group + "' 安全忽略。");
                 if(!script)
                 {
                     rules.emplace_back(buildClashRuleSetReference(
                         rule_name, rule_group, x.rule_type, x.options));
-                    if(stats)
-                        stats->add();
+                    local_stats.add();
                 }
                 groups.emplace_back(rule_name);
                 continue;
@@ -762,8 +786,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                         if(!script)
                         {
                             rules.emplace_back("RULE-SET," + rule_name + "," + rule_group);
-                            if(stats)
-                                stats->add();
+                            local_stats.add();
                         }
                         groups.emplace_back(rule_name);
                         continue;
@@ -776,7 +799,8 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             retrieved_rules = materializeRulesetContent(x);
             if(retrieved_rules.empty())
             {
-                writeLog(0, "获取规则集失败或规则集为空：'" + x.rule_path + "'。", LOG_LEVEL_WARNING);
+                writeLog(LOG_LEVEL_WARNING, "获取规则集失败或规则集为空：" +
+                                summarizeUrlForLog(x.rule_path) + "。");
                 continue;
             }
 
@@ -823,8 +847,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                                 strLine += "," + vArray[2];
                         }
                         rules.emplace_back(strLine);
-                        if(stats)
-                            stats->add();
+                        local_stats.add();
                     }
                 }
                 else if(!has_domain[rule_name] && (startsWith(strLine, "DOMAIN,") || startsWith(strLine, "DOMAIN-SUFFIX,")))
@@ -839,8 +862,7 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             if(has_domain[rule_name] && !script)
             {
                 rules.emplace_back("RULE-SET," + rule_name + " (Domain)," + rule_group);
-                if(stats)
-                    stats->add();
+                local_stats.add();
             }
             if(has_ipcidr[rule_name] && !script)
             {
@@ -848,14 +870,12 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
                     rules.emplace_back("RULE-SET," + rule_name + " (IP-CIDR)," + rule_group + ",no-resolve");
                 else
                     rules.emplace_back("RULE-SET," + rule_name + " (IP-CIDR)," + rule_group);
-                if(stats)
-                    stats->add();
+                local_stats.add();
             }
             if(!has_domain[rule_name] && !has_ipcidr[rule_name] && !script)
             {
                 rules.emplace_back("RULE-SET," + rule_name + "," + rule_group);
-                if(stats)
-                    stats->add();
+                local_stats.add();
             }
             if(std::find(groups.begin(), groups.end(), rule_name) == groups.end())
                 groups.emplace_back(rule_name);
@@ -869,8 +889,19 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
         std::string direct_url =
             !url.empty() && url[0] == '*' ? url.substr(1) : "";
         bool direct_mrs =
+            !direct_url.empty() && hasExtension(direct_url, ".mrs");
+        bool direct_txt =
+            !direct_url.empty() && hasExtension(direct_url, ".txt");
+        bool direct_yaml =
             !direct_url.empty() &&
-            custom_openclash_rules::hasMrsExtension(direct_url);
+            (hasExtension(direct_url, ".yaml") ||
+             hasExtension(direct_url, ".yml"));
+        std::string provider_format =
+            direct_mrs ? "mrs" :
+            direct_txt ? "text" :
+            (direct_url.empty() || direct_yaml) ? "yaml" : "";
+        const std::string provider_extension =
+            direct_mrs ? "mrs" : direct_txt ? "txt" : "yaml";
         bool group_has_domain = has_domain[x], group_has_ipcidr = has_ipcidr[x];
         int interval = ruleset_interval[x];
 
@@ -902,60 +933,23 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             std::string yaml_key = x;
             if(rule_type[x] != RULESET_CLASH_DOMAIN)
                 yaml_key += " (Domain)";
-            base_rule["rule-providers"][yaml_key]["type"] = "http";
-            base_rule["rule-providers"][yaml_key]["behavior"] = "domain";
-            if(url[0] == '*')
-                base_rule["rule-providers"][yaml_key]["url"] = url.substr(1);
-            else
-                base_rule["rule-providers"][yaml_key]["url"] = remote_path_prefix + "/getruleset?type=3&url=" + urlSafeBase64Encode(url);
-            base_rule["rule-providers"][yaml_key]["path"] =
-                "./providers/" + std::to_string(hash_(url)) +
-                (direct_mrs ? "_domain.mrs" : "_domain.yaml");
-            if(direct_mrs)
-                base_rule["rule-providers"][yaml_key]["format"] = "mrs";
-            if(interval)
-                base_rule["rule-providers"][yaml_key]["interval"] = interval;
+            emit_provider(yaml_key, "domain", 3);
         }
         if(group_has_ipcidr)
         {
             std::string yaml_key = x;
             if(rule_type[x] != RULESET_CLASH_IPCIDR)
                 yaml_key += " (IP-CIDR)";
-            base_rule["rule-providers"][yaml_key]["type"] = "http";
-            base_rule["rule-providers"][yaml_key]["behavior"] = "ipcidr";
-            if(url[0] == '*')
-                base_rule["rule-providers"][yaml_key]["url"] = url.substr(1);
-            else
-                base_rule["rule-providers"][yaml_key]["url"] = remote_path_prefix + "/getruleset?type=4&url=" + urlSafeBase64Encode(url);
-            base_rule["rule-providers"][yaml_key]["path"] =
-                "./providers/" + std::to_string(hash_(url)) +
-                (direct_mrs ? "_ipcidr.mrs" : "_ipcidr.yaml");
-            if(direct_mrs)
-                base_rule["rule-providers"][yaml_key]["format"] = "mrs";
-            if(interval)
-                base_rule["rule-providers"][yaml_key]["interval"] = interval;
+            emit_provider(yaml_key, "ipcidr", 4);
         }
         if(!group_has_domain && !group_has_ipcidr)
         {
             std::string yaml_key = x;
-            base_rule["rule-providers"][yaml_key]["type"] = "http";
-            base_rule["rule-providers"][yaml_key]["behavior"] = "classical";
-            if(url[0] == '*')
-                base_rule["rule-providers"][yaml_key]["url"] = url.substr(1);
-            else
-                base_rule["rule-providers"][yaml_key]["url"] = remote_path_prefix + "/getruleset?type=6&url=" + urlSafeBase64Encode(url);
-            base_rule["rule-providers"][yaml_key]["path"] =
-                "./providers/" + std::to_string(hash_(url)) +
-                (direct_mrs ? ".mrs" : ".yaml");
-            if(direct_mrs)
-                base_rule["rule-providers"][yaml_key]["format"] = "mrs";
-            if(interval)
-                base_rule["rule-providers"][yaml_key]["interval"] = interval;
+            emit_provider(yaml_key, "classical", 6);
         }
         if(script)
         {
-            if(stats)
-                stats->add();
+            local_stats.add();
             std::string json_path = "rules." + std::to_string(index) + ".";
             parse_json_pointer(data, json_path + "has_domain", group_has_domain ? "true" : "false");
             parse_json_pointer(data, json_path + "has_ipcidr", group_has_ipcidr ? "true" : "false");
@@ -987,7 +981,11 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
         }
         catch (std::exception &e)
         {
-            writeLog(0, "渲染时发生错误：" + std::string(e.what()), LOG_TYPE_ERROR);
+            writeLog(LOG_LEVEL_ERROR,
+                     "CLASH_SCRIPT_RENDER_FAILED detail=" +
+                         summarizeSensitiveTextForLog(e.what()));
+            if(stats)
+                stats->add(local_stats.rules);
             return -1;
         }
     }

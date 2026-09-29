@@ -4,7 +4,7 @@ FROM mirror.gcr.io/library/golang:latest AS go-builder
 # Docker Buildx 自动注入目标架构信息
 ARG TARGETARCH
 ARG TARGETVARIANT
-ARG MIHOMO_REF="Meta"
+ARG MIHOMO_REF="Alpha"
 ARG MIHOMO_CACHE_BUST=1
 ARG REFRESH_GO_DEPS=false
 
@@ -25,22 +25,39 @@ COPY bridge/converter.go ./
 COPY bridge/age.go ./
 COPY bridge/parser.go ./
 COPY bridge/preprocess.go ./
+COPY bridge/mieru.go ./
 
 RUN set -xe && \
+    retry_go_dependency() { \
+      attempt=1; \
+      while ! "$@"; do \
+        if [ "${attempt}" = 3 ]; then \
+          echo "Go dependency command failed after ${attempt} attempts" >&2; \
+          return 1; \
+        fi; \
+        echo "Go dependency command attempt ${attempt} failed; retrying" >&2; \
+        sleep "$((attempt * 5))"; \
+        attempt="$((attempt + 1))"; \
+      done; \
+    } && \
     if [ "${REFRESH_GO_DEPS}" = "true" ]; then \
       echo "MIHOMO_CACHE_BUST=$MIHOMO_CACHE_BUST" && \
-      go get github.com/metacubex/mihomo@${MIHOMO_REF} && \
-      go get -u all && \
-      go mod tidy; \
+      retry_go_dependency go get github.com/metacubex/mihomo@${MIHOMO_REF} && \
+      mihomo_version="$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)" && \
+      test -n "${mihomo_version}" && \
+      retry_go_dependency go get -u all && \
+      retry_go_dependency go get "github.com/metacubex/mihomo@${mihomo_version}" && \
+      go mod tidy && \
+      test "$(go list -m -f '{{.Version}}' github.com/metacubex/mihomo)" = "${mihomo_version}"; \
     else \
-      go mod download; \
+      retry_go_dependency go mod download; \
     fi
 
 # Copy scripts for scheme generation
 COPY scripts/ ../scripts/
-RUN go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated.go
-RUN go run ../scripts/generate_schemes.go mihomo_schemes.h
-RUN go run ../scripts/generate_param_compat.go -o param_compat.h
+RUN go run ../scripts/generate_proxy_validation.go -o proxy_validation_generated.go -manifest mihomo_capabilities.json
+RUN go run ../scripts/generate_schemes.go -manifest mihomo_capabilities.json -o mihomo_schemes.h
+RUN go run ../scripts/generate_param_compat.go -manifest mihomo_capabilities.json -o param_compat.h
 
 # Build static library (enable CGO for glibc)
 # 根据目标架构自动配置交叉编译环境
@@ -84,7 +101,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git g++ build-essential cmake python3 python3-pip \
     pkg-config curl \
-    libcurl4-openssl-dev libpcre2-dev rapidjson-dev \
+    libcurl4-openssl-dev libpcre2-dev libboost-dev rapidjson-dev \
     libyaml-cpp-dev ca-certificates ninja-build ccache && \
     rm -rf /var/lib/apt/lists/*
 
@@ -158,8 +175,11 @@ RUN set -xe && \
       echo "Using committed header-only libraries"; \
     fi
 
+RUN python3 scripts/ci/patch_cpp_httplib_force_max.py include/httplib.h
+
 RUN set -xe && \
-    [ -n "${SHA}" ] && sed -i "s/#define BUILD_ID \"\"/#define BUILD_ID \"${SHA}\"/ " src/version.h || true && \
+    BUILD_ID="$(printf '%.7s' "${SHA}")" && \
+    [ -n "${BUILD_ID}" ] && sed -i "s/#define BUILD_ID \"\"/#define BUILD_ID \"${BUILD_ID}\"/ " src/version.h || true && \
     [ -n "${VERSION}" ] && sed -i "s/#define VERSION \"dev\"/#define VERSION \"${VERSION}\"/" src/version.h || true && \
     [ -n "${BUILD_DATE}" ] && sed -i "s/#define BUILD_DATE \"\"/#define BUILD_DATE \"${BUILD_DATE}\"/" src/version.h || true && \
     # Copy Go library to bridge directory for CMake detection
@@ -181,7 +201,6 @@ FROM mirror.gcr.io/library/debian:latest
 ARG VERSION="dev"
 ARG SHA=""
 ARG BUILD_DATE=""
-ARG CUSTOM_OPENCLASH_RULES_REVISION=""
 LABEL \
   org.opencontainers.image.title="SubConverter-Extended" \
   org.opencontainers.image.description="A Modern Evolution of subconverter; an enhanced implementation aligned with Mihomo configuration" \
@@ -191,7 +210,6 @@ LABEL \
   org.opencontainers.image.version="${VERSION}" \
   org.opencontainers.image.revision="${SHA}" \
   org.opencontainers.image.created="${BUILD_DATE}" \
-  com.aethersailor.custom-openclash-rules.revision="${CUSTOM_OPENCLASH_RULES_REVISION}" \
   maintainer="Aethersailor"
 
 # Install runtime dependencies

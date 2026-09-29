@@ -43,10 +43,14 @@ struct Settings {
   std::string listenAddress = "127.0.0.1", defaultUrls, insertUrls,
               managedConfigPrefix;
   int listenPort = 25500, maxPendingConns = 10, maxConcurThreads = 16,
-      maxServerThreads = 128;
+      maxServerThreads = 128, requestDeadlineMs = 15000;
+  std::string resourceControl = "compat";
+  std::string resourceControlEffective = "compat";
+  std::string resourceControlSource = "builtin-default";
+  std::string forceMaxCurveFingerprint;
   bool prependInsert = true, skipFailedLinks = false;
-  bool customOpenClashRulesFallback = false;
-  bool customOpenClashRulesPublish = false;
+  bool fallbackToDefaultExternalConfig = false;
+  bool customOpenClashRulesSourceSwitch = false;
   static constexpr bool APIMode = true; // Hardcoded for security
   bool writeManagedConfig = false, enableRuleGen = true,
        updateRulesetOnRequest = false, overwriteOriginalRules = true;
@@ -130,6 +134,8 @@ struct Settings {
       "CF-Region-Code", "cf-region-code", "X-Geo-Subdivision"};
   bool dashboardAuthEnabled = false;
   std::string dashboardAuthUsername, dashboardAuthPassword;
+  std::string dashboardAuthClientIpHeader = "none";
+  string_array dashboardAuthTrustedProxyCidrs;
   int dashboardAuthMaxFailures = 5, dashboardAuthWindowSeconds = 300,
       dashboardAuthLockSeconds = 900;
 

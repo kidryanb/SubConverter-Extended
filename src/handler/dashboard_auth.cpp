@@ -2,11 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <ctime>
-#include <map>
-#include <mutex>
 #include <string>
 
+#include "handler/dashboard_auth_limiter.h"
 #include "handler/dashboard_page.h"
 #include "handler/settings.h"
 #include "handler/statistics.h"
@@ -16,17 +14,8 @@
 
 namespace {
 
-struct FailureState {
-  int failures = 0;
-  int64_t window_start = 0;
-  int64_t locked_until = 0;
-};
-
-std::mutex g_auth_mutex;
-std::map<std::string, FailureState> g_failures;
+dashboard_auth::FailureLimiter g_failure_limiter;
 std::atomic_bool g_misconfig_logged{false};
-
-int64_t nowSeconds() { return static_cast<int64_t>(std::time(nullptr)); }
 
 std::string headerValue(const Request &request, const std::string &name) {
   auto iter = request.headers.find(name);
@@ -35,92 +24,10 @@ std::string headerValue(const Request &request, const std::string &name) {
   return trimWhitespace(iter->second, true, true);
 }
 
-std::string firstForwardedValue(std::string value) {
-  size_t comma = value.find(',');
-  if (comma != std::string::npos)
-    value = value.substr(0, comma);
-  return trimWhitespace(value, true, true);
+bool validBasicAuth(const Request &request, const Settings &settings) {
+  return dashboard_auth::validAuthorizationHeader(
+      headerValue(request, "Authorization"), settings);
 }
-
-std::string sourceKey(const Request &request) {
-  std::string forwarded = headerValue(request, "CF-Connecting-IP");
-  if (forwarded.empty())
-    forwarded = headerValue(request, "True-Client-IP");
-  if (forwarded.empty())
-    forwarded = headerValue(request, "X-Real-IP");
-  if (forwarded.empty())
-    forwarded = firstForwardedValue(headerValue(request, "X-Forwarded-For"));
-  if (forwarded.empty())
-    forwarded = headerValue(request, "X-Client-IP");
-  if (!forwarded.empty())
-    return forwarded;
-  if (!request.remote_addr.empty())
-    return request.remote_addr;
-  return "unknown";
-}
-
-bool constantTimeEquals(const std::string &lhs, const std::string &rhs) {
-  unsigned char diff = static_cast<unsigned char>(lhs.size() ^ rhs.size());
-  size_t length = std::max(lhs.size(), rhs.size());
-  for (size_t i = 0; i < length; ++i) {
-    unsigned char left =
-        i < lhs.size() ? static_cast<unsigned char>(lhs[i]) : 0;
-    unsigned char right =
-        i < rhs.size() ? static_cast<unsigned char>(rhs[i]) : 0;
-    diff |= static_cast<unsigned char>(left ^ right);
-  }
-  return diff == 0;
-}
-
-bool validBasicAuth(const Request &request) {
-  std::string auth = headerValue(request, "Authorization");
-  if (auth.size() <= 6 || toLower(auth.substr(0, 6)) != "basic ")
-    return false;
-  std::string supplied = "Basic " + trimWhitespace(auth.substr(6), true, true);
-  std::string expected =
-      "Basic " + base64Encode(global.dashboardAuthUsername + ":" +
-                              global.dashboardAuthPassword);
-  return constantTimeEquals(supplied, expected);
-}
-
-void cleanupFailuresLocked(int64_t now) {
-  for (auto iter = g_failures.begin(); iter != g_failures.end();) {
-    const FailureState &state = iter->second;
-    bool lock_expired = state.locked_until <= now;
-    bool window_expired =
-        now - state.window_start > global.dashboardAuthWindowSeconds;
-    if (lock_expired && window_expired)
-      iter = g_failures.erase(iter);
-    else
-      ++iter;
-  }
-  while (g_failures.size() > 4096)
-    g_failures.erase(g_failures.begin());
-}
-
-int64_t lockedUntilLocked(const std::string &key, int64_t now) {
-  auto iter = g_failures.find(key);
-  if (iter == g_failures.end())
-    return 0;
-  if (iter->second.locked_until > now)
-    return iter->second.locked_until;
-  return 0;
-}
-
-void recordFailureLocked(const std::string &key, int64_t now) {
-  FailureState &state = g_failures[key];
-  if (state.window_start <= 0 ||
-      now - state.window_start > global.dashboardAuthWindowSeconds) {
-    state.window_start = now;
-    state.failures = 0;
-    state.locked_until = 0;
-  }
-  state.failures++;
-  if (state.failures >= global.dashboardAuthMaxFailures)
-    state.locked_until = now + global.dashboardAuthLockSeconds;
-}
-
-void recordSuccessLocked(const std::string &key) { g_failures.erase(key); }
 
 void applyNoStoreHeaders(Response &response) {
   response.headers["Cache-Control"] =
@@ -159,9 +66,8 @@ std::string locked(Response &response, int64_t retry_after) {
 std::string misconfigured(Response &response) {
   bool expected = false;
   if (g_misconfig_logged.compare_exchange_strong(expected, true)) {
-    writeLog(0,
-             "Dashboard 认证已启用，但用户名或密码为空，已拒绝访问。",
-             LOG_LEVEL_WARNING);
+    writeLog(LOG_LEVEL_WARNING,
+             "Dashboard 认证已启用，但用户名或密码为空，已拒绝访问。");
   }
   response.status_code = 503;
   response.content_type = "text/plain; charset=utf-8";
@@ -173,40 +79,32 @@ std::string misconfigured(Response &response) {
 }
 
 bool authorize(Request &request, Response &response, std::string &body) {
-  if (!global.dashboardAuthEnabled)
+  const SettingsSnapshot settings_snapshot =
+      captureEffectiveSettingsSnapshot();
+  if (!settings_snapshot) {
+    body = misconfigured(response);
+    return false;
+  }
+  const Settings &settings = *settings_snapshot;
+  if (!settings.dashboardAuthEnabled)
     return true;
 
-  if (global.dashboardAuthUsername.empty() ||
-      global.dashboardAuthPassword.empty()) {
+  if (settings.dashboardAuthUsername.empty() ||
+      settings.dashboardAuthPassword.empty()) {
     body = misconfigured(response);
     return false;
   }
 
-  int64_t now = nowSeconds();
-  std::string key = sourceKey(request);
-
-  {
-    std::lock_guard<std::mutex> lock(g_auth_mutex);
-    cleanupFailuresLocked(now);
-    int64_t locked_until = lockedUntilLocked(key, now);
-    if (locked_until > now) {
-      body = locked(response, locked_until - now);
-      return false;
-    }
-  }
-
-  bool ok = validBasicAuth(request);
-
-  std::lock_guard<std::mutex> lock(g_auth_mutex);
-  if (ok) {
-    recordSuccessLocked(key);
+  bool ok = validBasicAuth(request, settings);
+  const dashboard_auth::FailureLimiter::Decision decision =
+      g_failure_limiter.evaluate(
+          request.client_address, ok, settings.dashboardAuthMaxFailures,
+          settings.dashboardAuthWindowSeconds,
+          settings.dashboardAuthLockSeconds);
+  if (decision.result == dashboard_auth::FailureLimiter::Result::Allowed)
     return true;
-  }
-
-  recordFailureLocked(key, now);
-  int64_t locked_until = lockedUntilLocked(key, now);
-  if (locked_until > now)
-    body = locked(response, locked_until - now);
+  if (decision.result == dashboard_auth::FailureLimiter::Result::Locked)
+    body = locked(response, decision.retry_after_seconds);
   else
     body = unauthorized(response);
   return false;

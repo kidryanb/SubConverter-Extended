@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #ifdef MALLOC_TRIM
 #include <malloc.h>
@@ -32,7 +33,9 @@
 #include "utils/stl_extra.h"
 #include "utils/string_hash.h"
 #include "utils/urlencode.h"
+#include "handler/dashboard_auth.h"
 #include "handler/settings.h"
+#include "runtime/transport_admission.h"
 #include "webserver.h"
 #include "webserver_beast.h"
 #include "utils/system.h"
@@ -770,6 +773,24 @@ static httplib::Server::Handler makeHandler(const responseRoute &rr,
     req.url = request.path;
     req.remote_addr = request.remote_addr;
     req.remote_port = request.remote_port;
+    req.client_address = client_ip::parseAddress(request.remote_addr);
+    req.context = telemetry.context;
+    if (request.path == "/healthz" || request.path == "/version" ||
+        request.path == "/inspect")
+      telemetry.context->setCostClass(RequestCostClass::Low);
+    else if (request.path == "/getruleset")
+      telemetry.context->setCostClass(RequestCostClass::Medium);
+    const client_ip::Policy policy = web_server->client_ip_policy();
+    if (policy.enabled()) {
+      std::vector<std::string> values;
+      const char *name = client_ip::headerName(policy.header);
+      const std::size_t count = request.get_header_value_count(name);
+      values.reserve(count);
+      for (std::size_t index = 0; index < count; ++index)
+        values.push_back(request.get_header_value(name, "", index));
+      req.client_address =
+          client_ip::resolve(req.client_address, values, policy).address;
+    }
     for (auto &h : request.headers) {
       if (startsWith(h.first, "LOCAL_") || startsWith(h.first, "REMOTE_") ||
           is_request_header_blacklisted(h.first)) {
@@ -910,22 +931,15 @@ static httplib::Server::Handler makeHandler(const responseRoute &rr,
     } else {
       response.set_content(std::move(result), resp.content_type);
     }
-    response.set_content(std::move(result), content_type);
   };
 }
 
-static std::string dump(const httplib::Headers &headers) {
-  std::string s;
-  for (auto &x : headers) {
-    if (startsWith(x.first, "LOCAL_") || startsWith(x.first, "REMOTE_"))
-      continue;
-    if (strcasecmp(x.first.c_str(), "Authorization") == 0) {
-      s += x.first + ": [redacted]|";
-      continue;
-    }
-    s += x.first + ": " + x.second + "|";
-  }
-  return s;
+static void setUnhandledExceptionResponse(httplib::Response &response) {
+  response.status = 500;
+  response.set_header("Cache-Control", "private, no-store");
+  response.set_content("Internal server error while processing request.\n"
+                       "处理请求时发生内部服务器错误。\n",
+                       "text/plain; charset=utf-8");
 }
 
 int WebServer::start_web_server_multi(listener_args *args) {
@@ -1038,18 +1052,146 @@ int WebServer::start_web_server_multi(listener_args *args) {
                  });
   server.set_pre_routing_handler([&](const httplib::Request &req,
                                      httplib::Response &res) {
-    if (shouldLog(LOG_LEVEL_DEBUG)) {
-      writeLog(0,
-               "接受客户端连接：" + req.remote_addr + ":" +
-                   std::to_string(req.remote_port),
-               LOG_LEVEL_DEBUG);
+    HttpRequestTelemetry &telemetry = ensureRequestTelemetry(req, res);
+    setRequestTelemetryHeaders(res, telemetry.request_id);
+    ScopedLogRequestContext request_log_scope(telemetry.request_id);
+    ScopedRequestContext request_context_scope(telemetry.context);
+    ScopedSettingsView settings_scope(telemetry.settings);
+    const bool fast_health = isFastHealthRequest(req);
+    const bool force_max = telemetry.settings &&
+        telemetry.settings->resourceControlEffective == "force_max";
+    const bool reserved_control =
+        force_max && telemetry.settings &&
+        isForceMaxReservedControlRequest(req, *telemetry.settings);
+    const uint64_t admission_bytes =
+        fast_health ? 0 : requestAdmissionBytes(req);
+    if (!fast_health)
+      telemetry.context->setEstimatedBytes(admission_bytes);
+    if (reserved_control && !fast_health &&
+        !telemetry.completion->control_handler_acquired) {
+      if (!control_handlers.tryAcquire()) {
+        telemetry.context->suggestFailure(
+            RequestFailureAttribution::Capacity);
+        res.status = 503;
+        res.set_header("Cache-Control", "private, no-store");
+        res.set_header("Retry-After", "1");
+        res.set_content(
+            "Service temporarily unavailable: control handler capacity is "
+            "outside the hard resource envelope.\n"
+            "服务暂时不可用：控制面处理容量超出硬资源包络。\n",
+            "text/plain; charset=utf-8");
+        telemetry.context->recordAdmissionOnce(
+            std::chrono::steady_clock::now());
+        return httplib::Server::HandlerResponse::Handled;
+      }
+      telemetry.completion->control_handler_acquired = true;
     }
-    if (shouldLog(LOG_LEVEL_VERBOSE)) {
-      writeLog(0,
-               "处理请求：method=" + req.method + " uri=" +
-                   req.target,
-               LOG_LEVEL_VERBOSE);
-      writeLog(0, "请求头：" + dump(req.headers), LOG_LEVEL_VERBOSE);
+    if (force_max && !fast_health && !reserved_control &&
+        !telemetry.completion->normal_handler_acquired) {
+      if (!normal_handlers.acquire(telemetry.context)) {
+        RequestCancellationResponse cancellation;
+        if (requestCancellationResponse(telemetry.context,
+                                        cancellation)) {
+          res.status = cancellation.status_code;
+          for (const auto &[name, value] : cancellation.headers)
+            res.set_header(name, value);
+          res.set_content(std::move(cancellation.body),
+                          "text/plain; charset=utf-8");
+        } else {
+          telemetry.context->suggestFailure(
+              RequestFailureAttribution::Capacity);
+          res.status = 503;
+          res.set_header("Cache-Control", "private, no-store");
+          res.set_header("Retry-After", "1");
+          res.set_content(
+              "Service temporarily unavailable: HTTP handler capacity is "
+              "outside the hard resource envelope.\n"
+              "服务暂时不可用：HTTP 处理容量超出硬资源包络。\n",
+              "text/plain; charset=utf-8");
+        }
+        telemetry.context->recordAdmissionOnce(
+            std::chrono::steady_clock::now());
+        return httplib::Server::HandlerResponse::Handled;
+      }
+      telemetry.completion->normal_handler_acquired = true;
+    }
+    if (!fast_health && !reserved_control &&
+        !telemetry.completion->admission_acquired) {
+      if (OwnerAdmission *admission = globalTransportAdmission()) {
+        OwnerAdmissionOptions options{.cost = RequestCostClass::Medium,
+                                      .bytes = admission_bytes,
+                                      .request_context = telemetry.context};
+        OwnerAdmissionResult result;
+        if (auto immediate = admission->tryAdmitImmediate(options)) {
+          result = std::move(*immediate);
+        } else {
+          auto admitted =
+              std::make_shared<std::promise<OwnerAdmissionResult>>();
+          std::future<OwnerAdmissionResult> admitted_future =
+              admitted->get_future();
+          (void)admission->admit(
+              std::move(options),
+              [admitted](OwnerAdmissionResult admitted_result) {
+                admitted->set_value(std::move(admitted_result));
+              });
+          result = admitted_future.get();
+        }
+        if (result.status != OwnerAdmissionStatus::Granted) {
+          if (result.status == OwnerAdmissionStatus::Deadline)
+            telemetry.context->requestCancellation(
+                RequestCancellationReason::Deadline);
+          else if (result.status == OwnerAdmissionStatus::Shutdown)
+            telemetry.context->requestCancellation(
+                RequestCancellationReason::Shutdown);
+          RequestCancellationResponse cancellation;
+          if (requestCancellationResponse(telemetry.context,
+                                          cancellation)) {
+            res.status = cancellation.status_code;
+            for (const auto &[name, value] : cancellation.headers)
+              res.set_header(name, value);
+            res.set_content(std::move(cancellation.body),
+                            "text/plain; charset=utf-8");
+          } else {
+            telemetry.context->suggestFailure(
+                RequestFailureAttribution::Capacity);
+            res.status = 503;
+            res.set_header("Cache-Control", "private, no-store");
+            res.set_header("Retry-After", "1");
+            res.set_content(
+                "Service temporarily unavailable: request capacity is "
+                "outside the hard resource envelope.\n"
+                "服务暂时不可用：请求容量超出硬资源包络。\n",
+                "text/plain; charset=utf-8");
+          }
+          telemetry.context->recordAdmissionOnce(
+              std::chrono::steady_clock::now());
+          return httplib::Server::HandlerResponse::Handled;
+        }
+        telemetry.completion->waitable_admission =
+            std::move(result.lease);
+      } else if (!tryRequestAdmission(admission_bytes)) {
+        telemetry.context->suggestFailure(
+            RequestFailureAttribution::Capacity);
+        res.status = 503;
+        res.set_header("Cache-Control", "private, no-store");
+        res.set_header("Retry-After", "1");
+        res.set_content(
+            "Service temporarily unavailable: request capacity is full.\n"
+            "服务暂时不可用：请求容量已满。\n",
+            "text/plain; charset=utf-8");
+        telemetry.context->recordAdmissionOnce(
+            std::chrono::steady_clock::now());
+        return httplib::Server::HandlerResponse::Handled;
+      }
+      telemetry.completion->admission_acquired = true;
+      telemetry.completion->admission_bytes = admission_bytes;
+    }
+    telemetry.context->recordAdmissionOnce(
+        std::chrono::steady_clock::now());
+    if (shouldLog(LOG_LEVEL_DEBUG)) {
+      writeLog(LOG_LEVEL_DEBUG,
+               "接受客户端连接：" + req.remote_addr + ":" +
+                   std::to_string(req.remote_port));
     }
 
     if (req.has_header("SubConverter-Request")) {
@@ -1177,22 +1319,57 @@ int WebServer::start_web_server_multi(listener_args *args) {
   if (serve_file) {
     server.set_mount_point("/", serve_file_root);
   }
-  server.new_task_queue = [args] {
-    return new httplib::ThreadPool(args->max_workers,
-                                   global.maxServerThreads);
+  server.new_task_queue =
+      [args, force_max, force_max_execution, normal_active_limit,
+       normal_wait_limit, control_handler_limit] {
+    if (force_max) {
+      auto *pool = new httplib::ThreadPool(
+          force_max_execution.base_threads,
+          force_max_execution.max_threads,
+          force_max_execution.max_queued_requests,
+          CPPHTTPLIB_THREAD_POOL_IDLE_TIMEOUT, true);
+      httplib_base_threads.store(force_max_execution.base_threads,
+                                 std::memory_order_relaxed);
+      httplib_max_threads.store(force_max_execution.max_threads,
+                                std::memory_order_relaxed);
+      httplib_max_queued_requests.store(
+          force_max_execution.max_queued_requests,
+          std::memory_order_relaxed);
+      httplib_normal_active_handlers.store(normal_active_limit,
+                                           std::memory_order_relaxed);
+      httplib_normal_wait_handlers.store(normal_wait_limit,
+                                         std::memory_order_relaxed);
+      httplib_control_handler_limit.store(control_handler_limit,
+                                          std::memory_order_relaxed);
+      httplib_execution_ready.store(true, std::memory_order_release);
+      if (args->runtime_ready_callback)
+        args->runtime_ready_callback();
+      return pool;
+    }
+    const size_t base_workers = static_cast<size_t>(
+        std::max(args->max_workers, 1));
+    const size_t bounded_max = static_cast<size_t>(
+        std::max(global.maxServerThreads, args->max_workers));
+    return new httplib::ThreadPool(base_workers,
+                                   std::max(base_workers + 1, bounded_max),
+                                   static_cast<size_t>(
+                                       global.resourceControlEffective ==
+                                               "compat"
+                                           ? std::max(10240,
+                                                      args->listen_backlog)
+                                           : std::max(1,
+                                                      args->listen_backlog)));
   };
   if (!server.bind_to_port(args->listen_address, args->port, 0)) {
-    writeLog(0,
+    writeLog(LOG_LEVEL_FATAL,
              "无法绑定 HTTP 服务地址：" + args->listen_address + ":" +
-                 std::to_string(args->port),
-             LOG_LEVEL_FATAL);
+                 std::to_string(args->port));
     return 1;
   }
 
   std::thread thread([&]() {
     if (!server.listen_after_bind() && !SERVER_EXIT_FLAG) {
-      writeLog(0, "HTTP 服务在接受请求前停止。",
-               LOG_LEVEL_ERROR);
+      writeLog(LOG_LEVEL_ERROR, "HTTP 服务在接受请求前停止。");
       SERVER_EXIT_FLAG = true;
     }
   });

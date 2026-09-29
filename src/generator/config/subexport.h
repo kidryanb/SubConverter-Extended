@@ -1,7 +1,10 @@
 #ifndef SUBEXPORT_H_INCLUDED
 #define SUBEXPORT_H_INCLUDED
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
+#include <limits>
 #include <string>
 
 #ifndef NO_JS_RUNTIME
@@ -133,7 +136,6 @@ struct extra_settings {
   bool clash_script = false;
   std::string surge_ssr_path;
   std::string managed_config_prefix;
-  std::string custom_openclash_rules_base_url;
   std::string quanx_dev_id;
   tribool udp = tribool();
   tribool tfo = tribool();
@@ -149,7 +151,6 @@ struct extra_settings {
   std::string clash_proxy_groups_style = "flow";
   bool use_proxy_provider = true;       // 默认启用 proxy-provider 模式
   bool provider_proxy_direct = true;    // proxy-provider 默认使用 DIRECT 更新
-  bool custom_openclash_rules_fallback = false;
   std::vector<ProxyProvider> providers; // provider 列表
   std::vector<QuanXServerRemote> quanx_server_remotes;
   std::vector<SurgePolicyPathResource> surge_policy_paths;
@@ -162,6 +163,11 @@ struct extra_settings {
   TargetGenerationStats surfboard_generation_stats;
   TargetGenerationStats loon_generation_stats;
   bool authorized = false;
+  // Non-zero only for a force_max owner that has prepaid native bytes for an
+  // authorized proxy-group script result. The QuickJS heap remains governed
+  // separately; this bounds the C++ file/result copies before allocation.
+  bool force_max_group_script_limited = false;
+  std::size_t force_max_group_script_remaining_bytes = 0;
   RuleConversionStats *rule_stats = nullptr;
 
   extra_settings() = default;

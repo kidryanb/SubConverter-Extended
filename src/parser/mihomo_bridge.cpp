@@ -3,7 +3,6 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -17,51 +16,6 @@ void FreeString(char *s);
 }
 
 namespace {
-
-constexpr size_t kLargeSubscriptionThreshold = 256 * 1024;
-constexpr auto kGoMemoryReleaseInterval = std::chrono::seconds(30);
-
-void releaseGoMemoryAfterLargeParse(size_t subscription_size) noexcept {
-  if (subscription_size < kLargeSubscriptionThreshold)
-    return;
-
-  try {
-    static std::mutex release_mutex;
-    static std::chrono::steady_clock::time_point last_release;
-    static bool released_once = false;
-
-    std::unique_lock<std::mutex> lock(release_mutex, std::try_to_lock);
-    if (!lock.owns_lock())
-      return;
-
-    auto now = std::chrono::steady_clock::now();
-    if (released_once && now - last_release < kGoMemoryReleaseInterval)
-      return;
-
-    ReleaseUnusedMemory();
-    last_release = now;
-    released_once = true;
-  } catch (...) {
-    // Memory reclamation is opportunistic and must never fail a conversion.
-  }
-}
-
-class LargeParseMemoryGuard {
-public:
-  explicit LargeParseMemoryGuard(size_t subscription_size)
-      : subscription_size_(subscription_size) {}
-
-  ~LargeParseMemoryGuard() {
-    releaseGoMemoryAfterLargeParse(subscription_size_);
-  }
-
-private:
-  size_t subscription_size_;
-};
-
-} // namespace
-
-namespace mihomo {
 
 constexpr size_t kLargeSubscriptionThreshold = 256 * 1024;
 constexpr auto kGoMemoryReleaseInterval = std::chrono::seconds(30);
@@ -154,28 +108,6 @@ std::vector<ProxyNode> parseSubscription(const std::string &subscription) {
         }
       } else {
         node.port = 0;
-      }
-
-      // Store all other fields in params
-      for (auto it = item.begin(); it != item.end(); ++it) {
-        const std::string &key = it.key();
-        if (key != "name" && key != "type" && key != "server" &&
-            key != "port") {
-          std::string value;
-          if (it->is_string()) {
-            value = it->get<std::string>();
-          } else if (it->is_number_integer()) {
-            value = std::to_string(it->get<int>());
-          } else if (it->is_number_float()) {
-            value = std::to_string(it->get<double>());
-          } else if (it->is_boolean()) {
-            value = it->get<bool>() ? "true" : "false";
-          } else {
-            value = it->dump(); // For complex types, serialize to JSON
-          }
-          node.params[key] = value;
-          node.param_json[key] = it->dump();
-        }
       }
 
       nodes.emplace_back(std::move(node));
