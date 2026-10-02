@@ -620,7 +620,8 @@ ScopedResolvedImportView::ScopedResolvedImportView(
       previous_missing_(resolved_import_view.missing),
       previous_flow_missing_(resolved_import_view.flow_missing),
       previous_active_(resolved_import_view.active) {
-  resolved_import_view = {resolved, missing, nullptr, true};
+  resolved_import_view = {resolved, missing, nullptr,
+                          resolved != nullptr || missing != nullptr};
 }
 
 ScopedResolvedImportView::ScopedResolvedImportView(
@@ -630,7 +631,8 @@ ScopedResolvedImportView::ScopedResolvedImportView(
       previous_missing_(resolved_import_view.missing),
       previous_flow_missing_(resolved_import_view.flow_missing),
       previous_active_(resolved_import_view.active) {
-  resolved_import_view = {resolved, nullptr, missing, true};
+  resolved_import_view = {resolved, nullptr, missing,
+                          resolved != nullptr || missing != nullptr};
 }
 
 ScopedResolvedImportView::~ScopedResolvedImportView() {

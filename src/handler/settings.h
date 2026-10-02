@@ -209,9 +209,10 @@ struct UnresolvedImportSource {
 };
 
 // Bind pre-resolved import content to the current worker while request-scoped
-// parsing runs. When a flow-missing sink is supplied, importItems never falls
-// back to synchronous I/O: missing sources are reported to the flow so it can
-// suspend and resolve them on the async/blocking-I/O lanes.
+// parsing runs. With neither a resolved map nor a missing sink, preserve
+// synchronous import loading. When a flow-missing sink is supplied, importItems
+// never falls back to synchronous I/O: missing sources are reported to the flow
+// so it can suspend and resolve them on the async/blocking-I/O lanes.
 class ScopedResolvedImportView {
 public:
   ScopedResolvedImportView(const string_map *resolved,

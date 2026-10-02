@@ -1046,6 +1046,18 @@ class FixtureHandler(BaseHTTPRequestHandler):
         elif request_path == "/external-empty.ini":
             body = b""
             content_type = "text/plain; charset=utf-8"
+        elif request_path == "/external-import-emoji.txt":
+            body = b"Smoke,Imported\n"
+            content_type = "text/plain; charset=utf-8"
+        elif request_path == "/external-import-emoji.toml":
+            body = b'[[emoji]]\nmatch = "Smoke"\nemoji = "Imported"\n'
+            content_type = "text/plain; charset=utf-8"
+        elif request_path == "/external-import-empty.txt":
+            body = b""
+            content_type = "text/plain; charset=utf-8"
+        elif request_path == "/external-import-malformed.toml":
+            body = b"[[emoji]]\nmatch = [\n"
+            content_type = "text/plain; charset=utf-8"
         elif request_path == "/external-template-failure.ini":
             body = b"[custom]\nenable_rule_generator={{ invalid\n"
             content_type = "text/plain; charset=utf-8"
@@ -13281,6 +13293,61 @@ def conversion_mode_output_parity_baseline(
         )
 
     subscription_url = fixture_base + "/subscription.txt"
+    # Imported configuration must have the same observable output in the
+    # synchronous compat/adaptive paths and the force_max dependency flow.
+    import_configs = {
+        "ini": (
+            "[custom]\nenable_rule_generator=false\nadd_emoji=true\n"
+            f"emoji=!!import:{fixture_base}/external-import-emoji.txt\n"
+        ),
+        "yaml": (
+            "custom:\n  enable_rule_generator: false\n  add_emoji: true\n"
+            "  emojis:\n"
+            f"    - import: {fixture_base}/external-import-emoji.txt\n"
+        ),
+        "toml": (
+            "version = 1\n[custom]\nenable_rule_generator=false\n"
+            "add_emoji=true\n[[emoji]]\n"
+            f'import = "{fixture_base}/external-import-emoji.toml"\n'
+        ),
+    }
+    import_configs["yaml-spaced-key"] = import_configs["yaml"].replace(
+        "import:", "import :"
+    )
+    import_configs["toml-spaced-key"] = import_configs["toml"].replace(
+        "import =", "import  ="
+    )
+    for name, config in import_configs.items():
+        params = {
+            "target": "clash", "url": SUBSCRIPTION.strip(),
+            "list": "true", "emoji": "true",
+            "config": fixture_data_url(config),
+        }
+        for suffix in ("", "-repeat"):
+            cases.append(("external-import-" + name + suffix, params, {},
+                          200, b"Imported Smoke", False))
+    for name in ("ini", "yaml", "toml"):
+        source = (
+            "/external-import-emoji.toml" if name == "toml"
+            else "/external-import-emoji.txt"
+        )
+        for invalid_source in ("/external-import-empty.txt", "/missing-import.list"):
+            config = import_configs[name].replace(source, invalid_source)
+            cases.append(("external-import-" + name + invalid_source,
+                          {"target": "clash", "url": SUBSCRIPTION.strip(),
+                           "list": "true", "config": fixture_data_url(config)},
+                          {}, 400, b"selected external configuration", False))
+    malformed_import_config = import_configs["toml"].replace(
+        "/external-import-emoji.toml", "/external-import-malformed.toml"
+    )
+    cases.append(("external-import-malformed-toml",
+                  {"target": "clash", "url": SUBSCRIPTION.strip(),
+                   "list": "true", "config": fixture_data_url(malformed_import_config)},
+                  {}, 400, b"selected external configuration", False))
+    cases.append(("external-import-groups",
+                  {"target": "clash", "url": SUBSCRIPTION.strip(),
+                   "config": fixture_base + "/async-external-config.toml"},
+                  {}, 200, b"AsyncImported", False))
     cases.extend(
         (
             (
