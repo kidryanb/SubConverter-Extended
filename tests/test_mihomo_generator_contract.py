@@ -12,7 +12,6 @@ BUILD_ENTRYPOINTS = (
     "docker/Dockerfile.armv7-cross",
     "scripts/build-local-msys2.ps1",
     "scripts/build-windows-amd64.sh",
-    ".github/workflows/codeql.yml",
 )
 GENERATORS = (
     "generate_proxy_validation.go",

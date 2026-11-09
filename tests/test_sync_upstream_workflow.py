@@ -55,7 +55,7 @@ class UpstreamSyncWorkflowContractTests(unittest.TestCase):
             "python3 -m unittest discover -s tests -p 'test_*.py' -v",
             workflow,
         )
-        self.assertIn("bash tests/ci_delivery_scripts_test.sh", workflow)
+        self.assertNotIn("tests/ci_delivery_scripts_test.sh", workflow)
         self.assertIn("git diff --check HEAD^1..HEAD", workflow)
         self.assertIn("git push origin HEAD:master", workflow)
         self.assertLess(helper_start, validation_start)
