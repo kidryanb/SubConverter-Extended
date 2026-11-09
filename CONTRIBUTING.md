@@ -13,19 +13,46 @@ SubConverter-Extended 接受缺陷修复、兼容性改进、文档修正和可�
 1. 从最新 `dev` 创建功能分支。
 2. 只修改解决当前问题所必需的文件，并保留现有兼容性边界。
 3. 使用 Conventional Commits：`<type>(<scope>): <concise description>`。
-4. 运行与改动相关的现有测试和检查。
+4. 完成与改动相关的构建和人工验证，记录实际结果及未验证的范围。
 5. 向 `dev` 提交 PR，说明问题、方案、兼容性影响和验证结果。只在已有可跟踪项时引用实际 Issue；不要猜测编号。
 
-## 验证入口
+## 人工验证
 
-- C++ 、配置解析、安全基线或交付脚本变更：按 [PR Validation](.github/workflows/pr-validation.yml) 中的对应任务运行现有检查。
-- Mihomo 解析桥变更：在 `bridge/` 中运行 `go test ./...`；生成能力文件时，按 [`bridge/README.md`](bridge/README.md) 的顺序执行生成器。
+- 转换逻辑或配置解析变更：使用受影响的输入格式和目标客户端，检查实际转换结果；涉及兼容性时，同时检查原有用法。
+- Mihomo 解析桥变更：按 [`bridge/README.md`](bridge/README.md) 的顺序运行生成器并重新构建，再检查受影响的订阅输入。
+- 构建或打包变更：构建对应平台的制品，检查安装、启动和版本信息。
 - 用户文档变更：核对命令、路径、默认值、内部链接和目标格式，并确认内容仅描述已发布能力。
 
-CI 是必要验证，但不代替与改动对应的本地检查和实际输出验证。
+仓库不再维护自动化测试或 PR 验证门禁。CodeQL 独立扫描 `dev` 的源码，不作为自动合并或发布的前置条件。构建和发布流程继续负责生成制品、记录版本身份和防止覆盖历史版本；功能与兼容性由维护者人工验证。
+
+## 逐订阅 User-Agent 的开发验证
+
+`target=clash` 的 HTTP(S) proxy-provider 来源支持可选 `ua:` 前缀，可与 `provider:`、`tag:`、`interval:`、`proxy_direct:` 组合。以下为外层 `url` 查询参数解码后的来源字符串：
+
+```text
+provider:A,ua:ClientA%2F1.0,https://a.example/sub|provider:B,ua:ClientB%2F2.0,https://b.example/sub
+```
+
+UA 先按 URI 组件百分号编码，再将组合后的来源字符串编码为 `url` 参数。组件只解码一次，`+` 保持字面含义。解码后最多 512 字节，仅允许可打印 ASCII；去除首尾空格后不得为空。同一来源的重复 `ua:`、非法编码和超出作用范围的用法返回 HTTP 400。`target=auto` 最终解析为 Clash 时同样支持；`list=true`、直接节点和其他输出目标不支持该前缀。
+
+显式 UA 只写入对应 provider 的 `header.User-Agent`，允许浏览器和工具 UA；即使值看似数字或布尔值，也按 YAML 字符串输出，以保持请求头原文。未指定时保留现有自动继承及排除规则。provider 名称保持原命名规则；显式 UA 的缓存路径包含 URL 与规范化 UA 的完整身份摘要，避免复用其他 UA 对应的内容。更换 UA 可能留下旧缓存文件，本功能不自动删除客户端文件。
+
+人工验证应覆盖真实 Mihomo 的请求头、同 URL 不同 UA 的节点和缓存隔离、冷/热启动与 ETag、编码及错误边界，以及未设置 `ua:` 时的逐字节输出对照。日志和 explain 仅记录显式 UA 的来源与长度，不应回显其完整内容。
+
+## Emoji 总开关与 Provider Emoji 的开发验证
+
+后端偏好配置的 `emojis.enabled` 是内置 Emoji 添加和清理的总开关，支持 INI、TOML、YAML，缺省为 `false`。关闭或缺少该字段时，Provider、服务端解析、`list=true` 和混合输入均停止内置 Emoji 处理；请求中的 `emoji`、`add_emoji`、`remove_emoji`，以及外部配置和 `pref` 中的添加、清理开关均不能重新启用它。已有 Emoji 保留，正常 rename 规则继续执行；rename 本身包含的 Emoji 替换仍按规则执行。
+
+旧配置无需补字段即可正常加载，但升级后需显式设置 `emojis.enabled=true` 才会恢复原有 Emoji 处理。INI、TOML 在 `[emojis]` 节中设置 `enabled=true`，YAML 在 `emojis` 节下设置 `enabled: true`。配置重载时删除该字段会恢复关闭。`explain` 会将受总开关禁用的请求参数标记为忽略。
+
+总开关开启后，Clash/ClashR 的 HTTP proxy-provider 仅在请求明确传入 `emoji=true` 时生成 Emoji 处理规则；`emoji=false`、空值或省略参数均不生成 Emoji 清理、添加规则。独立的 `add_emoji`、`remove_emoji` 参数以及外部配置和 `pref` 中的开关不能单独启用 Provider Emoji；规则内容仍沿用现有配置来源。
+
+启用后保持现有原版兼容逻辑：清理名称开头原有范围内的 Emoji、执行 rename、添加首条匹配的 Emoji。不改为只清理国旗，不清理名称中间的 Emoji，也不增加前缀防重。已有的正则兼容限制和告警策略继续保留。
+
+总开关开启后，服务端解析、`list=true` 和混合输入中的直接节点保持原有参数语义；其中 `emoji=false` 仍表示去旧、不添加，不能用它代替总开关关闭。开发验证应覆盖三种配置格式的开启、关闭、缺省及重载删除字段，检查请求与外部配置不能绕过关闭状态，并验证原有 rename、混合输入、传统输出和远程订阅模式。开启状态需与改动前的结果对照，确认 Provider 的订阅地址、缓存路径和其他字段不变。测试使用仓库外临时用例，不新增仓库测试或 CI 门禁。
 
 ## 敏感信息和安全问题
 
-不要在 Issue、PR、日志、截图、样例或测试数据中提交真实订阅 URL、节点凭据、Token、Cookie、私有主机名或其他秘密。使用 `example.com`、保留的测试网段和明确的占位符构造最小复现。
+不要在 Issue、PR、日志、截图、样例或复现数据中提交真实订阅 URL、节点凭据、Token、Cookie、私有主机名或其他秘密。使用 `example.com`、保留的测试网段和明确的占位符构造最小复现。
 
 未修复的安全漏洞请通过 [GitHub 私密漏洞报告](https://github.com/Aethersailor/SubConverter-Extended/security/advisories/new) 提交，不要创建公开 Issue。

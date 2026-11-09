@@ -13,7 +13,9 @@
 #include "handler/settings.h"
 #include "handler/settings_view.h"
 #include "handler/webget.h"
+#include "utils/file.h"
 #include "server/request_context.h"
+#include "utils/base64/base64.h"
 #include "utils/logger.h"
 #include "utils/cooperative_cpu.h"
 #include "utils/network.h"
@@ -199,23 +201,6 @@ static inline void parse_json_pointer(nlohmann::json &json, const std::string &p
     }
 }
 
-static bool path_is_inside_scope(const std::filesystem::path &path,
-                                 const std::filesystem::path &scope)
-{
-    try
-    {
-        std::filesystem::path relative = std::filesystem::relative(path, scope);
-        std::string rel = relative.generic_string();
-        return rel == "." ||
-               (!relative.is_absolute() && rel != ".." &&
-                !startsWith(rel, "../"));
-    }
-    catch(std::exception &)
-    {
-        return false;
-    }
-}
-
 static std::string python_string_escape(const std::string &value)
 {
     static const char hex[] = "0123456789abcdef";
@@ -261,39 +246,6 @@ static std::string python_string_literal(const std::string &value)
 {
     return "\"" + python_string_escape(value) + "\"";
 }
-
-/*
-std::string parseHostname(inja::Arguments &args)
-{
-    std::string data = args.at(0)->get<std::string>(), hostname;
-    const std::string matcher = R"(^(?i:hostname\s*?=\s*?)(.*?)\s$)";
-    string_array urls = split(data, ",");
-    if(!urls.size())
-        return std::string();
-
-    std::string input_content, output_content;
-    const Settings &settings = effectiveSettings();
-    ProxyPolicy proxy = parseProxy(settings.proxyConfig, settings.proxyBypass);
-    for(std::string &x : urls)
-    {
-        input_content = webGet(x, proxy, settings.cacheConfig);
-        regGetMatch(input_content, matcher, 2, 0, &hostname);
-        if(hostname.size())
-        {
-            output_content += hostname + ",";
-            hostname.clear();
-        }
-    }
-    string_array vArray = split(output_content, ",");
-    std::set<std::string> hostnames;
-    for(std::string &x : vArray)
-        hostnames.emplace(trim(x));
-    output_content = std::accumulate(hostnames.begin(), hostnames.end(), std::string(), [](std::string a, std::string b)
-    {
-        return std::move(a) + "," + std::move(b);
-    });
-    return output_content;
-}*/
 
 #ifndef NO_WEBGET
 std::string template_webGet(inja::Arguments &args)
@@ -531,24 +483,32 @@ int render_template(const std::string &content, const template_args &vars,
 #ifndef NO_WEBGET
     env.add_callback("fetch", 1, template_webGet);
 #endif // NO_WEBGET
-    //env.add_callback("parseHostname", 1, parseHostname);
 
     env.set_include_callback([&](const std::filesystem::path &path, const std::string &template_name)
     {
-        const std::string include_path = path.string();
+        // Inja passes the current directory separately from the include name.
+        // Relative includes are rooted in the explicitly configured scope.
+        std::filesystem::path include_path = path / template_name;
+        if(include_path.is_relative() && !absolute_scope.empty())
+            include_path = std::filesystem::path(absolute_scope) / include_path;
         std::string absolute_path;
         try
         {
-            absolute_path = std::filesystem::canonical(path).string();
+            absolute_path = std::filesystem::canonical(include_path).string();
         }
         catch(std::exception &e)
         {
             throw inja::FileError(e.what());
         }
-        if(!absolute_scope.empty() &&
-           !path_is_inside_scope(absolute_path, absolute_scope))
+        const bool allowed = absolute_scope.empty()
+            ? isInScope(absolute_path)
+            : isPathInScope(absolute_path, absolute_scope);
+        if(!allowed ||
+           (isPublicFetchRestricted(context) &&
+            !isTrustedLocalResourcePath(absolute_path)) ||
+           !fileExist(absolute_path, false))
             throw inja::FileError("access denied when trying to include '" + template_name + "': out of scope");
-        return env.parse(fileGet(include_path, true));
+        return env.parse(fileGet(absolute_path, absolute_scope.empty()));
     });
     env.set_search_included_templates_in_files(false);
 
@@ -729,7 +689,6 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
         {
             if(x.rule_type == RULESET_CLASH_IPCIDR || x.rule_type == RULESET_CLASH_DOMAIN || x.rule_type == RULESET_CLASH_CLASSICAL)
             {
-                //rule_name = std::to_string(hash_(rule_group + rule_path));
                 rule_name = old_rule_name = urlDecode(findFileName(rule_path));
                 int idx = 2;
                 while(std::find(groups.begin(), groups.end(), rule_name) != groups.end())
@@ -771,7 +730,6 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             {
                 if(fileExist(rule_path, true) || isLink(rule_path))
                 {
-                    //rule_name = std::to_string(hash_(rule_group + rule_path));
                     rule_name = old_rule_name = urlDecode(findFileName(rule_path));
                     int idx = 2;
                     while(std::find(groups.begin(), groups.end(), rule_name) != groups.end())

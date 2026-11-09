@@ -32,6 +32,7 @@ struct ProxyProvider {
   std::string path;           // 本地缓存路径
   std::string user_agent;     // provider 更新时使用的 User-Agent
   std::map<std::string, std::string> headers; // 显式允许转发的请求头
+  bool user_agent_explicit = false;
   int groupId;                // 所属组 ID
 
   ProxyProvider()
@@ -128,6 +129,8 @@ struct extra_settings {
   RegexMatchConfigs emoji_array;
   bool add_emoji = false;
   bool remove_emoji = false;
+  // Clash provider emoji rules require an explicit emoji=true request.
+  bool provider_emoji_enabled = false;
   bool append_proxy_type = false;
   bool nodelist = false;
   bool sort_flag = false;
@@ -150,7 +153,7 @@ struct extra_settings {
   std::string clash_proxies_style = "flow";
   std::string clash_proxy_groups_style = "flow";
   bool use_proxy_provider = true;       // 默认启用 proxy-provider 模式
-  bool provider_proxy_direct = true;    // proxy-provider 默认使用 DIRECT 更新
+  bool provider_proxy_direct = kDefaultProxyProviderDirect;
   std::vector<ProxyProvider> providers; // provider 列表
   std::vector<QuanXServerRemote> quanx_server_remotes;
   std::vector<SurgePolicyPathResource> surge_policy_paths;

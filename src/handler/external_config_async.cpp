@@ -10,7 +10,7 @@
 #include "handler/webget.h"
 #include "generator/template/template_async.h"
 #include "runtime/blocking_io_executor.h"
-#include "utils/file_extra.h"
+#include "utils/file.h"
 #include "utils/logger.h"
 #include "utils/network.h"
 #include "utils/redact.h"
@@ -246,10 +246,10 @@ private:
           if (fileExist(source, scope_limit) &&
               (!isPublicFetchRestricted(context) || trusted))
             content = fileGet(source, scope_limit);
-          completion_state->complete(
+          const ExternalConfigLoadStatus status =
               content.empty() ? ExternalConfigLoadStatus::FetchFailed
-                              : ExternalConfigLoadStatus::Success,
-              std::move(content));
+                              : ExternalConfigLoadStatus::Success;
+          completion_state->complete(status, std::move(content));
         },
         [completion_state](SchedulerSubmitStatus completion_status,
                            std::exception_ptr error) mutable {

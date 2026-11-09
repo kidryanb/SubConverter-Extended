@@ -28,6 +28,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "config/binding.h"
+#include "config/proxy_provider_user_agent.h"
 #include "generator/config/clash_proxy.h"
 #include "generator/config/external_rules.h"
 #include "generator/config/nodemanip.h"
@@ -67,7 +68,7 @@ static string_icase_map buildSubscriptionRequestHeaders() {
 #include "utils/bounded_output.h"
 #include "utils/bounded_executor.h"
 #include "utils/cooperative_cpu.h"
-#include "utils/file_extra.h"
+#include "utils/file.h"
 #include "utils/ini_reader/ini_reader.h"
 #include "utils/logger.h"
 #include "utils/md5/md5_interface.h"
@@ -86,8 +87,6 @@ static string_icase_map buildSubscriptionRequestHeaders() {
 extern WebServer webServer;
 
 string_array gRegexBlacklist = {"(.*)*"};
-
-static constexpr size_t kProviderUserAgentMaxLen = 512;
 
 enum class RemoteSubscriptionMode {
   ServerSideParse,
@@ -500,7 +499,9 @@ bool checkExternalBase(const std::string &path, std::string &dest,
     dest = path;
     return true;
   }
-  if (fileExist(path, true) && isTrustedLocalResourcePath(path)) {
+  // The configured trust roots already permit files outside the preference
+  // working directory. Apply that same canonical boundary to external bases.
+  if (isTrustedLocalResourcePath(path) && fileExist(path, false)) {
     dest = path;
     return true;
   }
@@ -686,12 +687,15 @@ struct TaggedLink {
     DuplicateInterval,
     InvalidProxyDirect,
     DuplicateProxyDirect,
+    InvalidUserAgent,
+    DuplicateUserAgent,
     InvalidNode,
   };
 
   std::string tag;
   std::string provider;
   std::string link;
+  std::string user_agent;
   int interval = 0;
   bool proxy_direct = kDefaultProxyProviderDirect;
   bool has_tag = false;
@@ -699,6 +703,7 @@ struct TaggedLink {
   bool has_interval = false;
   bool has_proxy_direct = false;
   bool has_node = false;
+  bool has_user_agent = false;
   bool link_decoded = false;
   Error error = Error::None;
 };
@@ -800,6 +805,20 @@ static bool parseLinkPrefixes(const std::string &input, TaggedLink &result) {
       remainder.erase(0, 5);
       break;
     }
+    if (extractLinkPrefix(remainder, "ua:", value, next, saw_bracketed)) {
+      parsed = true;
+      if (result.has_user_agent) {
+        result.error = TaggedLink::Error::DuplicateUserAgent;
+        return true;
+      }
+      result.has_user_agent = true;
+      if (!parseProxyProviderUserAgent(value, result.user_agent)) {
+        result.error = TaggedLink::Error::InvalidUserAgent;
+        return true;
+      }
+      remainder = std::move(next);
+      continue;
+    }
     break;
   }
 
@@ -817,6 +836,12 @@ static bool parseLinkPrefixes(const std::string &input, TaggedLink &result) {
   if (starts_proxy_direct &&
       lower_remainder.find("%2c") == std::string::npos) {
     result.error = TaggedLink::Error::InvalidProxyDirect;
+    return true;
+  }
+  if ((startsWith(lower_remainder, "ua:") ||
+       startsWith(lower_remainder, "<ua:")) &&
+      lower_remainder.find("%2c") == std::string::npos) {
+    result.error = TaggedLink::Error::InvalidUserAgent;
     return true;
   }
 
@@ -838,6 +863,8 @@ static bool parseLinkPrefixes(const std::string &input, TaggedLink &result) {
 static bool looksLikeEncodedLinkPrefix(const std::string &input) {
   std::string lower = toLower(input);
   return startsWith(lower, "tag%3a") || startsWith(lower, "provider%3a") ||
+         startsWith(lower, "ua%3a") || startsWith(lower, "%3cua%3a") ||
+         startsWith(lower, "%3cua:") ||
          startsWith(lower, "interval%3a") ||
          startsWith(lower, "proxy_direct%3a") ||
          startsWith(lower, "node%3a") ||
@@ -855,6 +882,8 @@ static bool looksLikeEncodedLinkPrefix(const std::string &input) {
          (startsWith(lower, "interval:") &&
           lower.find("%2c") != std::string::npos) ||
          (startsWith(lower, "proxy_direct:") &&
+          lower.find("%2c") != std::string::npos) ||
+         (startsWith(lower, "ua:") &&
           lower.find("%2c") != std::string::npos);
 }
 
@@ -867,6 +896,9 @@ static TaggedLink parseTaggedLink(const std::string &input) {
     TaggedLink decoded_result;
     std::string decoded = urlDecode(value);
     if (parseLinkPrefixes(decoded, decoded_result)) {
+      if (decoded_result.has_user_agent &&
+          !validEncodedProviderUserAgentPrefix(value))
+        decoded_result.error = TaggedLink::Error::InvalidUserAgent;
       decoded_result.link_decoded = true;
       return decoded_result;
     }
@@ -878,6 +910,18 @@ static TaggedLink parseTaggedLink(const std::string &input) {
 static std::string providerLinkPrefixError(
     size_t item_index, TaggedLink::Error error) {
   const std::string item = std::to_string(item_index + 1);
+  if (error == TaggedLink::Error::DuplicateUserAgent) {
+    return "Invalid request: ua: is repeated for URL item #" + item + ".\n"
+           "无效请求：第 " + item + " 个 url 项重复设置了 ua: 前缀。";
+  }
+  if (error == TaggedLink::Error::InvalidUserAgent) {
+    return "Invalid request: ua: for URL item #" + item +
+           " must be a nonempty, percent-encoded printable ASCII component "
+           "of at most 512 decoded bytes.\n"
+           "无效请求：第 " + item +
+           " 个 url 项的 ua: 必须是合法百分号编码的可打印 ASCII，"
+           "解码后不得为空或超过 512 字节。";
+  }
   if (error == TaggedLink::Error::InvalidNode) {
     return "Invalid request: node: for URL item #" + item +
            " requires an HTTP(S) proxy with a host and port, no credentials, "
@@ -908,6 +952,16 @@ static std::string providerLinkPrefixError(
          " must be true, false, 1, or 0.\n"
          "无效请求：第 " + item +
          " 个 url 项的 proxy_direct: 必须是 true、false、1 或 0。";
+}
+
+static std::string providerUserAgentScopeError(size_t item_index) {
+  const std::string item = std::to_string(item_index + 1);
+  return "Invalid request: ua: for URL item #" + item +
+         " requires an HTTP(S) proxy-provider source with target=clash "
+         "and list=false.\n"
+         "无效请求：第 " + item +
+         " 个 url 项的 ua: 仅支持 target=clash 且 list=false 的 "
+         "HTTP(S) proxy-provider 来源。";
 }
 
 static std::string providerIntervalScopeError(size_t item_index) {
@@ -1308,6 +1362,7 @@ struct SubExplainProvider {
   int group_id = 0;
   uint32_t interval = 0;
   bool proxy_direct = kDefaultProxyProviderDirect;
+  size_t explicit_user_agent_length = 0;
 };
 
 struct SubExplainParameter {
@@ -1641,6 +1696,11 @@ static std::string serializeSubExplainReport(const SubExplainReport &report,
     writer.Bool(provider.proxy_direct);
     writer.Key("proxy_field_emitted");
     writer.Bool(provider.proxy_direct);
+    if (provider.explicit_user_agent_length) {
+      writeJsonString(writer, "user_agent_source", "explicit");
+      writer.Key("user_agent_length");
+      writer.Uint64(provider.explicit_user_agent_length);
+    }
     writer.EndObject();
   }
   writer.EndArray();
@@ -3812,10 +3872,27 @@ static std::string parseSubRequestArguments(Request &request,
   parsed.url = getUrlArg(argument, "url");
   if (parsed.url.find("node:") != std::string::npos ||
       parsed.url.find("node%3A") != std::string::npos ||
-      parsed.url.find("node%3a") != std::string::npos) {
+      parsed.url.find("node%3a") != std::string::npos ||
+      parsed.url.find("ua:") != std::string::npos ||
+      parsed.url.find("ua%3A") != std::string::npos ||
+      parsed.url.find("ua%3a") != std::string::npos) {
     const string_array request_sources = split(parsed.url, "|");
     for (size_t index = 0; index < request_sources.size(); ++index) {
       const TaggedLink tagged = parseTaggedLink(regTrim(request_sources[index]));
+      if (tagged.has_user_agent ||
+          tagged.error == TaggedLink::Error::InvalidUserAgent ||
+          tagged.error == TaggedLink::Error::DuplicateUserAgent) {
+        if (tagged.error != TaggedLink::Error::None) {
+          response.status_code = 400;
+          return providerLinkPrefixError(index, tagged.error);
+        }
+        if (parsed.target != "clash" ||
+            isTruthyRequestValue(getUrlArg(argument, "list")) ||
+            tagged.has_node || !mihomo::isHttpSchemeLink(tagged.link)) {
+          response.status_code = 400;
+          return providerUserAgentScopeError(index);
+        }
+      }
       if (!tagged.has_node && tagged.error != TaggedLink::Error::InvalidNode)
         continue;
       if (tagged.error != TaggedLink::Error::None) {
@@ -4001,9 +4078,11 @@ static std::string buildEffectiveSubPolicy(Request &request,
       !parsed.include_remark.empty() || !parsed.exclude_remark.empty();
   policy.requested_remote_node_rename = !parsed.renames.empty();
   policy.requested_remote_node_transform =
-      !parsed.emoji.is_undef() || parsed.add_emoji.get(false) ||
-      parsed.remove_emoji.get(false) || parsed.append_type.get(false) ||
-      parsed.sort.get(false) || parsed.filter_deprecated.get(false);
+      (settings.emojiEnabled &&
+       (!parsed.emoji.is_undef() || parsed.add_emoji.get(false) ||
+        parsed.remove_emoji.get(false))) ||
+      parsed.append_type.get(false) || parsed.sort.get(false) ||
+      parsed.filter_deprecated.get(false);
   policy.requested_remote_node_option_override =
       !parsed.tfo.is_undef() || !parsed.udp.is_undef() ||
       !parsed.skip_cert_verify.is_undef() || !parsed.tls13.is_undef();
@@ -4269,7 +4348,7 @@ static std::string buildExternalConfigFetchPlan(
       if (requested_config)
         policy.requested_remote_node_rename = true;
     }
-    if (!extconf.emoji.empty())
+    if (settings.emojiEnabled && !extconf.emoji.empty())
       policy.generator.emoji_array = extconf.emoji;
     if (!extconf.include.empty()) {
       policy.include_remarks = extconf.include;
@@ -4281,7 +4360,7 @@ static std::string buildExternalConfigFetchPlan(
       if (requested_config)
         policy.requested_remote_node_filter = true;
     }
-    if (requested_config &&
+    if (requested_config && settings.emojiEnabled &&
         (extconf.add_emoji.get(false) ||
          extconf.remove_old_emoji.get(false)))
       policy.requested_remote_node_transform = true;
@@ -4481,6 +4560,44 @@ static std::string buildExternalConfigFetchPlan(
 
   if (policy.generator.enable_rule_generator &&
       !policy.generator.nodelist && !parsed.simple_subscription) {
+    // Local rulesets have a deterministic operator/request-selected path.
+    // Reject unavailable files instead of returning a partial configuration;
+    // retain the historical handling of remote fetch failures and empty files.
+    for (size_t index = 0; index < policy.custom_rulesets.size(); ++index) {
+      std::string path = policy.custom_rulesets[index].Url;
+      if (path.find("[]") != std::string::npos)
+        continue;
+      for (const auto &type : RulesetTypes) {
+        if (startsWith(path, type.first)) {
+          path.erase(0, type.first.size());
+          break;
+        }
+      }
+      if (isLink(path) || startsWith(path, "data:"))
+        continue;
+      const bool trusted = isTrustedLocalResourcePath(path);
+      const bool allowed =
+          (trusted || isInScope(path)) &&
+          (!isPublicFetchRestricted(rulesetFetchContext) || trusted);
+      if (allowed && fileExist(path, !trusted) && fileReadable(path, !trusted))
+        continue;
+
+      response.status_code = plan.user_provided_external_config ? 400 : 500;
+      response.content_type = "text/plain; charset=utf-8";
+      response.headers["Cache-Control"] = "private, no-store";
+      writeLog(LOG_LEVEL_WARNING,
+               "RULESET_LOCAL_SOURCE_UNAVAILABLE source_index=" +
+                   std::to_string(index + 1) + " reason=" +
+                   (allowed ? "missing_or_unreadable" : "outside_allowed_scope") +
+                   " context=" + fetchContextName(rulesetFetchContext));
+      return "Local ruleset source #" + std::to_string(index + 1) +
+             " is missing, unreadable, or outside the allowed local "
+             "directories. Check the file path and base_path; no partial "
+             "configuration was generated.\n本地规则集来源 #" +
+             std::to_string(index + 1) +
+             " 不存在、不可读或超出允许的本地目录。请检查文件路径和 "
+             "base_path；本次未生成不完整的配置。";
+    }
     if (!dependency_resolution) {
       const bool stash_native_rulesets = parsed.target == "stash";
       if (stash_native_rulesets) {
@@ -4645,15 +4762,18 @@ static std::string buildExternalConfigFetchPlan(
   parsed.explain.ruleset_count = plan.ruleset_content.size();
   parsed.explain.custom_group_count = policy.custom_proxy_groups.size();
 
-  if (!parsed.emoji.is_undef()) {
-    parsed.add_emoji.set(parsed.emoji);
-    parsed.remove_emoji.set(true);
+  if (settings.emojiEnabled) {
+    policy.generator.provider_emoji_enabled = parsed.emoji.get(false);
+    if (!parsed.emoji.is_undef()) {
+      parsed.add_emoji.set(parsed.emoji);
+      parsed.remove_emoji.set(true);
+    }
+    policy.generator.add_emoji = parsed.add_emoji.get(settings.addEmoji);
+    policy.generator.remove_emoji =
+        parsed.remove_emoji.get(settings.removeEmoji);
+    if (policy.generator.add_emoji && policy.generator.emoji_array.empty())
+      policy.generator.emoji_array = settings.emojis;
   }
-  policy.generator.add_emoji = parsed.add_emoji.get(settings.addEmoji);
-  policy.generator.remove_emoji =
-      parsed.remove_emoji.get(settings.removeEmoji);
-  if (policy.generator.add_emoji && policy.generator.emoji_array.empty())
-    policy.generator.emoji_array = settings.emojis;
   if (!parsed.renames.empty()) {
     policy.generator.rename_array =
         INIBinding::from<RegexMatchConfig>::from_ini(
@@ -5454,6 +5574,8 @@ static SubStageResponse processSubscriptionNodes(
       bool has_interval = false;
       bool has_proxy_direct = false;
       bool url_decoded = false;
+      std::string user_agent;
+      bool has_user_agent = false;
     };
     std::vector<SubscriptionLinkItem> subscription_urls;
     std::vector<std::string> node_urls;
@@ -5492,7 +5614,7 @@ static SubStageResponse processSubscriptionNodes(
         subscription_urls.push_back(
             {link, tagged.tag, tagged.provider, tagged.interval,
              tagged.proxy_direct, tagged.has_interval, tagged.has_proxy_direct,
-             tagged.link_decoded});
+             tagged.link_decoded, tagged.user_agent, tagged.has_user_agent});
         explain.subscription_url_count++;
       } else {
         if (tagged.has_interval) {
@@ -5562,7 +5684,8 @@ static SubStageResponse processSubscriptionNodes(
           base_name = default_name;
         provider.name = reserve_provider_name(base_name);
         provider.tag = item.tag;
-        provider.url = item.url_decoded ? item.url : urlDecode(item.url);
+        // Transport and prefix decoding is complete; preserve URL escapes.
+        provider.url = item.url;
         provider.interval = static_cast<uint32_t>(
             item.has_interval ? item.interval : settings.proxyProviderInterval);
         provider.proxy_direct =
@@ -5570,7 +5693,17 @@ static SubStageResponse processSubscriptionNodes(
                                   : ext.provider_proxy_direct;
         provider.groupId = groupID;
         provider.path = "./providers/" + provider.name + ".yaml";
-        provider.user_agent = provider_user_agent;
+        provider.user_agent =
+            item.has_user_agent ? item.user_agent : provider_user_agent;
+        provider.user_agent_explicit = item.has_user_agent;
+        if (item.has_user_agent) {
+          const std::string identity =
+              std::to_string(provider.url.size()) + ":" + provider.url +
+              std::to_string(provider.user_agent.size()) + ":" +
+              provider.user_agent;
+          provider.path = "./providers/" + provider.name + "_ua_" +
+                          getMD5(identity) + ".yaml";
+        }
         provider.headers = provider_headers;
         provider.filter = buildProviderRemarkFilter(lIncludeRemarks);
         provider.exclude_filter =
@@ -5603,6 +5736,8 @@ static SubStageResponse processSubscriptionNodes(
         explain_provider.group_id = provider.groupId;
         explain_provider.interval = provider.interval;
         explain_provider.proxy_direct = provider.proxy_direct;
+        if (item.has_user_agent)
+          explain_provider.explicit_user_agent_length = provider.user_agent.size();
         explain.providers.push_back(std::move(explain_provider));
         groupID++;
       }
@@ -7169,10 +7304,32 @@ static std::string assembleSubResponse(
                  explain.upload_suppressed
                      ? "Uploads are disabled in explain mode."
                      : "");
-    addParameter("emoji", boolString(ext.add_emoji), "applied",
-                 "Sets add_emoji and remove_emoji together.");
-    addSwitchParameter("add_emoji", ext.add_emoji, argAddEmoji);
-    addSwitchParameter("remove_emoji", ext.remove_emoji, argRemoveEmoji);
+    const bool only_clash_providers =
+        !ext.providers.empty() && explain.total_node_count == 0;
+    if (!settings.emojiEnabled) {
+      for (const char *name : {"emoji", "add_emoji", "remove_emoji"})
+        addParameter(name, "false", "ignored",
+                     "Emoji addition and removal are disabled by "
+                     "emojis.enabled in the backend configuration.");
+    } else {
+      addParameter(
+          "emoji", boolString(only_clash_providers ? ext.provider_emoji_enabled
+                                                  : ext.add_emoji),
+          "applied",
+          ext.providers.empty()
+              ? "Sets add_emoji and remove_emoji together."
+              : "Clash providers require explicit emoji=true; server-parsed "
+                "nodes keep the original emoji behavior.");
+      if (only_clash_providers) {
+        for (const char *name : {"add_emoji", "remove_emoji"})
+          addParameter(name, boolString(ext.provider_emoji_enabled), "ignored",
+                       "Clash provider emoji processing is controlled by emoji, "
+                       "not the independent switches.");
+      } else {
+        addSwitchParameter("add_emoji", ext.add_emoji, argAddEmoji);
+        addSwitchParameter("remove_emoji", ext.remove_emoji, argRemoveEmoji);
+      }
+    }
     addSwitchParameter("append_type", ext.append_proxy_type, argAppendType);
     addSwitchParameter("tfo", ext.tfo.get(false), ext.tfo);
     addSwitchParameter("udp", ext.udp.get(false), ext.udp);
@@ -9062,281 +9219,6 @@ static bool startForceMaxFlow(
 
 } // namespace
 
-std::string simpleToClashR(RESPONSE_CALLBACK_ARGS) {
-  auto argument = joinArguments(request.argument);
-  int *status_code = &response.status_code;
-
-  std::string url = argument.size() <= 8 ? "" : argument.substr(8);
-  if (url.empty() || argument.substr(0, 8) != "sublink=") {
-    *status_code = 400;
-    return "Invalid request: missing sublink parameter.\n"
-           "无效请求：缺少 sublink 参数。\n"
-           "Please call this endpoint as /sub2clashr?sublink=<subscription-url>.\n"
-           "请使用 /sub2clashr?sublink=<订阅链接> 调用该接口。";
-  }
-  if (url == "sublink") {
-    *status_code = 400;
-    return "Invalid request: the default placeholder was not replaced with a "
-           "subscription link.\n"
-           "无效请求：默认占位符没有被替换为订阅链接。\n"
-           "Please provide a real subscription URL in the sublink parameter.\n"
-           "请在 sublink 参数中提供真实订阅链接。";
-  }
-  request.argument.emplace("target", "clashr");
-  request.argument.emplace("url", urlEncode(url));
-  return subconverter(request, response);
-}
-
-std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS) {
-  auto argument = joinArguments(request.argument);
-  int *status_code = &response.status_code;
-
-  INIReader ini;
-  string_array dummy_str_array;
-  std::vector<Proxy> nodes;
-  std::string base_content,
-      url = argument.size() <= 5 ? "" : argument.substr(5);
-  const std::string proxygroup_name = global.clashUseNewField ? "proxy-groups"
-                                                              : "Proxy Group",
-                    rule_name = global.clashUseNewField ? "rules" : "Rule";
-
-  ini.store_any_line = true;
-
-  if (url.empty())
-    url = global.defaultUrls;
-  if (url.empty() || argument.substr(0, 5) != "link=") {
-    *status_code = 400;
-    return "Invalid request: missing link parameter.\n"
-           "无效请求：缺少 link 参数。\n"
-           "Please call this endpoint as /surge2clash?link=<surge-config-url>.\n"
-           "请使用 /surge2clash?link=<Surge配置链接> 调用该接口。";
-  }
-  if (url == "link") {
-    *status_code = 400;
-    return "Invalid request: the default placeholder was not replaced with a "
-           "Surge configuration link.\n"
-           "无效请求：默认占位符没有被替换为 Surge 配置链接。\n"
-           "Please provide a real Surge configuration URL in the link "
-           "parameter.\n"
-           "请在 link 参数中提供真实 Surge 配置链接。";
-  }
-  writeLog(LOG_LEVEL_INFO, "SurgeConfToClash 调用，URL：" + summarizeUrlForLog(url) + "。");
-
-  ProxyPolicy proxy = parseProxy(global.proxyConfig, global.proxyBypass);
-  YAML::Node clash;
-  template_args tpl_args;
-  tpl_args.global_vars = global.templateVars;
-  tpl_args.local_vars["clash.new_field_name"] =
-      global.clashUseNewField ? "true" : "false";
-  tpl_args.request_params["target"] = "clash";
-  tpl_args.request_params["url"] = url;
-
-  if (render_template(fetchFile(global.clashBase, proxy, global.cacheConfig),
-                      tpl_args, base_content, global.templatePath) != 0) {
-    *status_code = 400;
-    return base_content;
-  }
-  clash = YAML::Load(base_content);
-
-  base_content = fetchFile(url, proxy, global.cacheConfig);
-
-  if (ini.parse(base_content) != INIREADER_EXCEPTION_NONE) {
-    const std::string parser_detail = ini.get_last_error();
-    const std::string errmsg = "Invalid request: failed to parse Surge "
-                               "configuration.\n"
-                               "无效请求：Surge 配置解析失败。";
-    // std::cerr<<errmsg<<"\n";
-    writeLog(LOG_LEVEL_ERROR, "SURGE_CONFIG_PARSE_FAILED detail=" +
-                    summarizeSensitiveTextForLog(parser_detail));
-    *status_code = 400;
-    return errmsg;
-  }
-  if (!ini.section_exist("Proxy") || !ini.section_exist("Proxy Group") ||
-      !ini.section_exist("Rule")) {
-    std::string errmsg =
-        "Invalid request: incomplete Surge configuration.\n"
-        "无效请求：Surge 配置不完整。\n"
-        "Required sections: [Proxy], [Proxy Group], and [Rule].\n"
-        "必须包含以下配置段：[Proxy]、[Proxy Group] 和 [Rule]。";
-    // std::cerr<<errmsg<<"\n";
-    writeLog(LOG_LEVEL_ERROR, "Surge 配置不完整，缺少必需配置段。");
-    *status_code = 400;
-    return errmsg;
-  }
-
-  // scan groups first, get potential policy-path
-  string_multimap section;
-  ini.get_items("Proxy Group", section);
-  std::string name, type, content;
-  string_array links;
-  links.emplace_back(url);
-  YAML::Node singlegroup;
-  for (auto &x : section) {
-    singlegroup.reset();
-    name = x.first;
-    content = x.second;
-    dummy_str_array = split(content, ",");
-    if (dummy_str_array.empty())
-      continue;
-    type = dummy_str_array[0];
-    if (!(type == "select" || type == "url-test" || type == "fallback" ||
-          type == "load-balance"))
-      // remove unsupported types
-      continue;
-    singlegroup["name"] = name;
-    singlegroup["type"] = type;
-    for (unsigned int i = 1; i < dummy_str_array.size(); i++) {
-      if (startsWith(dummy_str_array[i], "url"))
-        singlegroup["url"] =
-            trim(dummy_str_array[i].substr(dummy_str_array[i].find('=') + 1));
-      else if (startsWith(dummy_str_array[i], "interval"))
-        singlegroup["interval"] =
-            trim(dummy_str_array[i].substr(dummy_str_array[i].find('=') + 1));
-      else if (startsWith(dummy_str_array[i], "policy-path"))
-        links.emplace_back(
-            trim(dummy_str_array[i].substr(dummy_str_array[i].find('=') + 1)));
-      else
-        singlegroup["proxies"].push_back(trim(dummy_str_array[i]));
-    }
-    clash[proxygroup_name].push_back(singlegroup);
-  }
-
-  proxy = parseProxy(global.proxySubscription, global.proxyBypass);
-  eraseElements(dummy_str_array);
-
-  RegexMatchConfigs dummy_regex_array;
-  std::string subInfo;
-  parse_settings parse_set;
-  parse_set.proxy = &proxy;
-  parse_set.exclude_remarks = parse_set.include_remarks = &dummy_str_array;
-  parse_set.stream_rules = parse_set.time_rules = &dummy_regex_array;
-  parse_set.request_header = &request.headers;
-  parse_set.sub_info = &subInfo;
-  for (std::string &x : links) {
-    // std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-    writeLog(LOG_LEVEL_INFO, "正在从 URL 获取节点数据：" + summarizeUrlForLog(x) + "。");
-    if (addNodes(x, nodes, 0, parse_set) == -1) {
-      if (global.skipFailedLinks)
-        writeLog(LOG_LEVEL_WARNING,
-                 "以下链接不包含任何有效节点信息：" + x);
-      else {
-        *status_code = 400;
-        return "Invalid request: this link does not contain any supported "
-               "proxy nodes.\n"
-               "无效请求：该链接不包含任何受支持的代理节点。\n"
-               "Please check whether the link is reachable and the node URI "
-               "format is supported.\n"
-               "请检查链接是否可访问，以及节点 URI 格式是否受支持。\n"
-               "Link / 链接: " +
-               x;
-      }
-    }
-  }
-
-  // exit if found nothing
-  if (nodes.empty()) {
-    *status_code = 400;
-    return "Invalid request: no valid proxy nodes were found in the Surge "
-           "configuration or its policy-path subscriptions.\n"
-           "无效请求：Surge 配置或其 policy-path 订阅中未找到有效代理节点。\n"
-           "Please check whether the source configuration contains supported "
-           "proxy entries.\n"
-           "请检查源配置中是否包含受支持的代理条目。";
-  }
-
-  extra_settings ext;
-  ext.sort_flag = global.enableSort;
-  ext.filter_deprecated = global.filterDeprecated;
-  ext.clash_new_field_name = global.clashUseNewField;
-  ext.udp = global.UDPFlag;
-  ext.tfo = global.TFOFlag;
-  ext.skip_cert_verify = global.skipCertVerify;
-  ext.tls13 = global.TLS13Flag;
-  ext.clash_proxies_style = global.clashProxiesStyle;
-
-  ProxyGroupConfigs dummy_groups;
-  proxyToClash(nodes, clash, dummy_groups, false, ext);
-
-  section.clear();
-  ini.get_items("Proxy", section);
-  for (auto &x : section) {
-    singlegroup.reset();
-    name = x.first;
-    content = x.second;
-    dummy_str_array = split(content, ",");
-    if (dummy_str_array.empty())
-      continue;
-    content = trim(dummy_str_array[0]);
-    switch (hash_(content)) {
-    case "direct"_hash:
-      singlegroup["name"] = name;
-      singlegroup["type"] = "select";
-      singlegroup["proxies"].push_back("DIRECT");
-      break;
-    case "reject"_hash:
-    case "reject-tinygif"_hash:
-      singlegroup["name"] = name;
-      singlegroup["type"] = "select";
-      singlegroup["proxies"].push_back("REJECT");
-      break;
-    default:
-      continue;
-    }
-    clash[proxygroup_name].push_back(singlegroup);
-  }
-
-  eraseElements(dummy_str_array);
-  ini.get_all("Rule", "{NONAME}", dummy_str_array);
-  YAML::Node rule;
-  string_array strArray;
-  std::string strLine;
-  std::stringstream ss;
-  std::string::size_type lineSize;
-  for (std::string &x : dummy_str_array) {
-    if (startsWith(x, "RULE-SET")) {
-      strArray = split(x, ",");
-      if (strArray.size() != 3)
-        continue;
-      content = webGet(strArray[1], proxy, global.cacheRuleset);
-      if (content.empty())
-        continue;
-
-      ss << content;
-      char delimiter = getLineBreak(content);
-
-      while (getline(ss, strLine, delimiter)) {
-        lineSize = strLine.size();
-        if (lineSize && strLine[lineSize - 1] == '\r') // remove line break
-          strLine.erase(--lineSize);
-        if (!lineSize || strLine[0] == ';' || strLine[0] == '#' ||
-            (lineSize >= 2 && strLine[0] == '/' &&
-             strLine[1] == '/')) // empty lines and comments are ignored
-          continue;
-        else if (!std::any_of(ClashRuleTypes.begin(), ClashRuleTypes.end(),
-                              [&strLine](const std::string &type) {
-                                return startsWith(strLine, type);
-                              })) // remove unsupported types
-          continue;
-        strLine = appendClashRuleTarget(strLine, trim(strArray[2]));
-        rule.push_back(strLine);
-      }
-      ss.clear();
-      continue;
-    } else if (!std::any_of(ClashRuleTypes.begin(), ClashRuleTypes.end(),
-                            [&strLine](const std::string &type) {
-                              return startsWith(strLine, type);
-                            }))
-      continue;
-    rule.push_back(x);
-  }
-  clash[rule_name] = rule;
-
-  response.headers["profile-update-interval"] =
-      std::to_string(global.updateInterval / 3600);
-  writeLog(LOG_LEVEL_INFO, "转换完成。");
-  return dumpCanonicalClashYaml(clash);
-}
-
 std::string getProfile(RESPONSE_CALLBACK_ARGS) {
   auto &argument = request.argument;
   int *status_code = &response.status_code;
@@ -9351,11 +9233,6 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
   }
   std::string profile_content;
   name = profiles[0];
-  /*if(vfs::vfs_exist(name))
-  {
-      profile_content = vfs::vfs_get(name);
-  }
-  else */
   if (fileExist(name)) {
     profile_content = fileGet(name, true);
   } else {
@@ -9365,12 +9242,10 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
            "Profile / 配置: " +
            name;
   }
-  // std::cerr<<"Trying to load profile '" + name + "'.\n";
   writeLog(LOG_LEVEL_INFO, "正在加载配置档：'" + name + "'。");
   INIReader ini;
   if (ini.parse(profile_content) != INIREADER_EXCEPTION_NONE &&
       !ini.section_exist("Profile")) {
-    // std::cerr<<"Load profile failed! Reason: "<<ini.get_last_error()<<"\n";
     const std::string parser_detail = ini.get_last_error();
     writeLog(LOG_LEVEL_ERROR, "PROFILE_CONFIG_PARSE_FAILED detail=" +
                     summarizeSensitiveTextForLog(parser_detail));
@@ -9378,12 +9253,10 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
     return "Invalid profile: failed to parse profile content.\n"
            "无效配置：profile 内容解析失败。";
   }
-  // std::cerr<<"Trying to parse profile '" + name + "'.\n";
   writeLog(LOG_LEVEL_INFO, "正在解析配置档：'" + name + "'。");
   string_multimap contents;
   ini.get_items("Profile", contents);
   if (contents.empty()) {
-    // std::cerr<<"Load profile failed! Reason: Empty Profile section\n";
     writeLog(LOG_LEVEL_ERROR, "加载配置档失败！原因：[Profile] 配置段为空。");
     *status_code = 500;
     return "Invalid profile: [Profile] section is empty.\n"
@@ -9435,14 +9308,6 @@ std::string getProfile(RESPONSE_CALLBACK_ARGS) {
   return subconverter(request, response);
 }
 
-/*
-std::string jinja2_webGet(const std::string &url)
-{
-    ProxyPolicy proxy = parseProxy(global.proxyConfig, global.proxyBypass);
-    writeLog(LOG_LEVEL_INFO, "模板调用 fetch，URL：'" + url + "'。");
-    return webGet(url, proxy, global.cacheConfig);
-}*/
-
 inline std::string intToStream(unsigned long long stream) {
   char chrs[16] = {}, units[6] = {' ', 'K', 'M', 'G', 'T', 'P'};
   double streamval = stream;
@@ -9488,11 +9353,9 @@ std::string subInfoToMessage(std::string subinfo) {
 }
 
 int simpleGenerator() {
-  // std::cerr<<"\nReading generator configuration...\n";
   writeLog(LOG_LEVEL_INFO, "正在读取生成器配置...");
   std::string config = fileGet("generate.ini"), path, profile, content;
   if (config.empty()) {
-    // std::cerr<<"Generator configuration not found or empty!\n";
     writeLog(LOG_LEVEL_ERROR, "未找到生成器配置，或配置为空！");
     return -1;
   }
@@ -9505,7 +9368,6 @@ int simpleGenerator() {
                     summarizeSensitiveTextForLog(ini.get_last_error()));
     return -2;
   }
-  // std::cerr<<"Read generator configuration completed.\n\n";
   writeLog(LOG_LEVEL_INFO, "生成器配置读取完成。\n");
 
   string_array sections = ini.get_section_names();
@@ -9520,7 +9382,6 @@ int simpleGenerator() {
       if (std::find(sections.cbegin(), sections.cend(), x) != sections.cend())
         new_targets.emplace_back(std::move(x));
       else {
-        // std::cerr<<"Artifact \""<<x<<"\" not found in generator settings!\n";
         writeLog(LOG_LEVEL_ERROR, "生成器设置中未找到生成项：\"" + x + "\"！");
         return -3;
       }
@@ -9528,23 +9389,19 @@ int simpleGenerator() {
     sections = new_targets;
     sections.shrink_to_fit();
   } else
-    // std::cerr<<"Generating all artifacts...\n";
     writeLog(LOG_LEVEL_INFO, "正在生成所有生成项...");
 
   string_multimap allItems;
   ProxyPolicy proxy = parseProxy(global.proxySubscription, global.proxyBypass);
-  Request request;
-  Response response;
   bool write_failed = false;
   for (std::string &x : sections) {
-    response.status_code = 200;
-    // std::cerr<<"Generating artifact '"<<x<<"'...\n";
+    Request request;
+    Response response;
     writeLog(LOG_LEVEL_INFO, "正在生成生成项：'" + x + "'。");
     ini.enter_section(x);
     if (ini.item_exist("path"))
       path = ini.get("path");
     else {
-      // std::cerr<<"Artifact '"<<x<<"' output path missing! Skipping...\n\n";
       writeLog(LOG_LEVEL_ERROR, "生成项 '" + x + "' 缺少输出路径，跳过。\n");
       continue;
     }
@@ -9628,61 +9485,13 @@ int simpleGenerator() {
     if (iter != response.headers.end())
       writeLog(LOG_LEVEL_INFO,
                "生成项 '" + x + "' 的用户信息：" + subInfoToMessage(iter->second));
-    // std::cerr<<"Artifact '"<<x<<"' generate SUCCESS!\n\n";
     writeLog(LOG_LEVEL_INFO, "生成项 '" + x + "' 生成成功！\n");
     eraseElements(response.headers);
   }
-  // std::cerr<<"All artifact generated. Exiting...\n";
   if (write_failed) {
     writeLog(LOG_LEVEL_ERROR, "部分生成项写入失败，正在以失败状态退出...");
     return -1;
   }
   writeLog(LOG_LEVEL_INFO, "所有生成项已生成，正在退出...");
   return 0;
-}
-
-std::string renderTemplate(RESPONSE_CALLBACK_ARGS) {
-  auto &argument = request.argument;
-  int *status_code = &response.status_code;
-
-  std::string path = getUrlArg(argument, "path");
-  writeLog(LOG_LEVEL_INFO, "正在渲染模板：'" + path + "'。");
-
-  if (!startsWith(path, global.templatePath) || !fileExist(path)) {
-    *status_code = 404;
-    return "Template not found or outside the allowed template directory.\n"
-           "未找到模板，或模板路径超出允许的模板目录。\n"
-           "Please provide a path under the configured template directory.\n"
-           "请提供位于已配置模板目录下的路径。";
-  }
-  std::string template_content =
-      fetchFile(path, parseProxy(global.proxyConfig, global.proxyBypass),
-                global.cacheConfig);
-  if (template_content.empty()) {
-    *status_code = 400;
-    return "Invalid template: file is empty or cannot be read within the "
-           "allowed scope.\n"
-           "无效模板：文件为空，或无法在允许范围内读取。\n"
-           "Please check the template content and configured template path.\n"
-           "请检查模板内容和已配置的模板路径。";
-  }
-  template_args tpl_args;
-  tpl_args.global_vars = global.templateVars;
-
-  // load request arguments as template variables
-  string_map req_arg_map;
-  for (auto &x : argument) {
-    req_arg_map[x.first] = x.second;
-  }
-  tpl_args.request_params = req_arg_map;
-
-  std::string output_content;
-  if (render_template(template_content, tpl_args, output_content,
-                      global.templatePath) != 0) {
-    *status_code = 400;
-    writeLog(LOG_LEVEL_WARNING, "渲染失败。");
-  } else
-    writeLog(LOG_LEVEL_INFO, "渲染完成。");
-
-  return output_content;
 }
