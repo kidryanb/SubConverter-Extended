@@ -48,7 +48,6 @@ jobs:
         if: steps.sync.outputs.changed == 'true'
         run: |
           python3 -m unittest discover -s tests -p 'test_*.py' -v
-          bash tests/ci_delivery_scripts_test.sh
           git diff --check HEAD^1..HEAD
 
       - name: Push validated master

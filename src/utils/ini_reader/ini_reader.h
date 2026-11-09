@@ -10,7 +10,7 @@
 
 #include "utils/bounded_output.h"
 #include "utils/codepage.h"
-#include "utils/file_extra.h"
+#include "utils/file.h"
 #include "utils/string.h"
 
 enum
@@ -267,7 +267,7 @@ public:
                     {
                         if(allow_dup_section_titles || ini_content.at(curSection).empty())
                         {
-                            auto iter = ini_content.at(curSection); //get the existing section
+                            auto &iter = ini_content.at(curSection); //get the existing section
                             iter.merge(itemGroup); //move new items to this section
                         }
                         else if(!ini_content.at(curSection).empty())

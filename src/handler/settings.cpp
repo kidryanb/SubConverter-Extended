@@ -1092,11 +1092,6 @@ void readYAMLConf(YAML::Node &node,
 
   if (node["node_pref"].IsDefined()) {
     section = node["node_pref"];
-    /*
-    section["udp_flag"] >> udp_flag;
-    section["tcp_fast_open_flag"] >> tfo_flag;
-    section["skip_cert_verify_flag"] >> scv_flag;
-    */
     global.UDPFlag.set(safe_as<std::string>(section["udp_flag"]));
     global.TFOFlag.set(safe_as<std::string>(section["tcp_fast_open_flag"]));
     global.skipCertVerify.set(
@@ -1151,6 +1146,7 @@ void readYAMLConf(YAML::Node &node,
 
   if (node["emojis"].IsDefined()) {
     section = node["emojis"];
+    section["enabled"] >> global.emojiEnabled;
     section["add_emoji"] >> global.addEmoji;
     section["remove_old_emoji"] >> global.removeEmoji;
     if (section["rules"].IsSequence()) {
@@ -1482,8 +1478,9 @@ void readTOMLConf(toml::value &root,
 
   auto section_emojis = toml::find(root, "emojis");
 
-  find_if_exist(section_emojis, "add_emoji", global.addEmoji,
-                "remove_old_emoji", global.removeEmoji);
+  find_if_exist(section_emojis, "enabled", global.emojiEnabled,
+                "add_emoji", global.addEmoji, "remove_old_emoji",
+                global.removeEmoji);
 
   auto emojiconfs =
       toml::find_or<std::vector<toml::value>>(section_emojis, "emoji", {});
@@ -1682,6 +1679,7 @@ bool readConf() {
     global.resourceControlSource = "builtin-default";
     global.fallbackToDefaultExternalConfig = false;
     global.customOpenClashRulesSourceSwitch = false;
+    global.emojiEnabled = false;
     // A removed proxy_bypass setting must return to the upgrade-compatible
     // default on reload instead of retaining a previous custom policy.
     global.proxyBypass = kDefaultProxyBypass;
@@ -1779,7 +1777,6 @@ bool readConf() {
 
   INIReader ini;
   ini.allow_dup_section_titles = true;
-  // ini.do_utf8_to_gbk = true;
   int retVal = ini.parse_file(global.prefPath);
   if (retVal != INIREADER_EXCEPTION_NONE) {
     return restorePreviousSettings("PREFERENCE_INI_PARSE_FAILED detail=" +
@@ -1881,11 +1878,6 @@ bool readConf() {
 
   if (ini.section_exist("node_pref")) {
     ini.enter_section("node_pref");
-    /*
-    ini.GetBoolIfExist("udp_flag", udp_flag);
-    ini.get_bool_if_exist("tcp_fast_open_flag", tfo_flag);
-    ini.get_bool_if_exist("skip_cert_verify_flag", scv_flag);
-    */
     global.UDPFlag.set(ini.get("udp_flag"));
     global.TFOFlag.set(ini.get("tcp_fast_open_flag"));
     global.skipCertVerify.set(ini.get("skip_cert_verify_flag"));
@@ -1936,6 +1928,7 @@ bool readConf() {
   ini.get_if_exist("quanx_device_id", global.quanXDevID);
 
   ini.enter_section("emojis");
+  ini.get_bool_if_exist("enabled", global.emojiEnabled);
   ini.get_bool_if_exist("add_emoji", global.addEmoji);
   ini.get_bool_if_exist("remove_old_emoji", global.removeEmoji);
   if (ini.item_prefix_exist("rule")) {

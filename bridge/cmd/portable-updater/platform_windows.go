@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,12 +123,12 @@ func atomicSwapDirectories(left, right string) error {
 	if err := os.Rename(right, left); err != nil {
 		restoreErr := os.Rename(exchangeOld, left)
 		if restoreErr != nil {
-			return fmt.Errorf("activate Windows candidate: %v; restoring the current root also failed: %w", err, restoreErr)
+			return fmt.Errorf("%w: activate Windows candidate: %v; restoring the current root also failed: %w", errSwapIncomplete, err, restoreErr)
 		}
 		return fmt.Errorf("activate Windows candidate: %w", err)
 	}
 	if err := os.Rename(exchangeOld, right); err != nil {
-		return fmt.Errorf("retain previous Windows root after activation: %w", err)
+		return fmt.Errorf("%w: retain previous Windows root after activation: %w", errSwapIncomplete, err)
 	}
 	return nil
 }
@@ -159,10 +160,11 @@ func pathExists(path string) bool {
 }
 
 func processAlive(pid int) bool {
-	if pid < 1 {
+	processID := int64(pid)
+	if processID < 1 || processID > math.MaxUint32 {
 		return false
 	}
-	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(processID))
 	if err != nil {
 		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
 	}

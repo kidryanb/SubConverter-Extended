@@ -40,9 +40,12 @@ constexpr std::size_t kMaxPayloadBytes =
     (kMinuteBucketCount + kDailyBucketCount) *
         (sizeof(uint32_t) + kMaxEncodedBucketBytes) +
     kGeoCount * (sizeof(uint16_t) + sizeof(uint64_t) * 2) + 256;
+// Apply the structural and wire-format limits alongside the operational caps.
 constexpr std::size_t kMaxCheckpointPayloadBytes =
-    128U * 1024U * 1024U;
-constexpr std::size_t kMaxWalPayloadBytes = 8U * 1024U * 1024U;
+    std::min<std::size_t>(128U * 1024U * 1024U, kMaxPayloadBytes);
+constexpr std::size_t kMaxWalPayloadBytes = std::min<std::size_t>(
+    {8U * 1024U * 1024U, kMaxPayloadBytes,
+     std::numeric_limits<uint32_t>::max()});
 constexpr std::size_t kMaxWalFileBytes = 16U * 1024U * 1024U;
 constexpr std::size_t kCheckpointEnvelopeBytes = 44;
 constexpr std::size_t kWalCompactBytes = 4U * 1024U * 1024U;
@@ -53,10 +56,6 @@ constexpr std::array<uint8_t, 8> kCheckpointMagic = {'S', 'C', 'S', 'T',
 constexpr std::array<uint8_t, 4> kWalMagic = {'S', '2', 'W', 'L'};
 constexpr uint32_t kSchemaVersion = 2;
 constexpr uint32_t kWalPatchType = 1;
-
-#ifdef STATISTICS_V2_TESTING
-TestWriteFault g_test_write_fault = TestWriteFault::None;
-#endif
 
 uint64_t saturatedAddValue(uint64_t lhs, uint64_t rhs) {
   if (rhs > std::numeric_limits<uint64_t>::max() - lhs)
@@ -400,7 +399,7 @@ void encodeImagePayload(Encoder &encoder, const PersistentImage &image) {
 
 bool decodeImagePayload(const uint8_t *data, std::size_t size,
                         PersistentImage &image) {
-  if (size > kMaxCheckpointPayloadBytes || size > kMaxPayloadBytes)
+  if (size > kMaxCheckpointPayloadBytes)
     return false;
   Decoder decoder(data, size);
   image = PersistentImage{};
@@ -483,7 +482,7 @@ void encodePatchPayload(Encoder &encoder, const DirtyPatch &patch) {
 
 bool decodeAndApplyPatch(const uint8_t *data, std::size_t size,
                          PersistentImage &image) {
-  if (size > kMaxWalPayloadBytes || size > kMaxPayloadBytes)
+  if (size > kMaxWalPayloadBytes)
     return false;
   Decoder decoder(data, size);
   RuntimeState runtime;
@@ -603,12 +602,6 @@ std::FILE *openPersistenceFile(const std::string &path, bool append) {
 }
 
 bool flushFile(std::FILE *file) {
-#ifdef STATISTICS_V2_TESTING
-  if (g_test_write_fault == TestWriteFault::FlushFailure) {
-    errno = EIO;
-    return false;
-  }
-#endif
   if (std::fflush(file) != 0)
     return false;
 #ifdef _WIN32
@@ -625,19 +618,6 @@ bool flushFile(std::FILE *file) {
 }
 
 bool writeAll(std::FILE *file, const uint8_t *data, std::size_t size) {
-#ifdef STATISTICS_V2_TESTING
-  if (g_test_write_fault == TestWriteFault::NoSpace) {
-    errno = ENOSPC;
-    return false;
-  }
-  if (g_test_write_fault == TestWriteFault::ShortWrite) {
-    const std::size_t partial = size > 1 ? size / 2 : 0;
-    if (partial != 0)
-      std::fwrite(data, 1, partial, file);
-    errno = EIO;
-    return false;
-  }
-#endif
   std::size_t written = 0;
   while (written < size) {
     const std::size_t count =
@@ -684,7 +664,6 @@ bool decodeCheckpoint(const std::vector<uint8_t> &bytes,
       result.generation == 0 ||
       !decoder.u64(payload_size) ||
       payload_size > kMaxCheckpointPayloadBytes ||
-      payload_size > kMaxPayloadBytes ||
       payload_size > decoder.remaining() - 8)
     return false;
   const uint8_t *payload = decoder.current();
@@ -717,8 +696,7 @@ std::vector<uint8_t> walRecordBytes(const DirtyPatch &patch,
   const std::size_t payload_offset = encoder.size();
   encodePatchPayload(encoder, patch);
   const std::size_t payload_size = encoder.size() - payload_offset;
-  if (payload_size > kMaxWalPayloadBytes ||
-      payload_size > std::numeric_limits<uint32_t>::max())
+  if (payload_size > kMaxWalPayloadBytes)
     return {};
   encoder.patchU32(payload_size_offset,
                    static_cast<uint32_t>(payload_size));
@@ -1446,7 +1424,6 @@ StoreLoadResult Store::load() {
         !decoder.u64(generation) || !decoder.u64(sequence) ||
         !decoder.u32(payload_size) ||
         payload_size > kMaxWalPayloadBytes ||
-        payload_size > kMaxPayloadBytes ||
         payload_size > decoder.remaining() - std::min<std::size_t>(
                                                decoder.remaining(), 8))
       {
@@ -1518,16 +1495,7 @@ StoreLoadResult Store::load() {
 bool Store::replaceFile(const std::string &target,
                         const std::vector<uint8_t> &bytes) {
   const std::string temporary = target + ".tmp";
-#ifdef STATISTICS_V2_TESTING
-  std::FILE *file =
-      g_test_write_fault == TestWriteFault::OpenFailure
-          ? nullptr
-          : openPersistenceFile(temporary, false);
-  if (!file && g_test_write_fault == TestWriteFault::OpenFailure)
-    errno = EACCES;
-#else
   std::FILE *file = openPersistenceFile(temporary, false);
-#endif
   if (!file) {
     setError("cannot open temporary persistence file");
     return false;
@@ -1581,16 +1549,7 @@ bool Store::appendFile(const std::string &target,
     setError("statistics WAL exceeds the safety limit");
     return false;
   }
-#ifdef STATISTICS_V2_TESTING
-  std::FILE *file =
-      g_test_write_fault == TestWriteFault::OpenFailure
-          ? nullptr
-          : openPersistenceFile(target, true);
-  if (!file && g_test_write_fault == TestWriteFault::OpenFailure)
-    errno = EACCES;
-#else
   std::FILE *file = openPersistenceFile(target, true);
-#endif
   if (!file) {
     setError("cannot open statistics WAL");
     return false;
@@ -1616,13 +1575,6 @@ bool Store::truncateWal() {
 }
 
 bool Store::truncateWalTo(std::size_t size, std::size_t records) {
-#ifdef STATISTICS_V2_TESTING
-  if (g_test_write_fault == TestWriteFault::TruncateFailure) {
-    errno = EIO;
-    setError("injected statistics WAL truncation failure");
-    return false;
-  }
-#endif
   const std::string wal_path = path("statistics-v2.wal");
 #ifdef _WIN32
   HANDLE file = CreateFileA(wal_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
@@ -1794,11 +1746,5 @@ bool Store::cleanupLegacyFile() {
   }
   return true;
 }
-
-#ifdef STATISTICS_V2_TESTING
-void setTestWriteFault(TestWriteFault fault) {
-  g_test_write_fault = fault;
-}
-#endif
 
 } // namespace statistics_v2

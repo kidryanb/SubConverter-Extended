@@ -81,8 +81,8 @@ struct Settings {
   // preferences
   bool reloadConfOnRequest = false;
   RegexMatchConfigs renames, emojis;
-  bool addEmoji = false, removeEmoji = false, appendType = false,
-       filterDeprecated = true;
+  bool emojiEnabled = false, addEmoji = false, removeEmoji = false,
+       appendType = false, filterDeprecated = true;
   tribool UDPFlag, TFOFlag, skipCertVerify, TLS13Flag, enableInsert;
   bool enableSort = false, updateStrict = false;
   bool clashUseNewField = false, singBoxAddClashModes = true;
@@ -140,7 +140,7 @@ struct Settings {
       dashboardAuthLockSeconds = 900;
 
   // limits
-  size_t maxAllowedRulesets = 64, maxAllowedRules = 32768;
+  size_t maxAllowedRulesets = 256, maxAllowedRules = 32768;
   bool scriptCleanContext = false;
 
   // cron system
