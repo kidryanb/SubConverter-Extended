@@ -2,7 +2,7 @@ name: Sync upstream and rebuild image
 
 on:
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "23 3 * * *"
   workflow_dispatch:
 
 permissions:
