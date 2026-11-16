@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "module": "github.com/metacubex/mihomo",
-  "module_version": "v1.19.34-0.20261030092237-69c16319b12d",
+  "module_version": "v1.19.35-0.20261114152818-184857ce21a3",
   "schemes": [
     "hysteria",
     "hysteria2",
@@ -1304,6 +1304,10 @@
         "kind": "string",
         "required": false
       },
+      "mode": {
+        "kind": "string",
+        "required": false
+      },
       "mptcp": {
         "kind": "bool",
         "required": false
@@ -1342,6 +1346,10 @@
       },
       "udp": {
         "kind": "bool",
+        "required": false
+      },
+      "userkey": {
+        "kind": "string",
         "required": false
       },
       "version": {

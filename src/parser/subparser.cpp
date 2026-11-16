@@ -1192,6 +1192,12 @@ void explodeVmessConf(std::string content, std::vector<Proxy> &nodes) {
                 if (nodejson.HasMember(streamset.data()) && nodejson[streamset.data()].IsObject()) {
                     net = GetMember(nodejson[streamset.data()], "network");
                     tls = GetMember(nodejson[streamset.data()], "security");
+                    if (tls == "tls") {
+                        const auto &stream_settings = nodejson[streamset.data()];
+                        const auto tls_settings = stream_settings.FindMember("tlsSettings");
+                        if (tls_settings != stream_settings.MemberEnd())
+                            sni = GetMember(tls_settings->value, "serverName");
+                    }
                     if (net == "ws") {
                         if (nodejson[streamset.data()].HasMember(wsset.data()) &&
                             nodejson[streamset.data()][wsset.data()].IsObject())
@@ -1227,7 +1233,7 @@ void explodeVmessConf(std::string content, std::vector<Proxy> &nodes) {
                     }
                 }
                 vmessConstruct(node, V2RAY_DEFAULT_GROUP, add + ":" + port, add, port, type, id, aid, net, cipher, path,
-                               host, edge, tls, "", std::vector<std::string>{}, udp, tfo, scv);
+                               host, edge, tls, sni, std::vector<std::string>{}, udp, tfo, scv);
                 nodes.emplace_back(std::move(node));
             }
             return;
@@ -1364,7 +1370,7 @@ void explodeSS(std::string ss, Proxy &node) {
 void explodeSSD(std::string link, std::vector<Proxy> &nodes) {
     Document jsondata;
     uint32_t index = nodes.size(), listType = 0, listCount = 0;
-    std::string group, port, method, password, server, remarks;
+    std::string group, port, method, password;
     std::string plugin, pluginopts;
     std::map<uint32_t, std::string> node_map;
 
@@ -1393,13 +1399,6 @@ void explodeSSD(std::string link, std::vector<Proxy> &nodes) {
 
     rapidjson::Value singlenode;
     for (uint32_t i = 0; i < listCount; i++) {
-        //get default info
-        port = GetMember(jsondata, "port");
-        method = GetMember(jsondata, "encryption");
-        password = GetMember(jsondata, "password");
-        plugin = GetMember(jsondata, "plugin");
-        pluginopts = GetMember(jsondata, "plugin_options");
-
         //get server-specific info
         switch (listType) {
             case 0:
@@ -1411,8 +1410,20 @@ void explodeSSD(std::string link, std::vector<Proxy> &nodes) {
             default:
                 continue;
         }
-        singlenode["server"] >> server;
-        GetMember(singlenode, "remarks", remarks);
+        if (!singlenode.IsObject())
+            continue;
+        const auto server = singlenode.FindMember("server");
+        if (server == singlenode.MemberEnd() || !server->value.IsString() ||
+            server->value.GetString()[0] == '\0')
+            continue;
+
+        port = GetMember(jsondata, "port");
+        method = GetMember(jsondata, "encryption");
+        password = GetMember(jsondata, "password");
+        plugin = GetMember(jsondata, "plugin");
+        pluginopts = GetMember(jsondata, "plugin_options");
+
+        const std::string remarks = GetMember(singlenode, "remarks");
         GetMember(singlenode, "port", port);
         GetMember(singlenode, "encryption", method);
         GetMember(singlenode, "password", password);
@@ -1423,7 +1434,7 @@ void explodeSSD(std::string link, std::vector<Proxy> &nodes) {
             continue;
 
         Proxy node;
-        ssConstruct(node, group, remarks, server, port, password, method, plugin, pluginopts);
+        ssConstruct(node, group, remarks, server->value.GetString(), port, password, method, plugin, pluginopts);
         node.Id = index;
         nodes.emplace_back(std::move(node));
         index++;
